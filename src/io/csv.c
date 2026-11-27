@@ -4210,7 +4210,8 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
                 err = ray_err_from_obj(indexed); ray_release(indexed); ray_release(col);
                 break;
             }
-            ray_table_set_col_idx(tbl,c,col); ray_release(col);
+            err = ray_table_set_col_idx(tbl,c,col); ray_release(col);   /* the column not replaced is the failure (#1864) */
+            if (err != RAY_OK) break;
         }
         if (err != RAY_OK) { ray_release(tbl); scratch_free(row_offsets_hdr); break; }
 

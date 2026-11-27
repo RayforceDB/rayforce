@@ -57,15 +57,16 @@ static void insp_put(insp_dict_t* d, const char* key, ray_t* v) {
         return;
     }
     ((int64_t*)ray_data(d->keys))[d->keys->len++] = ray_sym_intern(key, strlen(key));
-    d->vals = ray_list_append(d->vals, v);
+    d->vals = ray_list_append_take(d->vals, v);
     ray_release(v);
     if (!d->vals || RAY_IS_ERR(d->vals)) d->oom = true;
 }
 
 static ray_t* insp_done(insp_dict_t* d) {
     if (d->oom) {
-        if (d->keys && !RAY_IS_ERR(d->keys)) ray_release(d->keys);
-        if (d->vals && !RAY_IS_ERR(d->vals)) ray_release(d->vals);
+        /* each is ours: a value released, an error freed (#1864) */
+        if (d->keys && RAY_IS_ERR(d->keys)) ray_error_free(d->keys); else ray_release(d->keys);
+        if (d->vals && RAY_IS_ERR(d->vals)) ray_error_free(d->vals); else ray_release(d->vals);
         return ray_error("oom", NULL);
     }
     return ray_dict_new(d->keys, d->vals);

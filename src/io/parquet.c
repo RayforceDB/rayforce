@@ -2589,7 +2589,8 @@ static ray_t* pq_write_batch(ray_parquet_t* r, ray_t* batch, const char* root, c
         ray_retain(col);
         ray_t* e = col->len >= PQ_BATCH ? ray_index_attach_chunk_zone(&col,16) : ray_index_attach_zone(&col);
         if (e && RAY_IS_ERR(e)) { ray_release(col); return e; }
-        ray_table_set_col_idx(batch,c,col); ray_release(col);
+        ray_err_t se = ray_table_set_col_idx(batch,c,col); ray_release(col);
+        if (se != RAY_OK) return ray_error("oom", NULL);   /* the column not replaced is the failure (#1864) */
     }
     char leaf[1400];
     int n = snprintf(leaf,sizeof(leaf),"%s/%lld/%s",root,(long long)part,table);

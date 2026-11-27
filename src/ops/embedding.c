@@ -779,11 +779,6 @@ ray_t* ray_hnsw_info_fn(ray_t* h) {
         default: break;
     }
 
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 6);
-    if (RAY_IS_ERR(keys)) return keys;
-    ray_t* vals = ray_list_new(6);
-    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
-
     struct { const char* name; size_t nlen; ray_t* val; } rows[] = {
         { "nrows",   5, make_i64(idx->n_nodes)               },
         { "dim",     3, make_i64((int64_t)idx->dim)          },
@@ -792,12 +787,28 @@ ray_t* ray_hnsw_info_fn(ray_t* h) {
         { "M",       1, make_i64((int64_t)idx->M)            },
         { "efc",     3, make_i64((int64_t)idx->ef_construction) },
     };
-    for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
+    const size_t nr = sizeof(rows)/sizeof(rows[0]);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, (int64_t)nr);
+    ray_t* vals = ray_list_new((int64_t)nr);
+    bool ok = keys && !RAY_IS_ERR(keys) && vals && !RAY_IS_ERR(vals);
+    for (size_t i = 0; i < nr; i++) if (!rows[i].val || RAY_IS_ERR(rows[i].val)) ok = false;
+    for (size_t i = 0; i < nr && ok; i++) {
         int64_t s = sym_intern_safe(rows[i].name, rows[i].nlen);
-        keys = ray_vec_append(keys, &s);
-        vals = ray_list_append(vals, rows[i].val);
-        ray_release(rows[i].val);
+        keys = ray_vec_append_take(keys, &s);
+        if (RAY_IS_ERR(keys)) { ok = false; break; }
+        vals = ray_list_append_take(vals, rows[i].val);
+        if (RAY_IS_ERR(vals)) { ok = false; break; }
     }
+    if (!ok) {   /* every error is ours: free it as one */
+        for (size_t i = 0; i < nr; i++) {
+            if (rows[i].val && RAY_IS_ERR(rows[i].val)) ray_error_free(rows[i].val);
+            else if (rows[i].val) ray_release(rows[i].val);
+        }
+        if (keys && RAY_IS_ERR(keys)) ray_error_free(keys); else if (keys) ray_release(keys);
+        if (vals && RAY_IS_ERR(vals)) ray_error_free(vals); else if (vals) ray_release(vals);
+        return ray_error("oom", NULL);
+    }
+    for (size_t i = 0; i < nr; i++) ray_release(rows[i].val);
     return ray_dict_new(keys, vals);
 }
 
@@ -910,7 +921,7 @@ ray_t* ray_emb_tokens_fn(ray_t* h, ray_t* x) {
             int64_t n = ray_embmodel_tokens(m, w, s ? s : "", s ? len : 0, &ids);
             ray_t* row = n < 0 ? ray_error("oom", NULL) : emb_ids_vec(ids, n);
             if (RAY_IS_ERR(row)) { ray_release(out); out = row; break; }
-            out = ray_list_append(out, row);
+            out = ray_list_append_take(out, row);
             ray_release(row);
         }
         if (!out) out = ray_error("oom", NULL);
@@ -992,7 +1003,7 @@ ray_t* ray_emb_encode_fn(ray_t** args, int64_t n) {
         ray_t* v = ray_vec_new(RAY_F32, in.dim);
         if (!v || RAY_IS_ERR(v)) { ray_release(out); return v ? v : ray_error("oom", NULL); }
         v->len = in.dim;
-        out = ray_list_append(out, v);
+        out = ray_list_append_take(out, v);
         ray_release(v);
         if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     }

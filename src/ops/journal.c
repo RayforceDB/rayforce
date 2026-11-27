@@ -343,12 +343,18 @@ ray_t* ray_log_validate_fn(ray_t* path) {
     if (e != RAY_OK) return err_to_ray(e, "io");
 
     ray_t* list = ray_list_new(2);
-    if (!list || RAY_IS_ERR(list)) return ray_error("oom", NULL);
     ray_t* a = ray_i64(chunks);
     ray_t* b = ray_i64(valid_bytes);
-    list = ray_list_append(list, a); ray_release(a);
+    if (!list || RAY_IS_ERR(list) || !a || RAY_IS_ERR(a) || !b || RAY_IS_ERR(b)) {
+        /* every error is ours: free it as one */
+        if (list && RAY_IS_ERR(list)) ray_error_free(list); else if (list) ray_release(list);
+        if (a && RAY_IS_ERR(a)) ray_error_free(a); else if (a) ray_release(a);
+        if (b && RAY_IS_ERR(b)) ray_error_free(b); else if (b) ray_release(b);
+        return ray_error("oom", NULL);
+    }
+    list = ray_list_append_take(list, a); ray_release(a);
     if (RAY_IS_ERR(list)) { ray_release(b); return list; }
-    list = ray_list_append(list, b); ray_release(b);
+    list = ray_list_append_take(list, b); ray_release(b);
     return list;
 }
 

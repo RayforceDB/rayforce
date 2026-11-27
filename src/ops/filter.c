@@ -125,7 +125,7 @@ static ray_t* exec_filter_parted_vec(ray_t* parted_col, ray_t* pred,
                 int64_t n = parted_seg_rows(segs, s, cnt, ncnt);
                 for (int64_t i = 0; i < n; i++) {
                     if (!pred_data[pred_off + i]) continue;
-                    result = ray_str_vec_append(result, "", 0);
+                    result = ray_str_vec_append_take(result, "", 0);
                     if (RAY_IS_ERR(result)) return result;
                     ray_vec_set_null(result, result->len - 1, true);
                 }

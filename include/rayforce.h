@@ -678,7 +678,17 @@ ray_t* ray_sym_vec_new(uint8_t sym_width, int64_t capacity);  /* RAY_SYM with ad
  *       ray_t* nv = ray_vec_append(v, &x);
  *       if (RAY_IS_ERR(nv)) { ray_release(v); return nv; }
  *       v = nv;
- *   `v = ray_vec_append(v, &x)` loses `v` on a failure. */
+ *   `v = ray_vec_append(v, &x)` would lose `v` on a failure: for that form
+ *   use the consuming `_take` writes below (#1864).
+ *
+ * The consuming writes take the input on every answer: on success as above,
+ * and on failure they release it and answer the error.  So
+ *       v = ray_vec_append_take(v, &x);
+ *       if (RAY_IS_ERR(v)) return v;
+ * loses nothing.  They are ray_vec_append_take, ray_vec_append_raw_take,
+ * ray_vec_insert_at_take, ray_str_vec_append_take, ray_str_vec_set_take,
+ * ray_list_append_take and ray_list_insert_at_take; ray_table_add_col,
+ * ray_dict_upsert and ray_dict_remove consume their input the same way. */
 ray_t* ray_vec_append(ray_t* vec, const void* elem);
 ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count);  /* one reserve + one memcpy */
 ray_t* ray_vec_set(ray_t* vec, int64_t idx, const void* elem);
@@ -718,6 +728,48 @@ ray_t* ray_list_get(ray_t* list, int64_t idx);
 ray_t* ray_list_set(ray_t* list, int64_t idx, ray_t* item);
 ray_t* ray_list_insert_at(ray_t* list, int64_t idx, ray_t* item);
 ray_t* ray_list_insert_many(ray_t* list, ray_t* idxs, ray_t* vals);
+
+/* The consuming forms of the growing writes (see above, #1864): on a
+ * failure the input, the caller's, is released.  An error given as the
+ * input is answered as it is, as the plain writes answer it. */
+#define RAY_TAKE_FAILED_(in, out) \
+    (__builtin_expect((out) != (in), 0) && (!(out) || RAY_IS_ERR(out)) && (in) && !RAY_IS_ERR(in))
+static inline ray_t* ray_vec_append_take(ray_t* v, const void* e) {
+    ray_t* r = ray_vec_append(v, e);
+    if (RAY_TAKE_FAILED_(v, r)) ray_release(v);
+    return r ? r : ray_error("oom", NULL);
+}
+static inline ray_t* ray_vec_append_raw_take(ray_t* v, const void* src, int64_t n) {
+    ray_t* r = ray_vec_append_raw(v, src, n);
+    if (RAY_TAKE_FAILED_(v, r)) ray_release(v);
+    return r ? r : ray_error("oom", NULL);
+}
+static inline ray_t* ray_vec_insert_at_take(ray_t* v, int64_t idx, const void* e) {
+    ray_t* r = ray_vec_insert_at(v, idx, e);
+    if (RAY_TAKE_FAILED_(v, r)) ray_release(v);
+    return r ? r : ray_error("oom", NULL);
+}
+static inline ray_t* ray_str_vec_append_take(ray_t* v, const char* s, size_t len) {
+    ray_t* r = ray_str_vec_append(v, s, len);
+    if (RAY_TAKE_FAILED_(v, r)) ray_release(v);
+    return r ? r : ray_error("oom", NULL);
+}
+static inline ray_t* ray_str_vec_set_take(ray_t* v, int64_t idx, const char* s, size_t len) {
+    ray_t* r = ray_str_vec_set(v, idx, s, len);
+    if (RAY_TAKE_FAILED_(v, r)) ray_release(v);
+    return r ? r : ray_error("oom", NULL);
+}
+static inline ray_t* ray_list_append_take(ray_t* l, ray_t* item) {
+    ray_t* r = ray_list_append(l, item);
+    if (RAY_TAKE_FAILED_(l, r)) ray_release(l);
+    return r ? r : ray_error("oom", NULL);
+}
+static inline ray_t* ray_list_insert_at_take(ray_t* l, int64_t idx, ray_t* item) {
+    ray_t* r = ray_list_insert_at(l, idx, item);
+    if (RAY_TAKE_FAILED_(l, r)) ray_release(l);
+    return r ? r : ray_error("oom", NULL);
+}
+
 
 /* ===== Symbol Intern Table API ===== */
 
@@ -771,12 +823,19 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val);
  *   ray_table_col_name                         -> -1
  *   ray_table_schema / ray_table_get_col*      -> NULL
  *   ray_table_col / ray_table_col_idx          -> NULL
- *   ray_table_set_col_name / ray_table_set_col_idx -> no-op
+ *   ray_table_set_col_name / ray_table_set_col_idx -> no-op, RAY_OK
  *   ray_table_add_col                          -> typed "type" error
  *   ray_table_validate_rectangular             -> typed "type" error
  *
  * ray_table_add_col consumes its `tbl` ref on every path, the error path
- * included, so a wrong tag releases the argument exactly as a bad column does.
+ * included, so a wrong tag releases the argument exactly as a bad column does,
+ * and so does a failed copy: it is a consuming write, as the `_take` writes
+ * are (#1864).
+ *
+ * ray_table_set_col_name and ray_table_set_col_idx write in place: they
+ * answer RAY_OK, or RAY_ERR_OOM when their copy of the schema or the column
+ * list fails, the table then left as it was.  The caller tests it: a column
+ * not replaced is a wrong answer, not an error, if the failure is ignored.
  *
  * The two that return a typed error are the ones to reach for when the
  * distinction matters: the accessors answer 0/NULL indistinguishably from a
@@ -800,8 +859,8 @@ ray_t*       ray_table_get_col_idx(ray_t* tbl, int64_t idx);
 ray_t*       ray_table_col(ray_t* tbl, int64_t name_id);
 ray_t*       ray_table_col_idx(ray_t* tbl, int64_t idx);
 int64_t     ray_table_col_name(ray_t* tbl, int64_t idx);
-void        ray_table_set_col_name(ray_t* tbl, int64_t idx, int64_t name_id);
-void        ray_table_set_col_idx(ray_t* tbl, int64_t idx, ray_t* col_vec);
+ray_err_t   ray_table_set_col_name(ray_t* tbl, int64_t idx, int64_t name_id);
+ray_err_t   ray_table_set_col_idx(ray_t* tbl, int64_t idx, ray_t* col_vec);
 int64_t     ray_table_ncols(ray_t* tbl);
 int64_t     ray_table_nrows(ray_t* tbl);
 ray_t*       ray_table_schema(ray_t* tbl);

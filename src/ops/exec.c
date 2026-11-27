@@ -597,7 +597,7 @@ ray_t* broadcast_scalar(ray_t* atom, int64_t nrows) {
         ray_t* vec = ray_vec_new(RAY_STR, nrows);
         if (!vec || RAY_IS_ERR(vec)) return vec;
         for (int64_t r = 0; r < nrows; r++) {
-            vec = ray_str_vec_append(vec, sp, sl);
+            vec = ray_str_vec_append_take(vec, sp, sl);
             if (RAY_IS_ERR(vec)) return vec;
         }
         return vec;
@@ -617,7 +617,7 @@ ray_t* broadcast_scalar(ray_t* atom, int64_t nrows) {
     uint8_t elem[8] = {0};
     memcpy(elem, &atom->i64, esz);
     for (int64_t r = 0; r < nrows; r++) {
-        vec = ray_vec_append(vec, elem);
+        vec = ray_vec_append_take(vec, elem);
         if (RAY_IS_ERR(vec)) return vec;
     }
     /* Propagate null state from the source atom.  A typed-null atom
@@ -1431,7 +1431,7 @@ ray_t* ray_in_sym_list_as_str(ray_t* set) {
             ray_t* t = ray_sym_str(e[i]->i64);
             if (t) { p = ray_str_ptr(t); len = ray_str_len(t); }
         }
-        if (p) v = ray_str_vec_append(v, p, len);
+        if (p) v = ray_str_vec_append_take(v, p, len);
     }
     return v ? v : ray_error("oom", NULL);
 }
@@ -6825,16 +6825,25 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         return cv;
                     }
                     ray_t* n_obj = make_i64(broadcast_len);
-                    ray_t* wide = n_obj ? ray_take_fn(cv, n_obj) : ray_error("oom", NULL);
-                    if (n_obj) ray_release(n_obj);
+                    /* a count that failed to allocate is the failure, never
+                     * the error read as the count (#1864); owned here */
+                    ray_t* wide = n_obj && !RAY_IS_ERR(n_obj) ? ray_take_fn(cv, n_obj)
+                                : n_obj ? n_obj : ray_error("oom", NULL);
+                    if (n_obj && !RAY_IS_ERR(n_obj)) ray_release(n_obj);
                     if (!wide || RAY_IS_ERR(wide)) {
                         ray_release(result);
                         g->table = saved_table;
                         ray_release(input);
                         return wide ? wide : ray_error("oom", NULL);
                     }
-                    ray_table_set_col_idx(result, c, wide);
+                    ray_err_t se = ray_table_set_col_idx(result, c, wide);
                     ray_release(wide);
+                    if (se != RAY_OK) {   /* the column not replaced is the failure (#1864) */
+                        ray_release(result);
+                        g->table = saved_table;
+                        ray_release(input);
+                        return ray_error("oom", NULL);
+                    }
                 }
                 /* Length-changing constant projections must not silently
                  * truncate or pad the other columns during materialization.
@@ -7182,7 +7191,7 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
                 if (base == RAY_STR) {
                     nulls = ray_vec_new(RAY_STR, seg_rows);
                     for (int64_t r = 0; nulls && !RAY_IS_ERR(nulls) && r < seg_rows; r++) {
-                        nulls = ray_str_vec_append(nulls, "", 0);
+                        nulls = ray_str_vec_append_take(nulls, "", 0);
                         if (nulls && !RAY_IS_ERR(nulls)) ray_vec_set_null(nulls, r, true);
                     }
                 } else if (base == RAY_LIST) {

@@ -1060,7 +1060,7 @@ static ray_err_t splay_write_table_cols(ray_t* tbl, ray_t* gen_src, const char* 
      *    is read by range for generation 2). */
     schema = ray_vec_new(RAY_STR, ncols > 0 ? ncols : 1);
     if (!schema || RAY_IS_ERR(schema)) {
-        if (schema) ray_release(schema);
+        ray_error_free(schema);   /* its error, ours: a release leaves it */
         schema = NULL;
         ret = RAY_ERR_OOM;
         goto out;
@@ -1092,9 +1092,9 @@ static ray_err_t splay_write_table_cols(ray_t* tbl, ray_t* gen_src, const char* 
             : splay_write_col(col, path, name, gens[c], sdom, durable, auto_index, keep_dict);
         /* No new .d or .current is published on failure. */
         if (err != RAY_OK) { ret = err; goto out; }
-        schema = ray_str_vec_append(schema, name, name_len);
+        schema = ray_str_vec_append_take(schema, name, name_len);
         if (!schema || RAY_IS_ERR(schema)) {
-            if (schema) ray_release(schema);
+            ray_error_free(schema);   /* the input released, its error ours */
             schema = NULL;
             ret = RAY_ERR_OOM;
             goto out;
@@ -1800,7 +1800,7 @@ static ray_t* splay_append_slots(ray_t* tbl, ray_t* old, const char* cur, const 
         ((ray_t**)ray_data(w))[1] = ns;   /* not-a-table */
         ray_t* next = ray_table_add_col(comb, name_id, w);
         ray_release(w);
-        if (!next || RAY_IS_ERR(next)) { ray_release(comb); return next ? next : ray_error("oom", NULL); }
+        if (!next || RAY_IS_ERR(next)) return next ? next : ray_error("oom", NULL);   /* comb consumed by add_col (#1864) */
         comb = next;
     }
     if (own && shared) {
@@ -1997,8 +1997,7 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
         ray_t* new_df = ray_table_add_col(tbl, name_id, col);
         if (!new_df || RAY_IS_ERR(new_df)) {
             ray_release(col);
-            ray_release(schema);
-            ray_release(tbl);
+            ray_release(schema);   /* tbl consumed by add_col (#1864) */
             return new_df ? new_df : ray_error("oom", NULL);
         }
         ray_release(col); /* table_add_col retains; drop our ref */

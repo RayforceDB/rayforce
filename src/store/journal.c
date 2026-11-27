@@ -1249,7 +1249,7 @@ ray_err_t ray_journal_snapshot(void) {
          * owns the original pointer which is now stale.  Take the
          * pre-call pointer so we can release whichever survived. */
         ray_t* prev_keys = keys;
-        keys = ray_vec_append(keys, &sym_ids[i]);
+        keys = ray_vec_append(keys, &sym_ids[i]);   /* plain: keeps the input for its own failure path (#1864) */
         if (RAY_IS_ERR(keys)) {
             ray_error_free(keys);
             ray_release(prev_keys);
@@ -1258,7 +1258,7 @@ ray_err_t ray_journal_snapshot(void) {
             return RAY_ERR_OOM;
         }
         ray_t* prev_vals = vals;
-        vals = ray_list_append(vals, vals_buf[i]);
+        vals = ray_list_append(vals, vals_buf[i]);   /* plain: keeps the input for its own failure path (#1864) */
         if (RAY_IS_ERR(vals)) {
             ray_error_free(vals);
             ray_release(prev_vals);
@@ -1290,7 +1290,7 @@ ray_err_t ray_journal_snapshot(void) {
             int64_t mk = ray_sym_intern(RAY_JLOG_COVER_KEY,
                                         (int64_t)strlen(RAY_JLOG_COVER_KEY));
             ray_t* prev_keys = keys;
-            keys = ray_vec_append(keys, &mk);
+            keys = ray_vec_append(keys, &mk);   /* plain: keeps the input for its own failure path (#1864) */
             if (RAY_IS_ERR(keys)) {
                 ray_error_free(keys);
                 ray_release(prev_keys);
@@ -1299,7 +1299,7 @@ ray_err_t ray_journal_snapshot(void) {
                 return RAY_ERR_OOM;
             }
             ray_t* prev_vals = vals;
-            vals = ray_list_append(vals, mv);
+            vals = ray_list_append(vals, mv);   /* plain: keeps the input for its own failure path (#1864) */
             ray_release(mv);
             if (RAY_IS_ERR(vals)) {
                 ray_error_free(vals);

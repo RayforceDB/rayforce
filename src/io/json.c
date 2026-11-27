@@ -405,7 +405,7 @@ static ray_t* json_collapse(ray_t* list, bool all_null_str) {
         out = ray_vec_new(RAY_STR, n);
         for (int64_t i = 0; out && !RAY_IS_ERR(out) && i < n; i++) {
             bool str = json_kind(it[i]) == JK_STR;
-            out = ray_str_vec_append(out, str ? ray_str_ptr(it[i]) : "", str ? ray_str_len(it[i]) : 0);
+            out = ray_str_vec_append_take(out, str ? ray_str_ptr(it[i]) : "", str ? ray_str_len(it[i]) : 0);
         }
     } else if (any_bool) {
         out = ray_vec_new(RAY_BOOL, n);
@@ -867,13 +867,14 @@ static bool jp_dedup(jp_t* jp, ray_t** keysp, ray_t** valsp, size_t* prep) {
     ray_t** items = (ray_t**)ray_data(vals);
     for (int64_t i = 0; i < n && nk && !RAY_IS_ERR(nk) && nv && !RAY_IS_ERR(nv); i++) {
         if (tmp[i] < 0) continue;
-        nk = ray_str_vec_append(nk, ks[i].p, ks[i].l);
-        if (!RAY_IS_ERR(nk)) nv = ray_list_append(nv, items[tmp[i]]);
+        nk = ray_str_vec_append_take(nk, ks[i].p, ks[i].l);
+        if (!RAY_IS_ERR(nk)) nv = ray_list_append_take(nv, items[tmp[i]]);
     }
     ray_free_raw(base);
     if (!nk || RAY_IS_ERR(nk) || !nv || RAY_IS_ERR(nv)) {
-        if (nk && !RAY_IS_ERR(nk)) ray_release(nk);
-        if (nv && !RAY_IS_ERR(nv)) ray_release(nv);
+        /* each is ours: a value released, an error freed (#1864) */
+        if (nk && RAY_IS_ERR(nk)) ray_error_free(nk); else ray_release(nk);
+        if (nv && RAY_IS_ERR(nv)) ray_error_free(nv); else ray_release(nv);
         jp_fail(jp, "oom", "out of memory");
         return false;
     }
@@ -1101,7 +1102,7 @@ static ray_t* jp_parse_each(jp_t* jp, const char* s, size_t l, int64_t row, void
     jp_parse_ctx_t* c = (jp_parse_ctx_t*)vctx;
     ray_t* v = jp_parse_doc(jp, s, l, row, c->lim);
     if (!v) return NULL;
-    c->out = ray_list_append(c->out, v);
+    c->out = ray_list_append_take(c->out, v);
     ray_release(v);
     if (RAY_IS_ERR(c->out)) { jp->err = c->out; c->out = NULL; return NULL; }
     return c->out;
@@ -1287,7 +1288,7 @@ static ray_t* jp_get_each(jp_t* jp, const char* s, size_t l, int64_t row, void* 
     jp_get_ctx_t* c = (jp_get_ctx_t*)vctx;
     ray_t* v = jp_get_doc(jp, s, l, row, c);
     if (!v) return NULL;
-    c->out = ray_list_append(c->out, v);
+    c->out = ray_list_append_take(c->out, v);
     ray_release(v);
     if (RAY_IS_ERR(c->out)) { jp->err = c->out; c->out = NULL; return NULL; }
     return c->out;
@@ -1336,11 +1337,11 @@ static ray_t* json_typed_vec(ray_t* list, int8_t t) {
         } else if (t == RAY_I64) {
             int64_t x = k == JK_INT ? it[i]->i64 : NULL_I64;
             any_null |= x == NULL_I64;
-            out = ray_vec_append(out, &x);
+            out = ray_vec_append_take(out, &x);
         } else {
             double x = k == JK_FLOAT ? it[i]->f64 : k == JK_INT ? (double)it[i]->i64 : NULL_F64;
             any_null |= x != x;
-            out = ray_vec_append(out, &x);
+            out = ray_vec_append_take(out, &x);
         }
     }
     ray_release(list);

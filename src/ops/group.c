@@ -14545,10 +14545,10 @@ static ray_t* dict_codes_to_str(const ray_t* codes_col, ray_t* src_col,
     if (!out || RAY_IS_ERR(out)) return out;
     for (int64_t i = 0; i < n; i++) {
         int32_t code = cd[i];
-        if (code < 0 || code >= ndist) { out = ray_str_vec_append(out, "", 0); }
+        if (code < 0 || code >= ndist) { out = ray_str_vec_append_take(out, "", 0); }
         else {
             size_t vl; const char* vp = ray_str_vec_get(src_col, focc[code], &vl);
-            out = ray_str_vec_append(out, vp ? vp : "", vp ? vl : 0);
+            out = ray_str_vec_append_take(out, vp ? vp : "", vp ? vl : 0);
         }
         if (!out || RAY_IS_ERR(out)) return out;
     }
@@ -14950,7 +14950,10 @@ static ray_t* group_strdom_kept(ray_graph_t* g, ray_op_t* op, ray_op_ext_t* ext,
         ray_t* eerr = !ids_col ? ray_error("nyi", "group: a swapped STR key without a table result")
                     : RAY_IS_ERR(ids_col) ? ids_col : strdom_key_emit(dom, ids_col, &str_col);
         if (eerr) { ray_release(result); result = eerr; }
-        else { ray_table_set_col_idx(result, 0, str_col); ray_release(str_col); }
+        else {
+            ray_err_t se = ray_table_set_col_idx(result, 0, str_col); ray_release(str_col);
+            if (se != RAY_OK) { ray_release(result); result = ray_error("oom", NULL); }   /* the column not replaced is the failure (#1864) */
+        }
     }
     ray_strdom_free(dom);
     return result;
@@ -15154,8 +15157,9 @@ __attribute__((noinline)) static ray_t* exec_group_core(ray_graph_t* g, ray_op_t
                     result = str_col ? str_col : ray_error("oom", NULL);
                     break;
                 }
-                ray_table_set_col_idx(result, k, str_col);
+                ray_err_t se = ray_table_set_col_idx(result, k, str_col);
                 ray_release(str_col);
+                if (se != RAY_OK) { ray_release(result); result = ray_error("oom", NULL); break; }   /* the column not replaced is the failure (#1864) */
                 continue;
             }
             if (sd >= 0) {
@@ -15168,8 +15172,9 @@ __attribute__((noinline)) static ray_t* exec_group_core(ray_graph_t* g, ray_op_t
                 ray_t* str_col = NULL;
                 ray_t* eerr = strdom_key_emit(sdom[sd], ids_col, &str_col);
                 if (eerr) { ray_release(result); result = eerr; break; }
-                ray_table_set_col_idx(result, k, str_col);
+                ray_err_t se = ray_table_set_col_idx(result, k, str_col);
                 ray_release(str_col);
+                if (se != RAY_OK) { ray_release(result); result = ray_error("oom", NULL); break; }   /* the column not replaced is the failure (#1864) */
                 continue;
             }
             if (!key_col[k]) continue;
@@ -15191,9 +15196,10 @@ __attribute__((noinline)) static ray_t* exec_group_core(ray_graph_t* g, ray_op_t
                 ray_t* str_col = dict_codes_to_str(
                     codes_col, key_col[k], ray_index_payload(key_col[k]->index));
                 if (str_col && !RAY_IS_ERR(str_col)) {
-                    ray_table_set_col_idx(result, k, str_col);
+                    ray_err_t se = ray_table_set_col_idx(result, k, str_col);
                     ray_release(str_col);
-                } else if (str_col) ray_release(str_col);
+                    if (se != RAY_OK) { ray_release(result); result = ray_error("oom", NULL); break; }   /* the column not replaced is the failure (#1864) */
+                } else ray_error_free(str_col);   /* owned; ray_release leaves an error */
             }
         }
     }
@@ -15239,8 +15245,9 @@ static ray_t* group_retag_duration_means(ray_graph_t* g, uint32_t gid, ray_t* re
             ray_release(result);
             return ts ? ts : ray_error("oom", NULL);
         }
-        ray_table_set_col_idx(result, ci, ts);
+        ray_err_t se = ray_table_set_col_idx(result, ci, ts);
         ray_release(ts);
+        if (se != RAY_OK) { ray_release(result); return ray_error("oom", NULL); }   /* the column not replaced is the failure (#1864) */
     }
     return result;
 }
@@ -19017,8 +19024,13 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 } else {
                     store_typed_elem(col, 0, atom);
                 }
-                ray_table_set_col_idx(result, a, col);
+                ray_err_t se = ray_table_set_col_idx(result, a, col);
                 ray_release(col);
+                if (se != RAY_OK) {   /* the column not replaced is the failure (#1864) */
+                    if (atom) ray_release(atom);
+                    recompute_err = ray_error("oom", NULL);
+                    break;
+                }
             }
             if (atom) ray_release(atom);
         }
@@ -19075,8 +19087,11 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                         /* NULL: a type the kernel does not take, the column
                          * as emitted; an error (oom, cancel) is the answer */
                         if (hv && RAY_IS_ERR(hv)) { recompute_err = hv; break; }
-                        if (hv) ray_table_set_col_idx(result, a, hv);
-                        if (hv) ray_release(hv);
+                        if (hv) {
+                            ray_err_t se = ray_table_set_col_idx(result, a, hv);
+                            ray_release(hv);
+                            if (se != RAY_OK) { recompute_err = ray_error("oom", NULL); break; }   /* the column not replaced is the failure (#1864) */
+                        }
                     }
                     scratch_free(ix_hdr);
                 }
@@ -23791,9 +23806,12 @@ static bool pp_wide_avg_split(ray_t** partp, int64_t si, int64_t mi, int64_t ci,
     }
     if (ok) {
         c0->len = c1->len = c2->len = n;
-        ray_table_set_col_idx(part, si, c0);
-        ray_table_set_col_idx(part, mi, c1);
-        part = ray_table_add_col(part, hi_name, c2);
+        if (ray_table_set_col_idx(part, si, c0) != RAY_OK ||
+            ray_table_set_col_idx(part, mi, c1) != RAY_OK) {   /* the column not replaced is the failure (#1864) */
+            ray_release(part);   /* ours, as add_col below would consume it */
+            part = NULL;
+        } else
+            part = ray_table_add_col(part, hi_name, c2);
         if (!part || RAY_IS_ERR(part)) {
             if (part) ray_error_free(part);
             part = NULL;
@@ -25007,8 +25025,15 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
 
         /* Rename running's agg columns back to the original partial names.
          * Without this, each merge adds an extra suffix (e.g. v1_sum → v1_sum_sum). */
-        for (uint32_t a = 0; a < part_n_aggs; a++)
-            ray_table_set_col_name(running, (int64_t)n_keys + a, agg_name_ids[a]);
+        bool renamed = true;
+        for (uint32_t a = 0; a < part_n_aggs && renamed; a++)
+            renamed = ray_table_set_col_name(running, (int64_t)n_keys + a, agg_name_ids[a]) == RAY_OK;
+        if (!renamed) {   /* a name not set is the failure: the concat fallback runs (#1864) */
+            ray_release(running);
+            running = NULL;
+            ray_release(merge_tbl);
+            goto pp_cleanup;
+        }
 
         continue;
 
@@ -25268,15 +25293,21 @@ batch_fail:
      * when it has no ext) — so the streaming result is name-for-name identical
      * to the concat fallback and the in-memory path (a select on a bare
      * computed by-key inherits this name directly). */
-    for (uint32_t k = 0; k < n_keys && (int64_t)k < rncols; k++) {
+    bool named = true;
+    for (uint32_t k = 0; k < n_keys && (int64_t)k < rncols && named; k++) {
         ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
-        ray_table_set_col_name(result, (int64_t)k, ke ? ke->sym : (int64_t)k);
+        named = ray_table_set_col_name(result, (int64_t)k, ke ? ke->sym : (int64_t)k) == RAY_OK;
     }
 
     /* Agg column names already fixed by ray_table_set_col_name inside batch loop.
      * Apply final name fixup for the user-facing n_aggs columns (trim decomposed extras). */
-    for (uint32_t a = 0; a < n_aggs && (int64_t)(n_keys + a) < rncols; a++)
-        ray_table_set_col_name(result, (int64_t)n_keys + a, agg_name_ids[a]);
+    for (uint32_t a = 0; a < n_aggs && (int64_t)(n_keys + a) < rncols && named; a++)
+        named = ray_table_set_col_name(result, (int64_t)n_keys + a, agg_name_ids[a]) == RAY_OK;
+    if (!named) {   /* a name not set is the failure: the concat fallback runs (#1864) */
+        ray_release(result);
+        if (merge_tbl) ray_release(merge_tbl);
+        goto pp_cleanup;
+    }
 
     if (merge_tbl) ray_release(merge_tbl);
     ret = result;

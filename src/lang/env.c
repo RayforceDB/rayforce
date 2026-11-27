@@ -284,8 +284,8 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, capacity);
     ray_t* vals = ray_list_new(capacity);
     if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
-        if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
-        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        if (keys && RAY_IS_ERR(keys)) ray_error_free(keys); else if (keys) ray_release(keys);
+        if (vals && RAY_IS_ERR(vals)) ray_error_free(vals); else if (vals) ray_release(vals);
         return ray_error("oom", NULL);
     }
 
@@ -335,7 +335,7 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
                 }
                 f->vals[i] = concrete;
             }
-            vals = ray_list_append(vals, f->vals[i]);
+            vals = ray_list_append_take(vals, f->vals[i]);
             if (!vals || RAY_IS_ERR(vals)) {
                 ray_release(keys); if (flags) ray_release(flags);
                 return vals ? vals : ray_error("oom", NULL);

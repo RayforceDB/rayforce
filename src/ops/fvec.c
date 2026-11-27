@@ -91,10 +91,8 @@ ray_t* ray_ftable_materialize(ray_ftable_t* ft) {
         int64_t name_id = ray_sym_intern(name_buf, (size_t)n);
         ray_t* new_tbl = ray_table_add_col(tbl, name_id, col);
         ray_release(col);
-        if (!new_tbl || RAY_IS_ERR(new_tbl)) {
-            if (new_tbl != tbl) ray_release(tbl);
+        if (!new_tbl || RAY_IS_ERR(new_tbl))   /* tbl consumed by add_col (#1864) */
             return new_tbl ? new_tbl : ray_error("oom", NULL);
-        }
         tbl = new_tbl;
     }
 

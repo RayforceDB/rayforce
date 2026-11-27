@@ -220,6 +220,17 @@ static void dict_pair_view(ray_t* d, ray_t** hdr_out, ray_t*** view_out,
  * representation of grouping output.  Returns an owned RAY_LIST (rc=1).
  * Atom keys are freshly boxed for typed-vector key columns (sym, i64,
  * etc.); for RAY_LIST keys they are retained borrows. */
+/* Name column idx of *t (owned) `name`.  A failed copy of its schema is
+ * the failure: *t is released and becomes an oom error, never a table with
+ * the column left unnamed (#1864).  On an error *t it does nothing, as
+ * ray_table_set_col_name does on any non-table. */
+static void query_rename_col(ray_t** t, int64_t idx, int64_t name) {
+    if (ray_table_set_col_name(*t, idx, name) != RAY_OK) {
+        ray_release(*t);
+        *t = ray_error("oom", NULL);
+    }
+}
+
 static ray_t* groups_to_pair_list(ray_t* d) {
     if (!d || d->type != RAY_DICT) return ray_error("type", "group: expected groups dict, got %s", d ? ray_type_name(d->type) : "null");
     ray_t* keys = ray_dict_keys(d);
@@ -265,10 +276,10 @@ static ray_t* groups_to_pair_list(ray_t* d) {
                 return k ? k : ray_error("oom", NULL);
             }
         }
-        out = ray_list_append(out, k);
+        out = ray_list_append_take(out, k);
         if (k) ray_release(k);
         ray_t* v = vptrs ? vptrs[i] : NULL;
-        out = ray_list_append(out, v);
+        out = ray_list_append_take(out, v);
     }
     return out;
 }
@@ -1148,12 +1159,12 @@ static ray_t* update_whole_list_value(ray_t* e, ray_t* tbl) {
     bool ok = en && cn && tk && h_en && h_cn && h_tk && col &&
               !RAY_IS_ERR(en) && !RAY_IS_ERR(cn) && !RAY_IS_ERR(tk);
     if (ok) {
-        en = ray_list_append(en, h_en); en = ray_list_append(en, e);
-        cn = ray_list_append(cn, h_cn); cn = ray_list_append(cn, col);
+        en = ray_list_append_take(en, h_en); en = ray_list_append_take(en, e);
+        cn = ray_list_append_take(cn, h_cn); cn = ray_list_append_take(cn, col);
         ok = en && cn && !RAY_IS_ERR(en) && !RAY_IS_ERR(cn);
     }
     if (ok) {
-        tk = ray_list_append(tk, h_tk); tk = ray_list_append(tk, en); tk = ray_list_append(tk, cn);
+        tk = ray_list_append_take(tk, h_tk); tk = ray_list_append_take(tk, en); tk = ray_list_append_take(tk, cn);
         ok = tk && !RAY_IS_ERR(tk);
     }
     if (h_en) ray_release(h_en);
@@ -1378,7 +1389,7 @@ static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t 
             return NULL;
         }
         ray_t* v = ray_vec_new(-atom->type, 1);
-        if (v && !RAY_IS_ERR(v)) v = ray_vec_append(v, &atom->i64);
+        if (v && !RAY_IS_ERR(v)) v = ray_vec_append_take(v, &atom->i64);
         if (v && !RAY_IS_ERR(v) && RAY_ATOM_IS_NULL(atom)) ray_vec_set_null(v, 0, true);
         ray_release(atom);
         if (!v || RAY_IS_ERR(v)) { ray_error_free(v); ray_release(res); return NULL; }
@@ -2252,7 +2263,7 @@ static ray_t* in_str_set_const(ray_graph_t* g, ray_t* set) {
     ray_dup_copy_begin(&seen);
     for (int64_t i = from; i < n && v && !RAY_IS_ERR(v); i++)
         if (e[i]->type == -RAY_STR && !ray_dup_copy_seen(&seen, e[i], ray_str_len(e[i])))
-            v = ray_str_vec_append(v, ray_str_ptr(e[i]), ray_str_len(e[i]));
+            v = ray_str_vec_append_take(v, ray_str_ptr(e[i]), ray_str_len(e[i]));
     ray_dup_copy_end(&seen);
     return v ? v : ray_error("oom", NULL);
 }
@@ -2302,7 +2313,7 @@ static ray_t* in_sym_set_const(ray_graph_t* g, ray_t* set, bool* has_empty) {
         }
         if (!p) continue;
         if (len == 0) { *has_empty = true; continue; }
-        v = ray_str_vec_append(v, p, len);
+        v = ray_str_vec_append_take(v, p, len);
     }
     return v ? v : ray_error("oom", NULL);
 }
@@ -2531,9 +2542,9 @@ static ray_t* or_eq_as_in(ray_t* e, ray_graph_t* g) {
     ray_t* h = ray_sym(ray_sym_intern("in", 2));
     ray_t* c = ray_sym(col);
     if (in && !RAY_IS_ERR(in) && h && c) {
-        in = ray_list_append(in, h);
-        if (in && !RAY_IS_ERR(in)) in = ray_list_append(in, c);
-        if (in && !RAY_IS_ERR(in)) in = ray_list_append(in, set);
+        in = ray_list_append_take(in, h);
+        if (in && !RAY_IS_ERR(in)) in = ray_list_append_take(in, c);
+        if (in && !RAY_IS_ERR(in)) in = ray_list_append_take(in, set);
     }
     if (h) ray_release(h);
     if (c) ray_release(c);
@@ -10524,9 +10535,9 @@ static ray_t* dkv_call(const char* head, ray_t* a, ray_t* b) {
     ray_t* l = ray_list_new(b ? 3 : 2);
     if (!l || RAY_IS_ERR(l)) { ray_error_free(l); if (a) ray_release(a); if (b) ray_release(b); return NULL; }
     ray_t* h = dkv_sym(head);
-    l = ray_list_append(l, h); ray_release(h);
-    l = ray_list_append(l, a); ray_release(a);
-    if (b) { l = ray_list_append(l, b); ray_release(b); }
+    l = ray_list_append_take(l, h); ray_release(h);
+    l = ray_list_append_take(l, a); ray_release(a);
+    if (b) { l = ray_list_append_take(l, b); ray_release(b); }
     if (!l || RAY_IS_ERR(l)) { if (l) ray_error_free(l); return NULL; }
     return l;
 }
@@ -10544,7 +10555,7 @@ static ray_t* dkv_select(const int64_t* keys, ray_t** vals, int64_t n) {
     kv->len = n;
     for (int64_t i = 0; i < n; i++) {
         ((int64_t*)ray_data(kv))[i] = keys[i];
-        vl = ray_list_append(vl, vals[i]);
+        vl = ray_list_append_take(vl, vals[i]);
         ray_release(vals[i]);
     }
     ray_t* d = ray_dict_new(kv, vl);
@@ -10552,8 +10563,8 @@ static ray_t* dkv_select(const int64_t* keys, ray_t** vals, int64_t n) {
     ray_t* sel = ray_list_new(2);
     if (!sel || RAY_IS_ERR(sel)) { ray_error_free(sel); ray_release(d); return NULL; }
     ray_t* h = dkv_sym("select");
-    sel = ray_list_append(sel, h); ray_release(h);
-    sel = ray_list_append(sel, d); ray_release(d);
+    sel = ray_list_append_take(sel, h); ray_release(h);
+    sel = ray_list_append_take(sel, d); ray_release(d);
     return sel;
 }
 
@@ -12740,8 +12751,8 @@ static ray_t* helper_spread_walk(ray_t* e, ray_t* sp) {
         ray_t* c = k == 0 ? (ray_retain(es[0]), es[0]) : helper_spread_walk(es[k], sp);
         if (c && !RAY_IS_ERR(c) && k > 0 && agg && query_expr_has_helper(es[k])) {
             ray_t* w = ray_list_new(2);
-            if (w && !RAY_IS_ERR(w)) w = ray_list_append(w, sp);
-            if (w && !RAY_IS_ERR(w)) w = ray_list_append(w, c);
+            if (w && !RAY_IS_ERR(w)) w = ray_list_append_take(w, sp);
+            if (w && !RAY_IS_ERR(w)) w = ray_list_append_take(w, c);
             ray_release(c);
             c = w ? w : ray_error("oom", NULL);
         }
@@ -12917,7 +12928,7 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
                     return result ? result : ray_error("oom", NULL);
                 }
                 const char* sp = ray_str_ptr(cell);
-                result = ray_str_vec_append(result, sp ? sp : "", sp ? ray_str_len(cell) : 0);
+                result = ray_str_vec_append_take(result, sp ? sp : "", sp ? ray_str_len(cell) : 0);
                 if (!result || RAY_IS_ERR(result)) {
                     g_active_query_table = _aqt;
                     ray_env_pop_scope(); ray_release(cell);
@@ -13809,7 +13820,7 @@ static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows) {
                     return result ? result : ray_error("oom", NULL);
                 }
                 const char* sp = ray_str_ptr(cell);
-                result = ray_str_vec_append(result, sp ? sp : "", sp ? ray_str_len(cell) : 0);
+                result = ray_str_vec_append_take(result, sp ? sp : "", sp ? ray_str_len(cell) : 0);
                 if (!result || RAY_IS_ERR(result)) {
                     g_active_query_table = _aqt; g_active_query_row = _aqr; g_active_query_row_tbl = _aqrt; g_active_query_row_depth = _aqrd;
                     ray_env_pop_scope();
@@ -16010,7 +16021,7 @@ static ray_t* try_count_distinct_v2_rewrite(
             int is_key = 0;
             for (int j = 0; j < n_K; j++) if (cn == K_syms[j]) { is_key = 1; break; }
             if (!is_key && cn != cd_c_sym) {
-                ray_table_set_col_name(result, ci, cd_c_sym);
+                query_rename_col(&result, ci, cd_c_sym);
                 break;
             }
         }
@@ -16021,7 +16032,7 @@ static ray_t* try_count_distinct_v2_rewrite(
         }
         for (int j = 0; j < n_K; j++)
             if (key_ci[j] >= 0 && K_alias[j] != K_syms[j])
-                ray_table_set_col_name(result, key_ci[j], K_alias[j]);
+                query_rename_col(&result, key_ci[j], K_alias[j]);
     }
     /* An unordered take keeps the first N groups seen, not the N smallest
      * keys the passes' order would leave to the trim below. */
@@ -17447,7 +17458,7 @@ static ray_t* scalar_atom_rows(ray_t* a, int64_t nrows) {
     if (!cells) {
         cells = ray_list_new(nrows);
         for (int64_t r = 0; r < nrows && cells && !RAY_IS_ERR(cells); r++)
-            cells = ray_list_append(cells, a);
+            cells = ray_list_append_take(cells, a);
     }
     ray_release(a);
     return cells ? cells : ray_error("oom", NULL);
@@ -17836,7 +17847,7 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
     emit:
         if (!ray_is_atom(agg_value)) {
             ray_t* box = ray_list_new(1);
-            if (box && !RAY_IS_ERR(box)) box = ray_list_append(box, agg_value);
+            if (box && !RAY_IS_ERR(box)) box = ray_list_append_take(box, agg_value);
             ray_release(agg_value);
             if (!box || RAY_IS_ERR(box)) {
                 ray_release(result);
@@ -18179,7 +18190,7 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
     int64_t base_ncols = ray_table_ncols(result) - n_funcs;
     for (int fi = 0; fi < n_funcs; fi++) {
         if (out_name_ids[fi] >= 0)
-            ray_table_set_col_name(result, base_ncols + fi, out_name_ids[fi]);
+            query_rename_col(&result, base_ncols + fi, out_name_ids[fi]);
     }
     scratch_free(outname_hdr);
 
@@ -18754,12 +18765,12 @@ ray_t* ray_try_select_head_expr(ray_t* expr, int64_t n, int* handled) {
     int64_t* kd = (int64_t*)ray_data(keys);
     for (int64_t i = 0; i < np; i++) {
         kd[i] = dv[2 * i]->i64;
-        if (!RAY_IS_ERR(vals)) vals = ray_list_append(vals, dv[2 * i + 1]);
+        if (!RAY_IS_ERR(vals)) vals = ray_list_append_take(vals, dv[2 * i + 1]);
     }
     DICT_VIEW_CLOSE(dv);
     kd[np] = ray_sym_intern("take", 4);
     keys->len = np + 1;
-    if (!RAY_IS_ERR(vals)) vals = ray_list_append(vals, nv);
+    if (!RAY_IS_ERR(vals)) vals = ray_list_append_take(vals, nv);
     ray_release(nv);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return NULL; }
     ray_t* head = ray_dict_new(keys, vals);
@@ -18870,7 +18881,7 @@ static ray_t* count_select_over(ray_t* dict, ray_t* src) {
     for (int64_t i = 0; i < np; i++) {
         kd[i] = dv[2 * i]->i64;
         ray_t* v = kd[i] == from_id ? src : dv[2 * i + 1];
-        if (!RAY_IS_ERR(vals)) vals = ray_list_append(vals, v);
+        if (!RAY_IS_ERR(vals)) vals = ray_list_append_take(vals, v);
     }
     DICT_VIEW_CLOSE(dv);
     keys->len = np;
@@ -19493,11 +19504,8 @@ static ray_t* project_table_cols(ray_t* src_tbl, const int64_t* keep_syms,
         ray_t* col = ray_table_slot(src_tbl, keep_syms[i]);   /* the slot object: an encoded column stays encoded */
         if (!col) { ray_release(nt); return ray_error("domain", "select: projected column not found"); }
         ray_t* nt2 = ray_table_add_col(nt, keep_syms[i], col);
-        if (!nt2 || RAY_IS_ERR(nt2)) {
-            if (nt2 && nt2 != nt) ray_release(nt2);
-            else ray_release(nt);
+        if (!nt2 || RAY_IS_ERR(nt2))   /* nt consumed by add_col (#1864) */
             return nt2 ? nt2 : ray_error("oom", NULL);
-        }
         nt = nt2;
     }
     return nt;
@@ -20056,7 +20064,7 @@ static ray_t* try_temporal_group_materialize(ray_t* dict, ray_t* tbl, unsigned p
                 replacement = ray_list_new(expr->len);
                 MAT_CHECK(replacement);
                 for (int64_t j = 0; j < expr->len; j++) {
-                    replacement = ray_list_append(replacement, es[j]); MAT_CHECK(replacement);
+                    replacement = ray_list_append_take(replacement, es[j]); MAT_CHECK(replacement);
                 }
             }
             ray_t* ref = ray_sym(sym);
@@ -20126,9 +20134,11 @@ static ray_t* select_fallback_bind_alias(ray_t* tbl, int64_t kid, ray_t* col) {
         if (ray_table_col_name(tbl, c) != kid) continue;
         ray_t* t2 = ray_cow(tbl);   /* a failed copy leaves `tbl` untouched */
         if (!t2 || RAY_IS_ERR(t2)) { ray_release(tbl); return t2; }
-        ray_table_set_col_idx(t2, c, col);
-        /* Slot objects on both sides: an encoded column is its own slot. */
-        if (ray_table_slot_idx(t2, c) != col) { ray_release(t2); return ray_error("oom", NULL); }
+        /* a column not replaced is the failure (#1864); slot objects on both
+         * sides: an encoded column is its own slot */
+        if (ray_table_set_col_idx(t2, c, col) != RAY_OK || ray_table_slot_idx(t2, c) != col) {
+            ray_release(t2); return ray_error("oom", NULL);
+        }
         return t2;
     }
     return ray_table_add_col(tbl, kid, col);
@@ -20154,7 +20164,7 @@ static ray_t* select_fallback_broadcast(ray_t* v, int64_t n) {
         /* one cell (a fold's collection, #1429): the same cell in every row */
         ray_t* cell = ((ray_t**)ray_data(v))[0];
         ray_t* out = ray_list_new((int32_t)n);
-        for (int64_t r = 0; r < n && out && !RAY_IS_ERR(out); r++) out = ray_list_append(out, cell);
+        for (int64_t r = 0; r < n && out && !RAY_IS_ERR(out); r++) out = ray_list_append_take(out, cell);
         ray_release(v);
         return out ? out : ray_error("oom", NULL);
     }
@@ -20180,8 +20190,9 @@ static ray_t* select_fallback_finish_columns(ray_t* result, uint32_t* scalar_col
             ray_release(result);
             return wide ? wide : ray_error("oom", NULL);
         }
-        ray_table_set_col_idx(result, c, wide);
+        ray_err_t se = ray_table_set_col_idx(result, c, wide);
         ray_release(wide);
+        if (se != RAY_OK) { ray_release(result); return ray_error("oom", NULL); }   /* a column not replaced is the failure (#1864) */
     }
     return result;
 }
@@ -20610,12 +20621,12 @@ static ray_t* select_alias_map_list(ray_t* expr, int64_t from, select_alias_map_
             out = ray_list_new(expr->len);
             if (!out || RAY_IS_ERR(out)) { ray_release(e2); return out ? out : ray_error("oom", NULL); }
             for (int64_t j = 0; j < i; j++) {
-                out = ray_list_append(out, el[j]);
+                out = ray_list_append_take(out, el[j]);
                 if (!out || RAY_IS_ERR(out)) { ray_release(e2); return out ? out : ray_error("oom", NULL); }
             }
         }
         if (out) {
-            out = ray_list_append(out, e2);
+            out = ray_list_append_take(out, e2);
             ray_release(e2);
             if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
         } else {
@@ -20660,8 +20671,8 @@ static ray_t* select_where_shield_alias_literals(ray_t* e, void* vctx) {
         if (!names_alias) { ray_retain(e); return e; }
         ray_t* head = ray_sym(ray_sym_intern("quote", 5));
         ray_t* wrap = head && !RAY_IS_ERR(head) ? ray_list_new(2) : NULL;
-        if (wrap && !RAY_IS_ERR(wrap)) wrap = ray_list_append(wrap, head);
-        if (wrap && !RAY_IS_ERR(wrap)) wrap = ray_list_append(wrap, e);
+        if (wrap && !RAY_IS_ERR(wrap)) wrap = ray_list_append_take(wrap, head);
+        if (wrap && !RAY_IS_ERR(wrap)) wrap = ray_list_append_take(wrap, e);
         if (head && !RAY_IS_ERR(head)) ray_release(head);
         if (!wrap || RAY_IS_ERR(wrap)) return wrap ? wrap : ray_error("oom", NULL);
         c->changed = true;
@@ -20725,8 +20736,8 @@ static ray_t* select_fallback_prereduce(ray_t* expr, void* vctx) {
     }
     ray_t* head = ray_sym(ray_sym_intern("quote", 5));
     ray_t* wrap = head && !RAY_IS_ERR(head) ? ray_list_new(2) : NULL;
-    if (wrap && !RAY_IS_ERR(wrap)) wrap = ray_list_append(wrap, head);
-    if (wrap && !RAY_IS_ERR(wrap)) wrap = ray_list_append(wrap, v);
+    if (wrap && !RAY_IS_ERR(wrap)) wrap = ray_list_append_take(wrap, head);
+    if (wrap && !RAY_IS_ERR(wrap)) wrap = ray_list_append_take(wrap, v);
     if (head && !RAY_IS_ERR(head)) ray_release(head);
     ray_release(v);
     if (!wrap || RAY_IS_ERR(wrap)) return wrap ? wrap : ray_error("oom", NULL);
@@ -21740,7 +21751,7 @@ static ray_t* select_strip_key_projections(ray_t* dict) {
             for (int64_t j = 0; j < nk && !drop; j++) drop = strip_key_id(kv, k1, j) == kid;
         if (drop) continue;
         ((int64_t*)ray_data(ck))[ck->len++] = kid;
-        cv = ray_list_append(cv, v[i]);
+        cv = ray_list_append_take(cv, v[i]);
     }
     if (!cv || RAY_IS_ERR(cv)) { ray_release(ck); return cv ? cv : ray_error("oom", NULL); }
     return ray_dict_new(ck, cv);
@@ -22333,7 +22344,7 @@ static ray_t* query_hoist_do_dict(ray_t* dict, bool* pushed, int64_t* key_names,
 
     ray_t* nv = ray_list_new((int32_t)nd);
     ray_t* err = NULL;
-    for (int64_t i = 0; i < nd && nv && !RAY_IS_ERR(nv); i++) nv = ray_list_append(nv, vs[i]);
+    for (int64_t i = 0; i < nd && nv && !RAY_IS_ERR(nv); i++) nv = ray_list_append_take(nv, vs[i]);
     if (!nv || RAY_IS_ERR(nv)) { ray_release(tbl); return nv ? nv : ray_error("oom", NULL); }
     ray_t** ns = (ray_t**)ray_data(nv);
     if (!from_sym) { ray_release(ns[from_i]); ray_retain(tbl); ns[from_i] = tbl; }
@@ -22404,8 +22415,8 @@ static ray_t* query_hoist_do_dict(ray_t* dict, bool* pushed, int64_t* key_names,
         for (int64_t i = 0; i < nd && k2 && !RAY_IS_ERR(k2) && v2 && !RAY_IS_ERR(v2); i++) {
             if (i == where_i) continue;
             int64_t kid = sym_cell_runtime_id(keys, i);
-            k2 = ray_vec_append(k2, &kid);
-            v2 = ray_list_append(v2, ns[i]);
+            k2 = ray_vec_append_take(k2, &kid);
+            v2 = ray_list_append_take(v2, ns[i]);
         }
         ray_release(nv);
         if (!k2 || RAY_IS_ERR(k2) || !v2 || RAY_IS_ERR(v2)) {
@@ -22457,7 +22468,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
         ray_table_ncols(r) > 0 && ray_table_col_name(r, 0) == key_names[0]) {
         /* the key column first, named as the written `by:` names it */
         r = ray_cow(r);
-        if (r && !RAY_IS_ERR(r)) ray_table_set_col_name(r, 0, key_names[1]);
+        if (r && !RAY_IS_ERR(r)) query_rename_col(&r, 0, key_names[1]);
     }
     if (hoisted && !RAY_IS_ERR(hoisted)) r = hoist_strip_cols(r);
     if (hoisted && !RAY_IS_ERR(hoisted)) ray_release(hoisted);
@@ -22587,14 +22598,14 @@ static ray_t* select_sort_take_pushdown(ray_t* dict, int depth, bool* plain) {
         ray_t* mv = ray_list_new((int32_t)(ni + 2));
         for (int64_t i = 0; i < ni && mk && !RAY_IS_ERR(mk) && mv && !RAY_IS_ERR(mv); i++) {
             int64_t k = sym_cell_runtime_id(ik, i);
-            mk = ray_vec_append(mk, &k);
-            mv = ray_list_append(mv, iv[i]);
+            mk = ray_vec_append_take(mk, &k);
+            mv = ray_list_append_take(mv, iv[i]);
         }
         int64_t ks = sym_cell_runtime_id(keys, sort_i);
-        if (mk && !RAY_IS_ERR(mk)) mk = ray_vec_append(mk, &ks);
-        if (mv && !RAY_IS_ERR(mv)) mv = ray_list_append(mv, vs[sort_i]);
-        if (mk && !RAY_IS_ERR(mk)) mk = ray_vec_append(mk, &id_take);
-        if (mv && !RAY_IS_ERR(mv)) mv = ray_list_append(mv, vs[take_i]);
+        if (mk && !RAY_IS_ERR(mk)) mk = ray_vec_append_take(mk, &ks);
+        if (mv && !RAY_IS_ERR(mv)) mv = ray_list_append_take(mv, vs[sort_i]);
+        if (mk && !RAY_IS_ERR(mk)) mk = ray_vec_append_take(mk, &id_take);
+        if (mv && !RAY_IS_ERR(mv)) mv = ray_list_append_take(mv, vs[take_i]);
         if (!mk || RAY_IS_ERR(mk) || !mv || RAY_IS_ERR(mv)) {
             if (mk && !RAY_IS_ERR(mk)) ray_release(mk);
             if (mv && !RAY_IS_ERR(mv)) ray_release(mv);
@@ -22643,10 +22654,10 @@ static ray_t* select_sort_take_pushdown(ray_t* dict, int depth, bool* plain) {
     ray_t* ik = ray_vec_new(RAY_SYM, ni);
     ray_t* iv = ray_list_new((int32_t)ni);
     int64_t ks = sym_cell_runtime_id(keys, sort_i);
-    ik = ray_vec_append(ik, &id_from);  iv = ray_list_append(iv, tbl);
-    if (where_i >= 0) { ik = ray_vec_append(ik, &id_where); iv = ray_list_append(iv, vs[where_i]); }
-    ik = ray_vec_append(ik, &ks);       iv = ray_list_append(iv, vs[sort_i]);
-    ik = ray_vec_append(ik, &id_take);  iv = ray_list_append(iv, vs[take_i]);
+    ik = ray_vec_append_take(ik, &id_from);  iv = ray_list_append_take(iv, tbl);
+    if (where_i >= 0) { ik = ray_vec_append_take(ik, &id_where); iv = ray_list_append_take(iv, vs[where_i]); }
+    ik = ray_vec_append_take(ik, &ks);       iv = ray_list_append_take(iv, vs[sort_i]);
+    ik = ray_vec_append_take(ik, &id_take);  iv = ray_list_append_take(iv, vs[take_i]);
     ray_release(tbl);
     if (!ik || RAY_IS_ERR(ik) || !iv || RAY_IS_ERR(iv)) {
         if (ik && !RAY_IS_ERR(ik)) ray_release(ik);
@@ -22661,13 +22672,13 @@ static ray_t* select_sort_take_pushdown(ray_t* dict, int depth, bool* plain) {
     /* then the outputs, in their order, over those rows */
     ray_t* ok2 = ray_vec_new(RAY_SYM, nout + 1);
     ray_t* ov = ray_list_new((int32_t)(nout + 1));
-    ok2 = ray_vec_append(ok2, &id_from); ov = ray_list_append(ov, rows);
+    ok2 = ray_vec_append_take(ok2, &id_from); ov = ray_list_append_take(ov, rows);
     ray_release(rows);
     for (int64_t i = 0; i < nd && ok2 && !RAY_IS_ERR(ok2) && ov && !RAY_IS_ERR(ov); i++) {
         if (i == from_i || i == where_i || i == take_i || i == sort_i) continue;
         int64_t k = sym_cell_runtime_id(keys, i);
-        ok2 = ray_vec_append(ok2, &k);
-        ov = ray_list_append(ov, vs[i]);
+        ok2 = ray_vec_append_take(ok2, &k);
+        ov = ray_list_append_take(ov, vs[i]);
     }
     if (!ok2 || RAY_IS_ERR(ok2) || !ov || RAY_IS_ERR(ov)) {
         if (ok2 && !RAY_IS_ERR(ok2)) ray_release(ok2);
@@ -22738,7 +22749,7 @@ static ray_t* select_dict_with_from(ray_t* dict, ray_t* tbl) {
     for (int64_t i = 0; i < nd && cv && !RAY_IS_ERR(cv); i++) {
         int64_t kid = sym_cell_runtime_id(keys, i);
         ((int64_t*)ray_data(ck))[ck->len++] = kid;
-        cv = ray_list_append(cv, kid == id_from ? tbl : ((ray_t**)ray_data(vals))[i]);
+        cv = ray_list_append_take(cv, kid == id_from ? tbl : ((ray_t**)ray_data(vals))[i]);
     }
     if (!cv || RAY_IS_ERR(cv)) { ray_release(ck); return cv ? cv : ray_error("oom", NULL); }
     return ray_dict_new(ck, cv);
@@ -23284,9 +23295,9 @@ static ray_t* fv_subst(ray_t* e, ray_t* tbl, bool rows, fv_cols_t* fc) {
         if (!out && c == el[i]) { ray_release(c); continue; }
         if (!out) {
             out = ray_list_new(e->len);
-            for (int64_t j = 0; j < i && out && !RAY_IS_ERR(out); j++) out = ray_list_append(out, el[j]);
+            for (int64_t j = 0; j < i && out && !RAY_IS_ERR(out); j++) out = ray_list_append_take(out, el[j]);
         }
-        if (out && !RAY_IS_ERR(out)) out = ray_list_append(out, c);
+        if (out && !RAY_IS_ERR(out)) out = ray_list_append_take(out, c);
         ray_release(c);
         if (!out || RAY_IS_ERR(out)) { fc->proj = proj0; return out ? out : ray_error("oom", NULL); }
     }
@@ -23586,8 +23597,8 @@ static ray_t* update_spread_walk(ray_t* e, ray_t* tbl, ray_t** sp, int depth) {
             if (!*fp) *fp = ray_fn_unary("spread", RAY_FN_NONE,
                                          keep_null ? update_spread_keep_null_fn : update_spread_fn);
             ray_t* w = *fp && !RAY_IS_ERR(*fp) ? ray_list_new(2) : NULL;
-            if (w && !RAY_IS_ERR(w)) w = ray_list_append(w, *fp);
-            if (w && !RAY_IS_ERR(w)) w = ray_list_append(w, c);
+            if (w && !RAY_IS_ERR(w)) w = ray_list_append_take(w, *fp);
+            if (w && !RAY_IS_ERR(w)) w = ray_list_append_take(w, c);
             ray_release(c);
             c = w ? w : ray_error("oom", NULL);
         }
@@ -23782,7 +23793,7 @@ static ray_t* row_globals_subst(ray_t* e, ray_t* tbl, ray_t* const* syms, const 
     for (int64_t i = 0; i < e->len && out && !RAY_IS_ERR(out); i++) {
         ray_t* c = i == 0 ? (ray_retain(el[0]), el[0]) : row_globals_subst(el[i], tbl, syms, names, n);
         if (!c || RAY_IS_ERR(c)) { ray_release(out); return c ? c : ray_error("oom", NULL); }
-        out = ray_list_append(out, c);
+        out = ray_list_append_take(out, c);
         ray_release(c);
     }
     if (out && !RAY_IS_ERR(out)) out->attrs = e->attrs;
@@ -24078,8 +24089,8 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
                 ray_t* fk = ray_vec_new(RAY_SYM, 2);
                 ray_t* fv = ray_list_new(2);
                 if (fk && !RAY_IS_ERR(fk)) { ((int64_t*)ray_data(fk))[0] = rid[0]; ((int64_t*)ray_data(fk))[1] = rid[1]; fk->len = 2; }
-                if (fv && !RAY_IS_ERR(fv)) fv = ray_list_append(fv, tbl);
-                if (fv && !RAY_IS_ERR(fv)) fv = ray_list_append(fv, where_expr);
+                if (fv && !RAY_IS_ERR(fv)) fv = ray_list_append_take(fv, tbl);
+                if (fv && !RAY_IS_ERR(fv)) fv = ray_list_append_take(fv, where_expr);
                 ray_t* fdict = ray_dict_new(fk, fv);
                 if (!fdict || RAY_IS_ERR(fdict)) { ray_release(base); return fdict ? fdict : ray_error("oom", NULL); }
                 ray_t* filtered = ray_select_impl(&fdict, 1, SELECT_ALIASES_RESOLVED |
@@ -24187,7 +24198,7 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
         ray_t* bk = ray_vec_new(RAY_SYM, 1);
         ray_t* bv = ray_list_new(1);
         if (bk && !RAY_IS_ERR(bk)) { ((int64_t*)ray_data(bk))[0] = hidden; bk->len = 1; }
-        if (bv && !RAY_IS_ERR(bv)) bv = ray_list_append(bv, by_expr);
+        if (bv && !RAY_IS_ERR(bv)) bv = ray_list_append_take(bv, by_expr);
         by_val = ray_dict_new(bk, bv);
     }
     if (!by_val || RAY_IS_ERR(by_val)) { if (keyed) ray_release(keyed); return by_val ? by_val : ray_error("oom", NULL); }
@@ -24876,10 +24887,10 @@ static ray_t* query_hoist_running(ray_t* e, run_hoist_t* h, int depth) {
         if (a == es[i] && !out) { ray_release(a); continue; }
         if (!out) {
             out = ray_list_new((int32_t)e->len);
-            for (int64_t j = 0; j < i && out && !RAY_IS_ERR(out); j++) out = ray_list_append(out, es[j]);
+            for (int64_t j = 0; j < i && out && !RAY_IS_ERR(out); j++) out = ray_list_append_take(out, es[j]);
             if (!out || RAY_IS_ERR(out)) { ray_release(a); return out ? out : ray_error("oom", NULL); }
         }
-        out = ray_list_append(out, a);
+        out = ray_list_append_take(out, a);
         ray_release(a);
         if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     }
@@ -25271,8 +25282,8 @@ static ray_t* select_plan_column_free_aggs(ray_t* dict, ray_t* tbl) {
         if (ray_is_atom(val)) {
             ray_t* lit = select_literal_of(val);
             out = lit && !RAY_IS_ERR(lit) ? ray_list_new(2) : lit;
-            if (out && !RAY_IS_ERR(out)) out = ray_list_append(out, el[0]);
-            if (out && !RAY_IS_ERR(out)) out = ray_list_append(out, lit);
+            if (out && !RAY_IS_ERR(out)) out = ray_list_append_take(out, el[0]);
+            if (out && !RAY_IS_ERR(out)) out = ray_list_append_take(out, lit);
             if (lit && !RAY_IS_ERR(lit)) ray_release(lit);
         } else {
             ray_t* agg = ray_sig_note(ray_fn_name(fn_obj), ((ray_unary_fn)(uintptr_t)fn_obj->i64)(val));
@@ -25291,8 +25302,8 @@ static ray_t* select_plan_column_free_aggs(ray_t* dict, ray_t* tbl) {
                 ray_t* q = query_quote_value(val);
                 ray_release(val);
                 out = q ? ray_list_new(2) : ray_error("oom", NULL);
-                if (out && !RAY_IS_ERR(out)) out = ray_list_append(out, el[0]);
-                if (out && !RAY_IS_ERR(out)) out = ray_list_append(out, q);
+                if (out && !RAY_IS_ERR(out)) out = ray_list_append_take(out, el[0]);
+                if (out && !RAY_IS_ERR(out)) out = ray_list_append_take(out, q);
                 if (q) ray_release(q);
             } else {
                 ray_release(val);
@@ -25324,8 +25335,8 @@ static ray_t* select_name_computed_key(ray_t* r, int64_t key_name) {
     int64_t nc = ray_table_ncols(r);
     int64_t key_at = -1;
     for (int64_t c = 0; c < nc; c++)
-        if (ray_table_col_name(r, c) == hidden) { ray_table_set_col_name(r, c, key_name); key_at = c; break; }
-    if (key_at < 0) return r;
+        if (ray_table_col_name(r, c) == hidden) { query_rename_col(&r, c, key_name); key_at = c; break; }
+    if (key_at < 0 || RAY_IS_ERR(r)) return r;
     /* With no outputs the engine returns every input column; the source
      * column the key is named after yields to the key, as it does when the
      * engine computed the key itself. */
@@ -28017,7 +28028,7 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
     for (int64_t i = 0; i < nb && nk && !RAY_IS_ERR(nk) && nv && !RAY_IS_ERR(nv); i++) {
         if (base[i] >= 0) continue;
         ((int64_t*)ray_data(nk))[nk->len++] = alias[i];
-        nv = ray_list_append(nv, bvals[i]);
+        nv = ray_list_append_take(nv, bvals[i]);
     }
     ray_t* r = NULL;
     if (!nk || RAY_IS_ERR(nk) || !nv || RAY_IS_ERR(nv)) {
@@ -28058,7 +28069,7 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
     ray_t* ok = ray_vec_new(RAY_SYM, 1 + nb + n_out);
     ray_t* ov = ray_list_new((int32_t)(1 + nb + n_out));
     if (ok && !RAY_IS_ERR(ok)) ((int64_t*)ray_data(ok))[ok->len++] = from_id;
-    if (ov && !RAY_IS_ERR(ov)) ov = ray_list_append(ov, grouped);
+    if (ov && !RAY_IS_ERR(ov)) ov = ray_list_append_take(ov, grouped);
     ray_release(grouped);
     for (int64_t i = 0; i < nb + nd && ok && !RAY_IS_ERR(ok) && ov && !RAY_IS_ERR(ov); i++) {
         int64_t name;
@@ -28074,7 +28085,7 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
         }
         if (!e || RAY_IS_ERR(e)) { ray_release(ov); ov = e ? e : ray_error("oom", NULL); break; }
         ((int64_t*)ray_data(ok))[ok->len++] = name;
-        ov = ray_list_append(ov, e);
+        ov = ray_list_append_take(ov, e);
         ray_release(e);
     }
     if (!ok || RAY_IS_ERR(ok) || !ov || RAY_IS_ERR(ov)) {
@@ -30556,7 +30567,7 @@ by_dict_done:
                             ray_release(tbl);
                             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cell ? cell : ray_error("domain", "select by: failed to read composite group key cell");
                         }
-                        row_key = ray_list_append(row_key, cell);
+                        row_key = ray_list_append_take(row_key, cell);
                         if (alloc) ray_release(cell);
                         if (!row_key || RAY_IS_ERR(row_key)) {
                             ray_release(composite_keys);
@@ -30566,7 +30577,7 @@ by_dict_done:
                             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return row_key ? row_key : ray_error("oom", NULL);
                         }
                     }
-                    composite_keys = ray_list_append(composite_keys, row_key);
+                    composite_keys = ray_list_append_take(composite_keys, row_key);
                     ray_release(row_key);
                     if (!composite_keys || RAY_IS_ERR(composite_keys)) {
                         scratch_free(keycols_hdr);
@@ -30805,7 +30816,7 @@ by_dict_done:
                                         ? ((ray_t**)ray_data(row_key))[k] : NULL;
                             const char* sp = cell ? ray_str_ptr(cell) : "";
                             size_t slen = cell ? ray_str_len(cell) : 0;
-                            key_vec = ray_str_vec_append(key_vec, sp ? sp : "", sp ? slen : 0);
+                            key_vec = ray_str_vec_append_take(key_vec, sp ? sp : "", sp ? slen : 0);
                         }
                     } else if (kt == RAY_LIST) {
                         /* A LIST key's cells are the source's items: the key
@@ -30815,7 +30826,7 @@ by_dict_done:
                             ray_t* row_key = grp_items[gi * 2];
                             ray_t* cell = (row_key && row_key->type == RAY_LIST && k < row_key->len)
                                         ? ((ray_t**)ray_data(row_key))[k] : NULL;
-                            key_vec = ray_list_append(key_vec, cell ? cell : RAY_NULL_OBJ);
+                            key_vec = ray_list_append_take(key_vec, cell ? cell : RAY_NULL_OBJ);
                         }
                     } else {
                         /* The composite cells are SYM atoms (runtime ids,
@@ -30898,12 +30909,12 @@ by_dict_done:
                             bool src_has_nulls = ray_vec_may_have_nulls(sc);
                             for (int64_t gi = 0; gi < out_groups && dst && !RAY_IS_ERR(dst); gi++) {
                                 if (src_has_nulls && ray_vec_is_null(sc, fi[gi])) {
-                                    dst = ray_str_vec_append(dst, "", 0);
+                                    dst = ray_str_vec_append_take(dst, "", 0);
                                     if (dst && !RAY_IS_ERR(dst)) ray_vec_set_null(dst, dst->len - 1, true);
                                 } else {
                                     size_t slen = 0;
                                     const char* sp = ray_str_vec_get(sc, fi[gi], &slen);
-                                    dst = ray_str_vec_append(dst, sp ? sp : "", sp ? slen : 0);
+                                    dst = ray_str_vec_append_take(dst, sp ? sp : "", sp ? slen : 0);
                                 }
                             }
                         } else if (sc->type == RAY_LIST) {
@@ -31145,7 +31156,7 @@ by_dict_done:
                         for (int64_t gi = 0; gi < ngroups && dst && !RAY_IS_ERR(dst); gi++) {
                             size_t slen = 0;
                             const char* sp = ray_str_vec_get(sc, fi[gi], &slen);
-                            dst = ray_str_vec_append(dst, sp ? sp : "", sp ? slen : 0);
+                            dst = ray_str_vec_append_take(dst, sp ? sp : "", sp ? slen : 0);
                         }
                     } else if (sct == RAY_LIST) {
                         dst = ray_list_new((int32_t)ngroups);
@@ -31621,12 +31632,12 @@ by_dict_done:
                         ray_t* k = grp_items[gi * 2];
                         const char* sp = ray_str_ptr(k);
                         size_t slen = ray_str_len(k);
-                        key_vec = ray_str_vec_append(key_vec, sp ? sp : "", sp ? slen : 0);
+                        key_vec = ray_str_vec_append_take(key_vec, sp ? sp : "", sp ? slen : 0);
                     }
                 } else if (ktype == RAY_LIST) {
                     key_vec = ray_list_new(n_groups);
                     for (int64_t gi = 0; gi < n_groups && key_vec && !RAY_IS_ERR(key_vec); gi++)
-                        key_vec = ray_list_append(key_vec, grp_items[gi * 2]);
+                        key_vec = ray_list_append_take(key_vec, grp_items[gi * 2]);
                 } else {
                     uint8_t kattrs = key_src_has ? key_src_m.attrs : 0;
                     if (ktype == RAY_SYM)
@@ -31704,20 +31715,20 @@ by_dict_done:
                         if (src_has_nulls) {
                             for (int64_t gi = 0; gi < n_groups && dst && !RAY_IS_ERR(dst); gi++) {
                                 if (ray_vec_is_null(sc, fi[gi])) {
-                                    dst = ray_str_vec_append(dst, "", 0);
+                                    dst = ray_str_vec_append_take(dst, "", 0);
                                     if (dst && !RAY_IS_ERR(dst))
                                         ray_vec_set_null(dst, dst->len - 1, true);
                                 } else {
                                     size_t slen = 0;
                                     const char* sp = ray_str_vec_get(sc, fi[gi], &slen);
-                                    dst = ray_str_vec_append(dst, sp ? sp : "", sp ? slen : 0);
+                                    dst = ray_str_vec_append_take(dst, sp ? sp : "", sp ? slen : 0);
                                 }
                             }
                         } else {
                             for (int64_t gi = 0; gi < n_groups && dst && !RAY_IS_ERR(dst); gi++) {
                                 size_t slen = 0;
                                 const char* sp = ray_str_vec_get(sc, fi[gi], &slen);
-                                dst = ray_str_vec_append(dst, sp ? sp : "", sp ? slen : 0);
+                                dst = ray_str_vec_append_take(dst, sp ? sp : "", sp ? slen : 0);
                             }
                         }
                     } else if (sc->type == RAY_LIST) {
@@ -33526,7 +33537,7 @@ by_dict_done:
                                 if (whole_verb && gwhole && col && !RAY_IS_ERR(col) && !ray_is_atom(col) &&
                                     expr_one_value(expr, eval_tbl, 0)) {
                                     ray_t* cell = ray_list_new(1);
-                                    if (cell && !RAY_IS_ERR(cell)) cell = ray_list_append(cell, col);
+                                    if (cell && !RAY_IS_ERR(cell)) cell = ray_list_append_take(cell, col);
                                     ray_release(col);
                                     col = cell ? cell : ray_error("oom", NULL);
                                 }
@@ -33541,7 +33552,7 @@ by_dict_done:
                                 if (one_value && !whole_verb && col && !RAY_IS_ERR(col) &&
                                     !ray_is_atom(col) && is_agg_expr(expr)) {
                                     ray_t* cell = ray_list_new(1);
-                                    if (cell && !RAY_IS_ERR(cell)) cell = ray_list_append(cell, col);
+                                    if (cell && !RAY_IS_ERR(cell)) cell = ray_list_append_take(cell, col);
                                     ray_release(col);
                                     col = cell ? cell : ray_error("oom", NULL);
                                     whole_atom = col && !RAY_IS_ERR(col);
@@ -33890,13 +33901,13 @@ by_dict_done:
         int64_t rc = ray_table_ncols(result);
         for (int64_t c = 1; c < rc; c++)
             if (ray_table_col_name(result, c) == kname) { kname = ray_sym_intern("key", 3); break; }
-        ray_table_set_col_name(result, 0, kname);
+        query_rename_col(&result, 0, kname);
     }
     if (named_value_key && result && !RAY_IS_ERR(result) && ray_is_lazy(result))
         result = ray_lazy_materialize(result);
     if (named_value_key && result && !RAY_IS_ERR(result) && result->type == RAY_TABLE &&
         ray_table_ncols(result) > 0)
-        ray_table_set_col_name(result, 0, by_expr->i64);
+        query_rename_col(&result, 0, by_expr->i64);
     if (self_emit_set)
         ray_group_emit_filter_set(prev_self_emit);
     if (post_group_where_expr && result && !RAY_IS_ERR(result))
@@ -34074,19 +34085,19 @@ by_dict_done:
                     ray_is_vec(by_expr) && by_expr->type == RAY_SYM) {
                     const int64_t* aliases = (const int64_t*)ray_data(by_expr);
                     for (int64_t k = 0; k < n_key_cols && k < ncols; k++)
-                        ray_table_set_col_name(result, k, aliases[k]);
+                        query_rename_col(&result, k, aliases[k]);
                 }
                 /* Rename only the agg columns (positions after keys).
                  * Non-agg/fallback columns are named at scatter time. */
                 for (int64_t j = 0; j < n_aggs_real && n_key_cols + j < ncols; j++)
-                    ray_table_set_col_name(result, n_key_cols + j, agg_names[j]);
+                    query_rename_col(&result, n_key_cols + j, agg_names[j]);
                 /* The computed key's derived name yields to an output alias
                  * that spells the same. */
                 if (computed_single_key && ncols > 1) {
                     int64_t kname = ray_table_col_name(result, 0);
                     for (int64_t c = 1; c < ncols; c++)
                         if (ray_table_col_name(result, c) == kname) {
-                            ray_table_set_col_name(result, 0, ray_sym_intern("key", 3));
+                            query_rename_col(&result, 0, ray_sym_intern("key", 3));
                             break;
                         }
                 }
@@ -34108,7 +34119,7 @@ by_dict_done:
                         kid == take_id || kid == asc_id || kid == desc_id ||
                         kid == nearest_id) continue;
                     if (n_key_cols + j < ncols)
-                        ray_table_set_col_name(result, n_key_cols + j, kid);
+                        query_rename_col(&result, n_key_cols + j, kid);
                     j++;
                 }
             }
@@ -35568,10 +35579,10 @@ static ray_t* append_atom_to_col(ray_t* col_vec, ray_t* atom) {
             return ray_str_vec_append(col_vec, "", 0);
         int64_t idx = col_vec->len;
         uint8_t zero[16] = {0};
-        col_vec = ray_vec_append(col_vec, zero);
-        if (!RAY_IS_ERR(col_vec))
-            ray_vec_set_null(col_vec, idx, true);
-        return col_vec;
+        ray_t* out = ray_vec_append(col_vec, zero);   /* plain: col_vec is the caller's, as in every arm here (#1864) */
+        if (!RAY_IS_ERR(out))
+            ray_vec_set_null(out, idx, true);
+        return out;
     }
     int8_t ct = col_vec->type;
     int8_t at = atom->type;
@@ -35656,6 +35667,15 @@ static ray_t* append_atom_to_col(ray_t* col_vec, ray_t* atom) {
     default:
         return ray_error("type", "insert: unsupported column type %s", ray_type_name(ct));
     }
+}
+
+/* append_atom_to_col consuming col_vec (#1864): a failure releases it.  For
+ * a column the caller owns alone; the in-place insert, whose column is the
+ * table's slot, keeps the plain form. */
+static ray_t* append_atom_to_col_take(ray_t* col_vec, ray_t* atom) {
+    ray_t* out = append_atom_to_col(col_vec, atom);
+    if (out != col_vec && (!out || RAY_IS_ERR(out))) ray_release(col_vec);
+    return out ? out : ray_error("oom", NULL);
 }
 
 /* Build a fresh boxed LIST column.  A table payload supplies a LIST column
@@ -36048,7 +36068,7 @@ static ray_t* update_strip_inert_do(ray_t* e, ray_t* tbl, int depth) {
         if (RAY_IS_ERR(x)) { if (out) ray_release(out); return x; }
         if (!out) {
             out = ray_list_new((int32_t)e->len);
-            for (int64_t j = 0; j < e->len && out && !RAY_IS_ERR(out); j++) out = ray_list_append(out, es[j]);
+            for (int64_t j = 0; j < e->len && out && !RAY_IS_ERR(out); j++) out = ray_list_append_take(out, es[j]);
             if (!out || RAY_IS_ERR(out)) { ray_release(x); return out ? out : ray_error("oom", NULL); }
             out->attrs = e->attrs;
         }
@@ -36221,7 +36241,7 @@ static ray_t* update_eval_kept(ray_t* tbl, ray_t* expr, ray_t* kept) {
         return ray_error("oom", NULL);
     }
     ((int64_t*)ray_data(keys))[keys->len++] = name;
-    vals = ray_list_append(vals, expr);
+    vals = ray_list_append_take(vals, expr);
     ray_t* d = ray_dict_new(keys, vals);
     if (!d || RAY_IS_ERR(d)) return d ? d : ray_error("oom", NULL);
     ray_t* plan = select_plan_running_where(d, tbl, false);
@@ -36404,7 +36424,7 @@ static bool update_agg_is_cell(ray_t* expr, ray_t* tbl) {
 static ray_t* update_cell_rows(ray_t* expr, ray_t* tbl, ray_t* val, int64_t n) {
     if (!val || RAY_IS_ERR(val) || ray_is_atom(val) || !update_agg_is_cell(expr, tbl)) return val;
     ray_t* l = ray_list_new((int32_t)n);
-    for (int64_t r = 0; r < n && l && !RAY_IS_ERR(l); r++) l = ray_list_append(l, val);
+    for (int64_t r = 0; r < n && l && !RAY_IS_ERR(l); r++) l = ray_list_append_take(l, val);
     ray_release(val);
     return l ? l : ray_error("oom", NULL);
 }
@@ -36988,7 +37008,7 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                         ray_t** cells = (ray_t**)ray_data(full_col);
                         int64_t* lidx = (int64_t*)ray_data(idx_vec);
                         for (int64_t r = 0; r < gsize && !RAY_IS_ERR(sub_list); r++)
-                            sub_list = ray_list_append(sub_list, cells[lidx[r]]);
+                            sub_list = ray_list_append_take(sub_list, cells[lidx[r]]);
                         if (RAY_IS_ERR(sub_list)) { ray_release(sub_tbl); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_list; }
                         sub_tbl = ray_table_add_col(sub_tbl, cn, sub_list);
                         ray_release(sub_list);
@@ -37372,7 +37392,7 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                     ray_t** vals = atom ? NULL : (ray_t**)ray_data(expr_vec);
                     for (int64_t r = 0; r < nrows; r++) {
                         ray_t* elem = !mask[r] ? orig_elems[r] : atom ? expr_vec : vals[r];
-                        new_list = ray_list_append(new_list, elem);
+                        new_list = ray_list_append_take(new_list, elem);
                         if (RAY_IS_ERR(new_list)) { ray_release(expr_vec); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_list; }
                     }
                     ray_release(expr_vec);
@@ -37398,7 +37418,7 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                         const char* sp = ray_str_ptr(expr_vec);
                         size_t sl = ray_str_len(expr_vec);
                         for (int64_t r = 0; r < nrows; r++) {
-                            bcast = ray_str_vec_append(bcast, sp, sl);
+                            bcast = ray_str_vec_append_take(bcast, sp, sl);
                             if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return bcast; }
                         }
                     } else {
@@ -37423,7 +37443,7 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                             #undef BCAST_FILL
                             bcast->len = nrows;
                         } else for (int64_t r = 0; r < nrows; r++) {
-                            bcast = ray_vec_append(bcast, elem);
+                            bcast = ray_vec_append_take(bcast, elem);
                             if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return bcast; }
                         }
                     }
@@ -37481,7 +37501,7 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                         ray_t* src_vec = mask[r] ? expr_vec : orig_col;
                         size_t slen = 0;
                         const char* sp = ray_str_vec_get(src_vec, r, &slen);
-                        new_col = ray_str_vec_append(new_col, sp ? sp : "", sp ? slen : 0);
+                        new_col = ray_str_vec_append_take(new_col, sp ? sp : "", sp ? slen : 0);
                         if (RAY_IS_ERR(new_col)) { ray_release(expr_vec); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_col; }
                         if (ray_vec_is_null(src_vec, r))
                             ray_vec_set_null(new_col, new_col->len - 1, true);
@@ -37494,7 +37514,7 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                     for (int64_t r = 0; r < nrows; r++) {
                         ray_t* src_vec = mask[r] ? expr_vec : orig_col;
                         int64_t sym_val = sym_cell_runtime_id(src_vec, r);
-                        new_col = ray_vec_append(new_col, &sym_val);
+                        new_col = ray_vec_append_take(new_col, &sym_val);
                         if (RAY_IS_ERR(new_col)) { ray_release(expr_vec); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_col; }
                         if (ray_vec_is_null(src_vec, r))
                             ray_vec_set_null(new_col, new_col->len - 1, true);
@@ -37531,7 +37551,7 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                     } else for (int64_t r = 0; r < nrows; r++) {
                         ray_t* src_vec = mask[r] ? expr_vec : orig_col;
                         uint8_t* base  = mask[r] ? expr_data : orig_data;
-                        new_col = ray_vec_append(new_col, base + r * elem_sz);
+                        new_col = ray_vec_append_take(new_col, base + r * elem_sz);
                         if (RAY_IS_ERR(new_col)) { ray_release(expr_vec); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_col; }
                         /* Propagate null bit from whichever side supplied
                          * the value.  Without this, masking in a typed-null
@@ -37714,7 +37734,7 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                     if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return bcast; }
                     for (int64_t r = 0; r < nrows; r++) {
                         ray_retain(expr_vec);
-                        bcast = ray_list_append(bcast, expr_vec);
+                        bcast = ray_list_append_take(bcast, expr_vec);
                         ray_release(expr_vec);
                         if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return bcast; }
                     }
@@ -37728,7 +37748,7 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                     const char* sp = ray_str_ptr(expr_vec);
                     size_t sl = ray_str_len(expr_vec);
                     for (int64_t r = 0; r < nrows; r++) {
-                        bcast = ray_str_vec_append(bcast, sp, sl);
+                        bcast = ray_str_vec_append_take(bcast, sp, sl);
                         if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return bcast; }
                     }
                 } else {
@@ -37738,7 +37758,7 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                     uint8_t elem[16];
                     update_atom_cell(expr_vec, ct, ray_elem_size(ct), elem);
                     for (int64_t r = 0; r < nrows; r++) {
-                        bcast = ray_vec_append(bcast, elem);
+                        bcast = ray_vec_append_take(bcast, elem);
                         if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return bcast; }
                     }
                 }
@@ -37845,7 +37865,7 @@ no_where_add_col:
                 const char* sp = (expr_vec->type == -RAY_STR) ? ray_str_ptr(expr_vec) : "";
                 size_t sl = (expr_vec->type == -RAY_STR) ? ray_str_len(expr_vec) : 0;
                 for (int64_t r = 0; r < nrows; r++) {
-                    bcast = ray_str_vec_append(bcast, sp, sl);
+                    bcast = ray_str_vec_append_take(bcast, sp, sl);
                     if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return bcast; }
                 }
             } else {
@@ -37854,7 +37874,7 @@ no_where_add_col:
                 uint8_t elem[16];
                 update_atom_cell(expr_vec, ct, ray_elem_size(ct), elem);
                 for (int64_t r = 0; r < nrows; r++) {
-                    bcast = ray_vec_append(bcast, elem);
+                    bcast = ray_vec_append_take(bcast, elem);
                     if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return bcast; }
                 }
             }
@@ -38287,7 +38307,7 @@ static ray_t* normalize_parted_insert_rows(ray_t* tbl,
                     ray_release(vals);
                     return one ? one : ray_error("oom", NULL);
                 }
-                one = ray_list_append(one, items[c]);
+                one = ray_list_append_take(one, items[c]);
                 if (!one || RAY_IS_ERR(one)) {
                     ray_release(vals);
                     return one ? one : ray_error("oom", NULL);
@@ -38369,7 +38389,7 @@ static ray_t* normalize_parted_insert_rows(ray_t* tbl,
                     ray_release(vals);
                     return one ? one : ray_error("oom", NULL);
                 }
-                one = ray_list_append(one, item);
+                one = ray_list_append_take(one, item);
                 if (!one || RAY_IS_ERR(one)) {
                     ray_release(vals);
                     return one ? one : ray_error("oom", NULL);
@@ -39315,25 +39335,25 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             }
             if (is_target_list) {
                 /* Always one slot — never splice on append. */
-                tbl = ray_list_append(tbl, val);
+                tbl = ray_list_append_take(tbl, val);
                 result = tbl;
             } else if (val->type == -tt) {
                 /* Atom of matching type → element append */
                 int64_t new_idx = tbl->len;
                 if (tt == RAY_STR) {
-                    tbl = ray_str_vec_append(tbl, ray_str_ptr(val), ray_str_len(val));
+                    tbl = ray_str_vec_append_take(tbl, ray_str_ptr(val), ray_str_len(val));
                 } else if (tt == RAY_SYM) {
                     int64_t s = val->i64;
-                    tbl = ray_vec_append(tbl, &s);
+                    tbl = ray_vec_append_take(tbl, &s);
                 } else if (tt == RAY_GUID) {
                     /* GUID atom's 16-byte payload lives in val->obj; typed-null
                      * atoms have obj==NULL — write zeros and let the post-call
                      * RAY_ATOM_IS_NULL check mark the slot. */
                     static const uint8_t zero_guid[16] = {0};
                     const void* src = val->obj ? ray_data(val->obj) : zero_guid;
-                    tbl = ray_vec_append(tbl, src);
+                    tbl = ray_vec_append_take(tbl, src);
                 } else {
-                    tbl = ray_vec_append(tbl, &val->u8);
+                    tbl = ray_vec_append_take(tbl, &val->u8);
                 }
                 if (tbl && !RAY_IS_ERR(tbl) && RAY_ATOM_IS_NULL(val))
                     ray_vec_set_null(tbl, new_idx, true);
@@ -39366,7 +39386,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
 
             if (is_target_list) {
                 if (idx_arg->type == -RAY_I64) {
-                    tbl = ray_list_insert_at(tbl, idx_arg->i64, val);
+                    tbl = ray_list_insert_at_take(tbl, idx_arg->i64, val);
                     result = tbl;
                 } else if (idx_arg->type == RAY_I64) {
                     if (val->type != RAY_LIST) {
@@ -39392,15 +39412,15 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                             ray_release(tbl);
                         } else if (tt == RAY_SYM) {
                             int64_t s = val->i64;
-                            tbl = ray_vec_insert_at(tbl, i, &s);
+                            tbl = ray_vec_insert_at_take(tbl, i, &s);
                             result = tbl;
                         } else if (tt == RAY_GUID) {
                             static const uint8_t zero_guid[16] = {0};
                             const void* src = val->obj ? ray_data(val->obj) : zero_guid;
-                            tbl = ray_vec_insert_at(tbl, i, src);
+                            tbl = ray_vec_insert_at_take(tbl, i, src);
                             result = tbl;
                         } else {
-                            tbl = ray_vec_insert_at(tbl, i, &val->u8);
+                            tbl = ray_vec_insert_at_take(tbl, i, &val->u8);
                             result = tbl;
                         }
                         if (result && !RAY_IS_ERR(result) && RAY_ATOM_IS_NULL(val))
@@ -39713,7 +39733,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                         int64_t m = pay->len;
                         res = col;
                         for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
-                            res = ray_list_append(res, cells[k]);
+                            res = ray_list_append(res, cells[k]);   /* plain: res aliases slots[c], which the roll-back reads (#1864) */
                             if (!RAY_IS_ERR(res)) { slots[c] = res; col = res; }
                         }
                     }
@@ -39734,12 +39754,12 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
                     int64_t at = res->len;
                     if (pay_nulls && ray_vec_is_null(pay, k)) {
-                        res = ray_str_vec_append(res, "", 0);
+                        res = ray_str_vec_append(res, "", 0);   /* plain: res aliases slots[c], which the roll-back reads (#1864) */
                         if (!RAY_IS_ERR(res)) ray_vec_set_null(res, at, true);
                     } else {
                         size_t slen = 0;
                         const char* sp = ray_str_vec_get(pay, k, &slen);
-                        res = ray_str_vec_append(res, sp ? sp : "", sp ? slen : 0);
+                        res = ray_str_vec_append(res, sp ? sp : "", sp ? slen : 0);   /* plain: res aliases slots[c], which the roll-back reads (#1864) */
                     }
                     if (!RAY_IS_ERR(res)) { slots[c] = res; col = res; }
                 }
@@ -39753,7 +39773,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
                     int64_t sym_val = sym_cell_runtime_id(pay, k);
                     int64_t at = res->len;
-                    res = ray_vec_append(res, &sym_val);
+                    res = ray_vec_append(res, &sym_val);   /* plain: res aliases slots[c], which the roll-back reads (#1864) */
                     if (!RAY_IS_ERR(res)) {
                         slots[c] = res;
                         col = res;
@@ -39910,13 +39930,13 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         if (ct == RAY_STR) {
             for (int64_t r = 0; r < nrows; r++) {
                 if (src_has_nulls && ray_vec_is_null(orig_col, r)) {
-                    new_col = ray_str_vec_append(new_col, "", 0);
+                    new_col = ray_str_vec_append_take(new_col, "", 0);
                     if (!RAY_IS_ERR(new_col))
                         ray_vec_set_null(new_col, new_col->len - 1, true);
                 } else {
                     size_t slen = 0;
                     const char* sp = ray_str_vec_get(orig_col, r, &slen);
-                    new_col = ray_str_vec_append(new_col, sp ? sp : "", sp ? slen : 0);
+                    new_col = ray_str_vec_append_take(new_col, sp ? sp : "", sp ? slen : 0);
                 }
                 if (RAY_IS_ERR(new_col)) { ray_release(result); INSERT_REBUILD_FREE(); return new_col; }
             }
@@ -39926,7 +39946,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
              * the runtime domain (raw-copy fast path pre-flip). */
             for (int64_t r = 0; r < nrows; r++) {
                 int64_t sym_val = sym_cell_runtime_id(orig_col, r);
-                new_col = ray_vec_append(new_col, &sym_val);
+                new_col = ray_vec_append_take(new_col, &sym_val);
                 if (RAY_IS_ERR(new_col)) { ray_release(result); INSERT_REBUILD_FREE(); return new_col; }
                 if (src_has_nulls && ray_vec_is_null(orig_col, r))
                     ray_vec_set_null(new_col, new_col->len - 1, true);
@@ -39935,7 +39955,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             size_t elem_sz = ray_elem_size(ct);
             uint8_t* src = (uint8_t*)ray_data(orig_col);
             for (int64_t r = 0; r < nrows; r++) {
-                new_col = ray_vec_append(new_col, src + r * elem_sz);
+                new_col = ray_vec_append_take(new_col, src + r * elem_sz);
                 if (RAY_IS_ERR(new_col)) { ray_release(result); INSERT_REBUILD_FREE(); return new_col; }
                 if (src_has_nulls && ray_vec_is_null(orig_col, r))
                     ray_vec_set_null(new_col, new_col->len - 1, true);
@@ -39946,10 +39966,10 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         if (!row_elems[c]) {
             /* NULL = null value for this column type */
             ray_t* null_atom = ray_typed_null(-ct);
-            new_col = append_atom_to_col(new_col, null_atom);
+            new_col = append_atom_to_col_take(new_col, null_atom);
             ray_release(null_atom);
         } else if (ray_is_atom(row_elems[c])) {
-            new_col = append_atom_to_col(new_col, row_elems[c]);
+            new_col = append_atom_to_col_take(new_col, row_elems[c]);
         } else if (row_elems[c]->type == ct) {
             /* Same-typed vector → splice; preserves the column type. */
             ray_t* merged = ray_concat_fn(new_col, row_elems[c]);
@@ -39972,16 +39992,16 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 }
                 if (!e) {
                     ray_t* na = ray_typed_null(-ct);
-                    new_col = append_atom_to_col(new_col, na);
+                    new_col = append_atom_to_col_take(new_col, na);
                     ray_release(na);
                 } else {
-                    new_col = append_atom_to_col(new_col, e);
+                    new_col = append_atom_to_col_take(new_col, e);
                     if (alloc) ray_release(e);
                 }
                 if (RAY_IS_ERR(new_col)) break;
             }
         } else {
-            new_col = append_atom_to_col(new_col, row_elems[c]);
+            new_col = append_atom_to_col_take(new_col, row_elems[c]);
         }
         if (RAY_IS_ERR(new_col)) { ray_release(result); INSERT_REBUILD_FREE(); return new_col; }
 
@@ -41640,15 +41660,15 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
         if (ct == RAY_STR) {
             for (int64_t r = 0; r < nrows; r++) {
                 if (r == match_row && has_new_val) {
-                    new_col = append_atom_to_col(new_col, row_elems[c]);
+                    new_col = append_atom_to_col_take(new_col, row_elems[c]);
                 } else if (src_has_nulls && ray_vec_is_null(orig_col, r)) {
-                    new_col = ray_str_vec_append(new_col, "", 0);
+                    new_col = ray_str_vec_append_take(new_col, "", 0);
                     if (!RAY_IS_ERR(new_col))
                         ray_vec_set_null(new_col, new_col->len - 1, true);
                 } else {
                     size_t slen = 0;
                     const char* sp = ray_str_vec_get(orig_col, r, &slen);
-                    new_col = ray_str_vec_append(new_col, sp ? sp : "", sp ? slen : 0);
+                    new_col = ray_str_vec_append_take(new_col, sp ? sp : "", sp ? slen : 0);
                 }
                 if (RAY_IS_ERR(new_col)) { ray_release(result); ray_release(tbl); ray_release(key_sym); ray_release(row); return new_col; }
             }
@@ -41658,10 +41678,10 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
              * runtime domain (raw-copy fast path pre-flip). */
             for (int64_t r = 0; r < nrows; r++) {
                 if (r == match_row && has_new_val) {
-                    new_col = append_atom_to_col(new_col, row_elems[c]);
+                    new_col = append_atom_to_col_take(new_col, row_elems[c]);
                 } else {
                     int64_t sym_val = sym_cell_runtime_id(orig_col, r);
-                    new_col = ray_vec_append(new_col, &sym_val);
+                    new_col = ray_vec_append_take(new_col, &sym_val);
                     if (!RAY_IS_ERR(new_col) && src_has_nulls && ray_vec_is_null(orig_col, r))
                         ray_vec_set_null(new_col, new_col->len - 1, true);
                 }
@@ -41672,9 +41692,9 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             uint8_t* src = (uint8_t*)ray_data(orig_col);
             for (int64_t r = 0; r < nrows; r++) {
                 if (r == match_row && has_new_val) {
-                    new_col = append_atom_to_col(new_col, row_elems[c]);
+                    new_col = append_atom_to_col_take(new_col, row_elems[c]);
                 } else {
-                    new_col = ray_vec_append(new_col, src + r * elem_sz);
+                    new_col = ray_vec_append_take(new_col, src + r * elem_sz);
                     if (!RAY_IS_ERR(new_col) && src_has_nulls && ray_vec_is_null(orig_col, r))
                         ray_vec_set_null(new_col, new_col->len - 1, true);
                 }

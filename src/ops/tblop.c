@@ -1047,12 +1047,13 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
                     ray_error_free(v); ix_fail = true; break;   /* boxed here, owned here */
                 }
                 if (!a2) ray_retain(v);
-                tup = ray_list_append(tup, v);
+                tup = ray_list_append_take(tup, v);
                 ray_release(v);
             }
             if (ix_fail) { ray_release(tup); break; }   /* owned here, with the parts made */
-            ix_list = ray_list_append(ix_list, tup);
+            ix_list = ray_list_append_take(ix_list, tup);
             ray_release(tup);
+            if (RAY_IS_ERR(ix_list)) { ix_fail = true; break; }   /* the list is gone with its error (#1864) */
         }
     }
     scratch_free(g_icols_hdr); /* last use of g_icols was inside this loop */
@@ -1097,7 +1098,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
 
 fb_cleanup:
     ray_free(gmap);
-    ray_release(ix_list);
+    if (ix_list && RAY_IS_ERR(ix_list)) ray_error_free(ix_list); else ray_release(ix_list);   /* ours (#1864) */
     /* agg_results is a RAY_LIST that owns each ar[gi]; ray_free walks
      * its children via ray_release_owned_refs, so a manual loop here
      * would double-release every slot and corrupt the slab freelist. */
@@ -2471,14 +2472,14 @@ ray_t* ray_unify_fn(ray_t* a, ray_t* b) {
     if (a->type == b->type || ray_is_atom(a) || ray_is_atom(b)) {
         /* Same type or atoms: return as-is */
         ray_retain(a); ray_retain(b);
-        result = ray_list_append(result, a); ray_release(a);
-        result = ray_list_append(result, b); ray_release(b);
+        result = ray_list_append_take(result, a); ray_release(a);
+        result = ray_list_append_take(result, b); ray_release(b);
         return result;
     }
 
     /* Different vector types: wrapped as-is, no coercion to a common type. */
     ray_retain(a); ray_retain(b);
-    result = ray_list_append(result, a); ray_release(a);
-    result = ray_list_append(result, b); ray_release(b);
+    result = ray_list_append_take(result, a); ray_release(a);
+    result = ray_list_append_take(result, b); ray_release(b);
     return result;
 }

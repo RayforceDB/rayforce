@@ -430,7 +430,7 @@ static ray_t* col_load_str_list(const uint8_t* ptr, size_t remaining) {
         if (!s || RAY_IS_ERR(s)) { ray_release(list); return s; }
         ptr += slen; remaining -= slen;
 
-        list = ray_list_append(list, s);
+        list = ray_list_append_take(list, s);
         ray_release(s);  /* list_append retains */
         if (!list || RAY_IS_ERR(list)) return list;
     }
@@ -770,7 +770,7 @@ static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining) {
         for (int64_t i = 0; i < count; i++) {
             ray_t* elem = col_read_recursive(pp, remaining);
             if (!elem || RAY_IS_ERR(elem)) { ray_release(list); return elem; }
-            list = ray_list_append(list, elem);
+            list = ray_list_append_take(list, elem);
             ray_release(elem);
             if (!list || RAY_IS_ERR(list)) return list;
         }
