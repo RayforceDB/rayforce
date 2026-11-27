@@ -229,6 +229,11 @@ int32_t   ray_env_scope_depth(void);
 bool      ray_env_query_scope_above(int32_t depth);
 ray_err_t ray_env_set_local(int64_t sym_id, ray_t* val);
 ray_t*    ray_env_get_lexical_local(int64_t sym_id);
+/* A read of the lazy handle `lazy` a lookup found bound to `sym_id`: forced
+ * at that binding, as any read of the name forces it (#1860).  The concrete
+ * value, owned; the value's own error, owned; or `lazy` retained when no
+ * frame binds that very object. */
+ray_t*    ray_env_read_bound(int64_t sym_id, ray_t* lazy);
 /* The same for a body an `eval` window's text calls: every window is
  * passed by (see ray_scope_frame_t.eval_window). */
 ray_t*    ray_env_get_lexical_local_callee(int64_t sym_id);

@@ -264,7 +264,7 @@ static int32_t env_frame_lexical_count(const ray_scope_frame_t* f) {
 /* `in_callee`: the name is looked up for code a compiled frame's text
  * calls (a helper body the planner inlines), so no eval window is its
  * scope; otherwise the nearest window is, and none below it. */
-static ray_t* env_lexical_local_impl(int64_t sym_id, bool in_callee) {
+static ray_t* env_lexical_local_impl(int64_t sym_id, bool in_callee, bool force) {
     if (!__VM) return NULL;
     for (int32_t d = __VM->scope_depth - 1; d >= __VM->scope_base; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
@@ -272,20 +272,39 @@ static ray_t* env_lexical_local_impl(int64_t sym_id, bool in_callee) {
         if (f->lexical) in_callee = true;
         if (f->eval_window && in_callee) continue;
         int32_t n = env_frame_lexical_count(f);
-        for (int32_t i = 0; i < n; i++)
-            if (f->keys[i] == sym_id) return f->vals[i];
+        for (int32_t i = 0; i < n; i++) {
+            if (f->keys[i] != sym_id) continue;
+            ray_t* v = f->vals[i];
+            if (force && v && ray_is_lazy(v) && RAY_LAZY_GRAPH(v) != RAY_LAZY_G_FAILED) {
+                /* The planner takes the value a local holds to decide a plan
+                 * and to compile it: a lazy one is settled to its concrete
+                 * value here, so the query reads it as it reads that value
+                 * (#1868).  A failure keeps the handle bound with its error
+                 * (RAY_LAZY_G_FAILED), raised only by a read that happens. */
+                ray_t* r = env_frame_force(f, i);
+                if (RAY_IS_ERR(r)) { ray_error_free(r); return f->vals[i]; }
+                return r;
+            }
+            return v;
+        }
         if (f->eval_window) in_callee = true;
         if (f->kind == RAY_SCOPE_CALL) break;
     }
     return NULL;
 }
 
+ray_t* ray_env_read_bound(int64_t sym_id, ray_t* lazy) {
+    ray_t* v = env_force_binding(sym_id, lazy);
+    if (v && !RAY_IS_ERR(v)) ray_retain(v);
+    return v;
+}
+
 ray_t* ray_env_get_lexical_local(int64_t sym_id) {
-    return env_lexical_local_impl(sym_id, false);
+    return env_lexical_local_impl(sym_id, false, true);
 }
 
 ray_t* ray_env_get_lexical_local_callee(int64_t sym_id) {
-    return env_lexical_local_impl(sym_id, true);
+    return env_lexical_local_impl(sym_id, true, true);
 }
 
 int32_t ray_env_lexical_scope_depth(int64_t sym_id) {
@@ -302,7 +321,7 @@ int32_t ray_env_lexical_scope_depth(int64_t sym_id) {
 }
 
 bool ray_env_has_lexical_local(int64_t sym_id) {
-    return ray_env_get_lexical_local(sym_id) != NULL;
+    return env_lexical_local_impl(sym_id, false, false) != NULL;   /* a test, no read */
 }
 
 ray_err_t ray_env_set_query_local(int64_t sym_id, ray_t* val) {

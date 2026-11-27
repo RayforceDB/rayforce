@@ -1498,6 +1498,16 @@ bool ray_retain_owned_refs(ray_t* v) {
                 ray_t* t = *(ray_t**)ray_data(v);
                 if (t) ray_retain(t);
             }
+#ifdef DEBUG
+            /* A copy taken while another owner settles the handle would keep
+             * the SETTLING sentinel, and a read of it would wait for a
+             * publication that goes to the original only.  No path copies a
+             * lazy handle; this keeps one from doing so silently. */
+            if (RAY_LAZY_GRAPH(v) == RAY_LAZY_G_SETTLING) {
+                fprintf(stderr, "ray_retain_owned_refs: copy of a lazy handle while it settles\n");
+                abort();
+            }
+#endif
             if (RAY_LAZY_OP(v) && RAY_LAZY_GRAPH(v) == RAY_LAZY_G_SETTLED)
                 ray_retain((ray_t*)RAY_LAZY_OP(v));      /* the copy keeps the result too */
             if (RAY_LAZY_OP(v) && RAY_LAZY_GRAPH(v) == RAY_LAZY_G_FAILED) {   /* and its own error */

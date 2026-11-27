@@ -1,0 +1,36 @@
+;; A query reading a local that holds a lazy value (a parameter holding
+;; (distinct x)) answered as if the value were one item (#1868): the
+;; planner took the handle as a scalar, since ray_is_atom is true of every
+;; type from RAY_LAMBDA up.  The planner now reads the local's concrete
+;; value, and each query answers as it does over the same value given
+;; concretely, the free-vector rule's errors included.
+(set T (table [a b] (list [1 2 1 3] [10 20 30 40])))
+(set E1868 (fn [f x] (try (f x) (fn [e] (at e 'code)))))
+(set q1 (fn [v] (count (select {from: T where: (> a (count v))}))))
+(set q2 (fn [v] (at (update {from: T b: (+ b 1) where: (> a (count v))}) 'b)))
+(set q3 (fn [v] (at (select {from: T n: (+ a (count v))}) 'n)))
+(set q4 (fn [v] (at (select {from: T s: (sum v)}) 's)))
+(set q5 (fn [v] (count (do (select {from: T where: (> a (count v))}) (select {from: T where: (> a (count v))})))))
+(set q6 (fn [v] (count (select {from: T where: (in a v)}))))
+(set q7 (fn [v] (at (select {from: T n: (count v) by: a}) 'n)))
+(q1 (distinct [1 2 1])) -- 1
+(q1 (distinct [1 2 1])) -- (q1 [1 2])
+(q2 (distinct [1 2 1])) -- [10 20 30 41]
+(q2 (distinct [1 2 1])) -- (q2 [1 2])
+(E1868 q3 (distinct [1 2 1])) -- (E1868 q3 [1 2])
+(E1868 q4 (distinct [1 2 1])) -- (E1868 q4 [1 2])
+(q5 (distinct [1 2 1])) -- 1
+(q5 (distinct [1 2 1])) -- (q5 [1 2])
+(q6 (distinct [1 2 1])) -- (q6 [1 2])
+(E1868 q7 (distinct [1 2 1])) -- (E1868 q7 [1 2])
+;; asc and reverse keep their order through the query
+(at ((fn [v] (select {from: T n: (at v 0)})) (asc [3 1 2])) 'n) -- [1 1 1 1]
+(at ((fn [v] (select {from: T n: (at v 0)})) (reverse [3 1 2])) 'n) -- [2 2 2 2]
+;; a value that fails to materialize: a read raises the value's own error,
+;; an operand the query skips raises nothing, and a read after a caught
+;; failure raises the same error again
+(set bad1868 (fn [] (sum (distinct ['a 'b]))))
+(set own1868 (try ((fn [v] (count v)) (bad1868)) (fn [e] (at e 'msg))))
+(try ((fn [v] (count (select {from: T where: (> a (count v))}))) (bad1868)) (fn [e] (at e 'msg))) -- own1868
+((fn [v] (count (select {from: T where: (and false (> (count v) 0))}))) (bad1868)) -- 0
+(try ((fn [v] (do (try (select {from: T where: (> a (count v))}) 0) (count v))) (bad1868)) (fn [e] (at e 'msg))) -- own1868
