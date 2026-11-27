@@ -2197,6 +2197,16 @@ fail:
  * Parallel parse context and callback
  * -------------------------------------------------------------------------- */
 
+/* The first bad row a strict parse saw (#1885); row INT64_MAX: none. */
+enum { CSV_BAD_CELLS = 1, CSV_BAD_CELL, CSV_BAD_AFTER_QUOTE, CSV_BAD_UNCLOSED,
+       CSV_BAD_LONE_CR, CSV_BAD_RANGE, CSV_BAD_NULLV, CSV_BAD_PRECISION,
+       CSV_BAD_UNDERFLOW };
+typedef struct {
+    int64_t row;
+    int32_t col;        /* the bad cell's column; -1 for CSV_BAD_CELLS */
+    uint8_t kind;
+} csv_bad_t;
+
 typedef struct {
     const char*       buf;
     size_t            buf_size;
@@ -2211,7 +2221,50 @@ typedef struct {
     bool*             worker_had_null; /* [n_workers * n_cols] */
     bool*             worker_had_escaped; /* [n_workers * n_cols] */
     uint8_t*          row_done;     /* [n_rows], marks initialized strref rows */
+    /* strict only (#1885); last, so the default parse's offsets are as they were */
+    csv_bad_t*        worker_bad;   /* [n_workers]: the first bad row each saw */
+    size_t            rows_end;     /* where the last row ends: the next chunk's start */
 } csv_par_ctx_t;
+
+/* Strict mode (#1885): which rows a strict load refuses.  A row is cut into
+ * cells as the lenient reader cuts it; a cell is a field ended by the
+ * delimiter, the line end or the end of the file, so a row has one cell more
+ * than the delimiters it holds before its line end, and a blank line is one
+ * empty cell.  A row is bad when its cell count is not the schema's, when a
+ * quoted cell has text after its closing quote or no closing quote, or when
+ * a non-empty cell does not parse as its column's type -- exactly the cells
+ * the lenient reader turns into nulls (or, for B8 and U8, which hold none,
+ * into false and 0).  A number out of its column's range -- which the
+ * lenient reader wraps (300 in a U8 is 44), stores as the null sentinel
+ * (INT16_MIN in an I16), or turns into an infinity (1e39 in an F32) -- is
+ * bad too: a wrapped value is worse than a null.  (Out-of-range I64 and
+ * non-finite F64 text already parses to a null.)  An empty cell is a null
+ * in both modes.  A file
+ * without quotes splits rows at LF only, and a cell ends at CR, so text
+ * after a lone CR inside a row is never read: strict refuses it too. */
+static bool csv_quote_closed(const char* p, const char* buf_end) {
+    for (p++; p < buf_end; p++) {
+        if (*p != '"') continue;
+        if (p + 1 < buf_end && p[1] == '"') { p++; continue; }
+        return true;
+    }
+    return false;
+}
+
+/* After the scan of a field that started at p0 and ended at p: did it end on
+ * the delimiter (another cell follows), and is the cell well formed? */
+RAY_INLINE bool csv_strict_cell_end(const char* p0, const char* p,
+                                    const char* row_end, const char* buf_end,
+                                    char delim, uint8_t* kind) {
+    if (p0 < buf_end && *p0 == '"' && !csv_quote_closed(p0, buf_end)) {
+        *kind = CSV_BAD_UNCLOSED;
+        return false;
+    }
+    if (p > p0 && p[-1] == delim) return true;
+    if (p < row_end && p < buf_end && *p != '\n' && *p != '\r')
+        *kind = CSV_BAD_AFTER_QUOTE;
+    return false;
+}
 
 static void csv_parse_fn(void* arg, uint32_t worker_id,
                           int64_t start, int64_t end_row) {
@@ -2395,11 +2448,438 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
     }
 }
 
+/* Why a non-empty number cell did not parse: an integer or a finite-looking
+ * float too big for the type is out of range; anything else is not one. */
+static uint8_t csv_bad_int_kind(const char* p, size_t n) {
+    size_t i = (n > 0 && (p[0] == '-' || p[0] == '+')) ? 1 : 0;
+    if (i == n) return CSV_BAD_CELL;
+    for (; i < n; i++) if (p[i] < '0' || p[i] > '9') return CSV_BAD_CELL;
+    return CSV_BAD_RANGE;
+}
+
+/* A float text with a non-zero digit before its exponent: if it stores as
+ * zero it underflowed (#1885 review).  Rounding to the nearest value, a
+ * subnormal included, is not a loss; a non-zero text stored as 0 is. */
+static bool csv_float_text_nonzero(const char* p, size_t n) {
+    for (size_t i = 0; i < n && p[i] != 'e' && p[i] != 'E'; i++)
+        if (p[i] >= '1' && p[i] <= '9') return true;
+    return false;
+}
+
+static uint8_t csv_bad_float_kind(const char* p, size_t n) {
+    bool digit = false;
+    for (size_t i = 0; i < n; i++) if (p[i] >= '0' && p[i] <= '9') { digit = true; break; }
+    double v;
+    return digit && ray_parse_f64(p, n, &v) == n ? CSV_BAD_RANGE : CSV_BAD_CELL;
+}
+
+/* Temporal cells the lenient parsers take but store as something other than
+ * the text says (#1885 review): an instant or a duration past the type's
+ * range, which the arithmetic wraps, and fraction digits past the type's
+ * precision, which are dropped.  Called after a lenient parse succeeded. */
+
+/* Every fraction digit past the first `keep` (the one '.' a TIME, TIMESPAN
+ * or TIMESTAMP holds) is a zero. */
+/* The same for a cell whose fraction ends it (TIME, TIMESPAN): read back
+ * from the end, so only the fraction's digits are looked at. */
+RAY_INLINE bool csv_frac_tail_kept(const char* p, size_t n, unsigned keep) {
+    size_t i = n;
+    while (i > 0 && p[i - 1] >= '0' && p[i - 1] <= '9') i--;
+    if (i == 0 || p[i - 1] != '.' || n - i <= keep) return true;
+    for (size_t k = i + keep; k < n; k++)
+        if (p[k] != '0') return false;
+    return true;
+}
+
+static bool csv_frac_kept(const char* p, size_t n, unsigned keep) {
+    const char* dot = memchr(p, '.', n);
+    if (!dot) return true;
+    unsigned i = 0;
+    for (const char* q = dot + 1; q < p + n && *q >= '0' && *q <= '9'; q++, i++)
+        if (i >= keep && *q != '0') return false;
+    return true;
+}
+
+/* The strict timestamp parse: fast_timestamp's grammar and value, but with
+ * the arithmetic checked, since past the type's range fast_timestamp's
+ * overflows (undefined; and on the earliest day even for an instant inside
+ * it).  Returns CSV_TS_OK with *out, CSV_TS_NULL where fast_timestamp reads a
+ * null (the text is not a timestamp), or CSV_TS_RANGE: well formed, but the
+ * instant is outside the type. */
+enum { CSV_TS_OK, CSV_TS_NULL, CSV_TS_RANGE };
+RAY_INLINE int csv_strict_timestamp(const char* p, size_t n, int64_t* out) {
+    const int64_t NS_PER_DAY = 86400000000000LL;
+    const int64_t DMAX = INT64_MAX / NS_PER_DAY;       /* 106751 */
+    if (n < 19) return CSV_TS_NULL;
+    bool sep = p[10] == 'T' || p[10] == 't' || p[10] == ' ' || (p[10] == 'D' && p[4] == '.');
+    if (!sep) return CSV_TS_NULL;
+    bool nul = false;
+    int64_t days = fast_date(p, 10, &nul);
+    if (nul) return CSV_TS_NULL;
+    size_t used = 8;
+    int64_t t = fast_time_ns(p + 11, n - 11, &nul, &used);
+    if (nul) return CSV_TS_NULL;
+    int64_t adj = 0;
+    size_t off = 11 + used, tz_used = 0;
+    if (off < n && (!parse_tz_offset(p + off, n - off, &adj, &tz_used) || off + tz_used != n))
+        return CSV_TS_NULL;
+    /* days * NS_PER_DAY + t - adj, with t in [0, NS_PER_DAY) and
+     * |adj| < NS_PER_DAY; the earliest day starts below INT64_MIN, so its
+     * day is folded into the time */
+    int64_t d = days, r = t;
+    if (d == -DMAX - 1) { d++; r -= NS_PER_DAY; }
+    if (d > DMAX || d < -DMAX) return CSV_TS_RANGE;
+    int64_t base = d * NS_PER_DAY;
+    if ((r > 0 && base > INT64_MAX - r) || (r < 0 && base < INT64_MIN - r)) return CSV_TS_RANGE;
+    base += r;
+    if ((adj > 0 && base < INT64_MIN + adj) || (adj < 0 && base > INT64_MAX + adj))
+        return CSV_TS_RANGE;
+    *out = base - adj;
+    return CSV_TS_OK;
+}
+
+/* A duration's days * NS_PER_DAY + the rest fits below the infinities
+ * (+-INT64_MAX, which a finite text must not reach); "0Wn" is the infinity
+ * itself and fits. */
+static bool csv_timespan_fits_slow(const char* p, size_t n, size_t i) {
+    uint64_t days = 0;
+    for (; i < n && p[i] >= '0' && p[i] <= '9'; i++) days = days * 10 + (uint64_t)(p[i] - '0');
+    char t[130];
+    if (n - i + 1 >= sizeof t) return false;
+    t[0] = '0';
+    memcpy(t + 1, p + i, n - i);
+    t[n - i + 1] = 0;
+    size_t used = 0;
+    int64_t rest = 0;
+    if (!ray_parse_timespan(t, &used, &rest) || rest < 0) return false;
+    const uint64_t day_ns = UINT64_C(86400000000000);
+    uint64_t lim = (uint64_t)INT64_MAX - 1;
+    return days <= (lim - (uint64_t)rest) / day_ns;
+}
+
+RAY_INLINE bool csv_timespan_fits(const char* p, size_t n) {
+    size_t i = (n > 0 && p[0] == '-') ? 1 : 0;
+    if (n - i == 3 && p[i] == '0' && p[i + 1] == 'W') return true;
+    /* fewer than six day digits: under 100000 days, inside the range */
+    size_t dd = 0;
+    while (dd < 6 && i + dd < n && p[i + dd] >= '0' && p[i + dd] <= '9') dd++;
+    return dd < 6 || csv_timespan_fits_slow(p, n, i);
+}
+
+/* The strict parse: csv_parse_fn with the checks above, which also records
+ * each worker's first bad row.  A copy rather than a flag on csv_parse_fn,
+ * so that the default parse, here and in csv_parse_serial, is the same
+ * machine code it was before. */
+static void csv_parse_fn_strict(void* arg, uint32_t worker_id,
+                                int64_t start, int64_t end_row) {
+    csv_par_ctx_t* ctx = (csv_par_ctx_t*)arg;
+    /* the context in locals: a column store could alias it */
+    const char* const          buf = ctx->buf;
+    const int64_t* const       row_offsets = ctx->row_offsets;
+    const int64_t              n_rows = ctx->n_rows;
+    const int                  n_cols = ctx->n_cols;
+    const char                 delim = ctx->delim;
+    const csv_type_t* const    col_types = ctx->col_types;
+    const int8_t* const        resolved_types = ctx->resolved_types;
+    void* const* const         col_data = ctx->col_data;
+    csv_strref_t* const* const str_refs = ctx->str_refs;
+    uint8_t* const             row_done = ctx->row_done;
+    char esc_buf[8192];
+    const char* buf_end = buf + ctx->buf_size;
+    const char* last_end = buf + ctx->rows_end;
+    bool* my_had_null = &ctx->worker_had_null[(size_t)worker_id * (size_t)n_cols];
+    bool* my_had_escaped = &ctx->worker_had_escaped[(size_t)worker_id * (size_t)n_cols];
+
+    for (int64_t row = start; row < end_row; row++) {
+        if (RAY_UNLIKELY(((row - start) & 1023) == 0 && ray_interrupted()))
+            return;
+        const char* p = buf + row_offsets[row];
+        const char* row_end = (row + 1 < n_rows)
+            ? buf + row_offsets[row + 1]
+            : last_end;
+        /* the cells seen, and the row's first bad cell */
+        int cells = 1;
+        bool more = true;
+        int bad_col = -1;
+        uint8_t bad_kind = 0;
+
+        for (int c = 0; c < n_cols; c++) {
+            /* Guard: if past row boundary, fill remaining columns with defaults + null */
+            if (p >= row_end) {
+                for (; c < n_cols; c++) {
+                    switch (col_types[c]) {
+                        case CSV_TYPE_BOOL: ((uint8_t*)col_data[c])[row] = 0; break;
+                        case CSV_TYPE_U8:   ((uint8_t*)col_data[c])[row] = 0; break;
+                        case CSV_TYPE_I16:  ((int16_t*)col_data[c])[row] = NULL_I16; break;
+                        case CSV_TYPE_I32:  ((int32_t*)col_data[c])[row] = NULL_I32; break;
+                        case CSV_TYPE_I64:  ((int64_t*)col_data[c])[row] = NULL_I64; break;
+                        case CSV_TYPE_F32:  ((float*)col_data[c])[row] = NULL_F32; break;
+                        case CSV_TYPE_F64:  ((double*)col_data[c])[row] = NULL_F64; break;
+                        case CSV_TYPE_DATE: ((int32_t*)col_data[c])[row] = NULL_I32; break;
+                        case CSV_TYPE_TIME: ((int32_t*)col_data[c])[row] = NULL_I32; break;
+                        case CSV_TYPE_TIMESPAN:
+                        case CSV_TYPE_TIMESTAMP:
+                            ((int64_t*)col_data[c])[row] = NULL_I64; break;
+                        case CSV_TYPE_GUID:
+                            memset((uint8_t*)col_data[c] + (size_t)row * 16, 0, 16);
+                            break;
+                        case CSV_TYPE_STR:
+                            str_refs[c][row].ptr = NULL;
+                            str_refs[c][row].len = 0;
+                            break;
+                        default: break;
+                    }
+                    /* BOOL/U8 are non-nullable; empty cells store 0/false. */
+                    if (col_types[c] != CSV_TYPE_BOOL &&
+                        col_types[c] != CSV_TYPE_U8) {
+                        my_had_null[c] = true;
+                    }
+                }
+                break;
+            }
+
+            const char* fld;
+            size_t flen;
+            char* dyn_esc = NULL;
+            const char* p0 = p;
+            p = scan_field(p, buf_end, delim, &fld, &flen, esc_buf, &dyn_esc);
+            {
+                uint8_t k = 0;
+                bool delim_end = csv_strict_cell_end(p0, p, row_end, buf_end,
+                                                     delim, &k);
+                if (k && bad_col < 0) { bad_col = c; bad_kind = k; }
+                if (more && delim_end) cells++;
+                else more = false;
+            }
+
+            switch (col_types[c]) {
+                case CSV_TYPE_BOOL: {
+                    /* BOOL is non-nullable; fast_bool returns 0 for
+                     * empty / unparseable input and we store it as-is. */
+                    bool is_null;
+                    uint8_t v = fast_bool(fld, flen, &is_null);
+                    ((uint8_t*)col_data[c])[row] = v;
+                    if (is_null && flen > 0 && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_CELL; }
+                    break;
+                }
+                case CSV_TYPE_I64: {
+                    bool is_null;
+                    int64_t v = fast_i64(fld, flen, &is_null);
+                    ((int64_t*)col_data[c])[row] = is_null ? NULL_I64 : v;
+                    /* INT64_MIN parses, but it is the null sentinel */
+                    if (!is_null && v == INT64_MIN && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_NULLV; }
+                    if (is_null) {
+                        my_had_null[c] = true;
+                        if (flen > 0 && bad_col < 0) { bad_col = c; bad_kind = csv_bad_int_kind(fld, flen); }
+                    }
+                    break;
+                }
+                case CSV_TYPE_U8: {
+                    /* U8 is non-nullable; fast_i64 returns 0 for
+                     * empty / unparseable input and we store it as-is. */
+                    bool is_null;
+                    int64_t v = fast_i64(fld, flen, &is_null);
+                    ((uint8_t*)col_data[c])[row] = (uint8_t)v;
+                    if (is_null && flen > 0 && bad_col < 0) { bad_col = c; bad_kind = csv_bad_int_kind(fld, flen); }
+                    else if (!is_null && (v < 0 || v > 255) && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_RANGE; }
+                    break;
+                }
+                case CSV_TYPE_I16: {
+                    bool is_null;
+                    int64_t v = fast_i64(fld, flen, &is_null);
+                    ((int16_t*)col_data[c])[row] = is_null ? NULL_I16 : (int16_t)v;
+                    if (!is_null && (v < INT16_MIN || v > INT16_MAX) && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_RANGE; }
+                    else if (!is_null && v == INT16_MIN && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_NULLV; }
+                    if (is_null) {
+                        my_had_null[c] = true;
+                        if (flen > 0 && bad_col < 0) { bad_col = c; bad_kind = csv_bad_int_kind(fld, flen); }
+                    }
+                    break;
+                }
+                case CSV_TYPE_I32: {
+                    bool is_null;
+                    int64_t v = fast_i64(fld, flen, &is_null);
+                    ((int32_t*)col_data[c])[row] = is_null ? NULL_I32 : (int32_t)v;
+                    if (!is_null && (v < INT32_MIN || v > INT32_MAX) && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_RANGE; }
+                    else if (!is_null && v == INT32_MIN && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_NULLV; }
+                    if (is_null) {
+                        my_had_null[c] = true;
+                        if (flen > 0 && bad_col < 0) { bad_col = c; bad_kind = csv_bad_int_kind(fld, flen); }
+                    }
+                    break;
+                }
+                case CSV_TYPE_F64: {
+                    bool is_null;
+                    double v = fast_f64(fld, flen, &is_null);
+                    ((double*)col_data[c])[row] = is_null ? NULL_F64 : v;
+                    if (!is_null && v == 0.0 && bad_col < 0 && csv_float_text_nonzero(fld, flen)) {
+                        bad_col = c; bad_kind = CSV_BAD_UNDERFLOW;
+                    }
+                    if (is_null) {
+                        my_had_null[c] = true;
+                        if (flen > 0 && bad_col < 0) { bad_col = c; bad_kind = csv_bad_float_kind(fld, flen); }
+                    }
+                    break;
+                }
+                case CSV_TYPE_F32: {
+                    bool is_null;
+                    double v = fast_f64(fld, flen, &is_null);
+                    ((float*)col_data[c])[row] = is_null ? NULL_F32 : (float)v;
+                    if (!is_null && !isfinite((float)v) && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_RANGE; }
+                    else if (!is_null && (float)v == 0.0f && bad_col < 0 && csv_float_text_nonzero(fld, flen)) {
+                        bad_col = c; bad_kind = CSV_BAD_UNDERFLOW;
+                    }
+                    if (is_null) {
+                        my_had_null[c] = true;
+                        if (flen > 0 && bad_col < 0) { bad_col = c; bad_kind = csv_bad_float_kind(fld, flen); }
+                    }
+                    break;
+                }
+                case CSV_TYPE_DATE: {
+                    bool is_null;
+                    int32_t v = fast_date(fld, flen, &is_null);
+                    ((int32_t*)col_data[c])[row] = is_null ? NULL_I32 : v;
+                    if (is_null) {
+                        my_had_null[c] = true;
+                        if (flen > 0 && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_CELL; }
+                    }
+                    break;
+                }
+                case CSV_TYPE_TIME: {
+                    bool is_null;
+                    int32_t v = fast_time(fld, flen, &is_null);
+                    ((int32_t*)col_data[c])[row] = is_null ? NULL_I32 : v;
+                    if (!is_null && bad_col < 0) {
+                        if (v == NULL_I32) { bad_col = c; bad_kind = CSV_BAD_NULLV; }
+                        /* "H:MM:SS.ddd" is 11: only a longer cell has more digits */
+                        else if (flen > 11 && !csv_frac_tail_kept(fld, flen, 3)) { bad_col = c; bad_kind = CSV_BAD_PRECISION; }
+                    }
+                    if (is_null) {
+                        my_had_null[c] = true;
+                        if (flen > 0 && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_CELL; }
+                    }
+                    break;
+                }
+                case CSV_TYPE_TIMESPAN: {
+                    bool is_null;
+                    int64_t v = fast_timespan(fld, flen, &is_null);
+                    ((int64_t*)col_data[c])[row] = is_null ? NULL_I64 : v;
+                    if (!is_null && bad_col < 0) {
+                        if (!csv_timespan_fits(fld, flen)) { bad_col = c; bad_kind = CSV_BAD_RANGE; }
+                        /* "0D00:00:00.123456789" is 20 */
+                        else if (flen > 20 && !csv_frac_tail_kept(fld, flen, 9)) { bad_col = c; bad_kind = CSV_BAD_PRECISION; }
+                    }
+                    if (is_null) {
+                        my_had_null[c] = true;
+                        if (flen > 0 && bad_col < 0) {
+                            bad_col = c;
+                            bad_kind = flen == 3 && memcmp(fld, "0Nn", 3) == 0 ? CSV_BAD_NULLV : CSV_BAD_CELL;
+                        }
+                    }
+                    break;
+                }
+                case CSV_TYPE_TIMESTAMP: {
+                    bool is_null;
+                    /* parsed with checked arithmetic: past the type's range
+                     * fast_timestamp's overflows */
+                    int64_t v = 0;
+                    int cls = csv_strict_timestamp(fld, flen, &v);
+                    is_null = cls != CSV_TS_OK;
+                    ((int64_t*)col_data[c])[row] = is_null ? NULL_I64 : v;
+                    if (cls == CSV_TS_RANGE && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_RANGE; }
+                    if (!is_null && bad_col < 0) {
+                        if (v == NULL_I64) { bad_col = c; bad_kind = CSV_BAD_NULLV; }
+                        /* 19 + '.' + 9 digits: only a longer cell has more */
+                        else if (flen > 29 && !csv_frac_kept(fld, flen, 9)) { bad_col = c; bad_kind = CSV_BAD_PRECISION; }
+                    }
+                    if (is_null) {
+                        my_had_null[c] = true;
+                        if (flen > 0 && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_CELL; }
+                    }
+                    break;
+                }
+                case CSV_TYPE_GUID: {
+                    bool is_null;
+                    uint8_t* slot = (uint8_t*)col_data[c] + (size_t)row * 16;
+                    fast_guid(fld, flen, slot, &is_null);
+                    if (!is_null && bad_col < 0) {
+                        static const uint8_t zero[16];
+                        if (memcmp(slot, zero, 16) == 0) { bad_col = c; bad_kind = CSV_BAD_NULLV; }
+                    }
+                    if (is_null) {
+                        memset(slot, 0, 16);
+                        my_had_null[c] = true;
+                        if (flen > 0 && bad_col < 0) { bad_col = c; bad_kind = CSV_BAD_CELL; }
+                    }
+                    break;
+                }
+                case CSV_TYPE_STR: {
+                    if (flen == 0) {
+                        str_refs[c][row].ptr = NULL;
+                        str_refs[c][row].len = 0;
+                        my_had_null[c] = true;
+                    } else {
+                        /* fld may point into esc_buf (stack) or dyn_esc
+                         * (freed below) — both die before csv_fill_str_cols
+                         * reads the strref.  Persist escaped fields. */
+                        if (fld < buf || fld >= buf_end) {
+                            my_had_escaped[c] = true;
+                            if (dyn_esc && fld == dyn_esc) {
+                                dyn_esc = NULL; /* transfer ownership */
+                            } else {
+                                char* cp = (char*)ray_sys_alloc(flen);
+                                if (cp) { memcpy(cp, fld, flen); fld = cp; }
+                            }
+                        }
+                        str_refs[c][row].ptr = fld;
+                        str_refs[c][row].len = (uint32_t)flen;
+                        /* SYM columns are deduplicated by hash right after
+                         * the parse; hash here while the bytes are hot. */
+                        if (resolved_types[c] == RAY_SYM)
+                            str_refs[c][row].hash = (uint32_t)ray_hash_bytes(fld, flen);
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+            if (RAY_UNLIKELY(dyn_esc != NULL)) ray_sys_free(dyn_esc);
+        }
+        if (row_done) row_done[row] = 1;
+        {
+            /* A malformed quote is reported first: it is what cut the
+             * cells.  Then a wrong cell count, then an unparsed cell. */
+            if ((bad_kind == CSV_BAD_CELL || bad_kind == CSV_BAD_RANGE ||
+                 bad_kind == CSV_BAD_NULLV || bad_kind == CSV_BAD_PRECISION ||
+                 bad_kind == CSV_BAD_UNDERFLOW) &&
+                cells != n_cols) bad_kind = 0;
+            if (!bad_kind && cells == n_cols) {
+                const char* q = p;
+                while (q < row_end && (*q == '\r' || *q == '\n')) q++;
+                if (q < row_end) bad_kind = CSV_BAD_LONE_CR;
+            }
+            csv_bad_t* bad = &ctx->worker_bad[worker_id];
+            if ((bad_kind || cells != n_cols) && row < bad->row) {
+                bad->row  = row;
+                bad->kind = bad_kind ? bad_kind : (uint8_t)CSV_BAD_CELLS;
+                bad->col  = (bad_kind && bad_kind != CSV_BAD_LONE_CR) ? bad_col : -1;
+            }
+        }
+    }
+}
+
 /* --------------------------------------------------------------------------
  * Serial parse fallback (small files or no thread pool)
  * -------------------------------------------------------------------------- */
 
-static bool csv_parse_serial(const char* buf, size_t buf_size,
+/* Not inlined into its one caller, csv_parse_all: inlined there it ran more
+ * instructions per row than it does on its own. */
+#if defined(_MSC_VER)
+#define CSV_NOINLINE __declspec(noinline)
+#else
+#define CSV_NOINLINE __attribute__((noinline))
+#endif
+CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                               const int64_t* row_offsets, int64_t n_rows,
                               int n_cols, char delim,
                               const csv_type_t* col_types,
@@ -2584,6 +3064,286 @@ static bool csv_parse_serial(const char* buf, size_t buf_size,
 }
 
 /* --------------------------------------------------------------------------
+ * Parse every row: across the pool for a large file, else on this thread
+ * (small files, no pool, or no memory for the per-worker flags).  The
+ * per-column null/escaped flags are ORed into ctx's [n_cols] arrays.
+ * strict: *bad is the file's first bad row (row INT64_MAX: none) -- the
+ * smallest row any worker saw, so the parallel answer is the serial one.
+ * -------------------------------------------------------------------------- */
+
+static void csv_parse_all(csv_par_ctx_t* ctx, bool strict, csv_bad_t* bad) {
+    bad->row = INT64_MAX; bad->col = -1; bad->kind = 0;
+    bool* col_had_null = ctx->worker_had_null;
+    bool* col_had_escaped = ctx->worker_had_escaped;
+    int ncols = ctx->n_cols;
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && ctx->n_rows > 8192) {
+        uint32_t n_workers = ray_pool_total_workers(pool);
+        size_t flags_sz = (size_t)n_workers * (size_t)ncols * sizeof(bool);
+        size_t bad_sz = strict ? (size_t)n_workers * sizeof(csv_bad_t) : 0;
+        /* [bad: n_workers, strict only][had_null][had_escaped] */
+        char* scratch = (char*)ray_sys_alloc(bad_sz + flags_sz * 2);
+        if (scratch) {
+            bool* worker_flags = (bool*)(void*)(scratch + bad_sz);
+            memset(worker_flags, 0, flags_sz * 2);
+            csv_par_ctx_t pctx = *ctx;
+            pctx.worker_had_null = worker_flags;
+            pctx.worker_had_escaped = worker_flags + (size_t)n_workers * (size_t)ncols;
+            pctx.worker_bad = NULL;
+            if (strict) {
+                pctx.worker_bad = (csv_bad_t*)(void*)scratch;
+                for (uint32_t w = 0; w < n_workers; w++) pctx.worker_bad[w] = *bad;
+            }
+            ray_pool_dispatch(pool, strict ? csv_parse_fn_strict : csv_parse_fn,
+                              &pctx, ctx->n_rows);
+            for (uint32_t w = 0; w < n_workers; w++) {
+                for (int c = 0; c < ncols; c++) {
+                    if (pctx.worker_had_null[(size_t)w * (size_t)ncols + (size_t)c])
+                        col_had_null[c] = true;
+                    if (pctx.worker_had_escaped[(size_t)w * (size_t)ncols + (size_t)c])
+                        col_had_escaped[c] = true;
+                }
+                if (strict && pctx.worker_bad[w].row < bad->row) *bad = pctx.worker_bad[w];
+            }
+            ray_sys_free(scratch);
+            return;
+        }
+    }
+    if (strict) {
+        csv_par_ctx_t sctx = *ctx;
+        sctx.worker_bad = bad;
+        csv_parse_fn_strict(&sctx, 0, 0, ctx->n_rows);
+    } else {
+        (void)csv_parse_serial(ctx->buf, ctx->buf_size, ctx->row_offsets, ctx->n_rows,
+                               ctx->n_cols, ctx->delim, ctx->col_types,
+                               ctx->resolved_types, ctx->col_data, ctx->str_refs,
+                               col_had_null, col_had_escaped, ctx->row_done);
+    }
+}
+
+/* Text for a strict error, written to `out` (NUL-terminated) in at most
+ * `cap` bytes.  Whole units only: a quote, a backslash, \n \r \t (two bytes
+ * each), any other control byte or a byte that does not start a complete
+ * UTF-8 character (\xHH), or a whole UTF-8 character.  When the text does
+ * not fit, or `more` says it goes on past `len`, the units that fit are
+ * followed by "...", so the message is valid UTF-8 and no escape is cut.
+ * Returns the bytes written. */
+#define CSV_SHOW_MAX 40
+static size_t csv_show(const char* p, size_t len, bool more, char* out, size_t cap) {
+    size_t o = 0, i = 0;
+    if (cap < 4) { out[0] = 0; return 0; }
+    while (i < len) {
+        unsigned char ch = (unsigned char)p[i];
+        char unit[5];
+        size_t ul, take = 1;
+        if (ch == '"' || ch == '\\') { unit[0] = '\\'; unit[1] = (char)ch; ul = 2; }
+        else if (ch == '\n') { unit[0] = '\\'; unit[1] = 'n'; ul = 2; }
+        else if (ch == '\r') { unit[0] = '\\'; unit[1] = 'r'; ul = 2; }
+        else if (ch == '\t') { unit[0] = '\\'; unit[1] = 't'; ul = 2; }
+        else if (ch < 0x80 && ch >= 0x20 && ch != 0x7F) { unit[0] = (char)ch; ul = 1; }
+        else {
+            size_t n = ch >= 0xC2 && ch <= 0xDF ? 2 : ch >= 0xE0 && ch <= 0xEF ? 3
+                     : ch >= 0xF0 && ch <= 0xF4 ? 4 : 0;
+            bool whole = n > 0 && i + n <= len;
+            for (size_t k = 1; whole && k < n; k++)
+                whole = ((unsigned char)p[i + k] & 0xC0) == 0x80;
+            if (whole) { memcpy(unit, p + i, n); ul = n; take = n; }
+            else if (n > 0 && i + n > len && more) break;   /* cut by the capture */
+            else { snprintf(unit, sizeof unit, "\\x%02x", ch); ul = 4; }
+        }
+        bool last = i + take >= len && !more;
+        /* room for this unit, and for "..." unless it is the last one */
+        if (o + ul + (last ? 0 : 3) > cap - 1) { more = true; break; }
+        memcpy(out + o, unit, ul);
+        o += ul;
+        i += take;
+    }
+    if (more) { memcpy(out + o, "...", 3); o += 3; }
+    out[o] = 0;
+    return o;
+}
+
+/* The file's line `at` starts on, 1-based: a line ends at LF, CRLF (or
+ * LFCR) or a lone CR, as a row can. */
+static int64_t csv_line_of(const char* buf, const char* buf_end, const char* at) {
+    int64_t line = 1;
+    for (const char* q = buf; q < at; ) {
+        q = memchr(q, '\n', (size_t)(at - q));
+        if (!q) break;
+        line++; q++;
+    }
+    for (const char* q = buf; q < at; ) {
+        q = memchr(q, '\r', (size_t)(at - q));
+        if (!q) break;
+        if ((q + 1 >= buf_end || q[1] != '\n') && (q == buf || q[-1] != '\n')) line++;
+        q++;
+    }
+    return line;
+}
+
+/* A strict error's message, composed so that it fits: ray_error keeps 255
+ * bytes, the caller may append `reserve` of its own (the note a parted
+ * import adds), and only the cell text gives way, cut by csv_show.  The path
+ * and the column name are clipped first only when they would leave the text
+ * no room.  `where` is "column <name>" or NULL; `text` is the cell, NULL for
+ * a message without one; pre and post surround it. */
+#define CSV_MSG_MAX 255
+static ray_t* csv_strict_msg(const char* op, const char* path, int64_t line,
+                             const char* name, size_t name_len,
+                             const char* pre, const char* text, size_t text_len,
+                             bool text_more, const char* post, size_t reserve) {
+    char msg[CSV_MSG_MAX + 1];
+    size_t limit = reserve < CSV_MSG_MAX - 64 ? CSV_MSG_MAX - reserve : 64;
+    size_t path_max = 72, name_max = 48;
+    for (;;) {
+        char pbuf[RAY_ERR_PATH_MAX + 1], nbuf[CSV_MSG_MAX + 1];
+        int n = snprintf(msg, sizeof msg, "%s \"%s\": line %" PRId64, op,
+                         ray_err_path_n(path, pbuf, path_max), line);
+        size_t o = n > 0 ? (size_t)n : 0;
+        if (name) {
+            csv_show(name, name_len, false, nbuf, name_max + 1);
+            n = snprintf(msg + o, sizeof msg - o, ", column %s", nbuf);
+            o += n > 0 ? (size_t)n : 0;
+        }
+        size_t fixed = o + strlen(pre) + strlen(post);
+        if (text && fixed + 12 > limit && (path_max > 16 || name_max > 16)) {
+            if (path_max > 16) path_max = path_max > 32 ? path_max - 16 : 16;
+            else name_max = name_max > 32 ? name_max - 16 : 16;
+            continue;
+        }
+        if (o + strlen(pre) < limit) {
+            memcpy(msg + o, pre, strlen(pre));
+            o += strlen(pre);
+        }
+        if (text) {
+            size_t room = limit > o + strlen(post) ? limit - o - strlen(post) : 4;
+            o += csv_show(text, text_len, text_more, msg + o, room + 1);
+        }
+        if (o + strlen(post) <= CSV_MSG_MAX) {
+            memcpy(msg + o, post, strlen(post));
+            o += strlen(post);
+        }
+        msg[o] = 0;
+        return ray_error("parse", "%s", msg);
+    }
+}
+
+/* The strict error for the first bad row (#1885): the file's line it starts
+ * on (1-based, counting the header and the newlines inside quoted cells),
+ * and the column and cell text, or the cell count.  The row is cut again
+ * here as the parse cut it; only the error pays for it. */
+static ray_t* csv_strict_error(const ray_csv_opts_t* opts, const char* path,
+                               const char* buf, size_t buf_size,
+                               size_t rows_end,
+                               const int64_t* row_offsets, int64_t n_rows,
+                               const csv_bad_t* bad, int ncols, char delim,
+                               const int64_t* col_name_ids,
+                               const int8_t* resolved_types) {
+    const char* buf_end = buf + buf_size;
+    const char* row_start = buf + row_offsets[bad->row];
+    const char* row_end = bad->row + 1 < n_rows ? buf + row_offsets[bad->row + 1] : buf + rows_end;
+    int64_t line = csv_line_of(buf, buf_end, row_start);
+    const char* op = opts->op ? opts->op : "csv";
+
+    /* Cut the row: its cell count, and the bad cell's text. */
+    char esc_buf[8192];
+    /* at most CSV_SHOW_MAX bytes of the cell are shown, less if the
+     * message has no room for them */
+    char text[CSV_SHOW_MAX];
+    size_t text_len = 0, cell_len = 0;
+    int cells = 1;
+    const char* p = row_start;
+    for (int c = 0; ; c++) {
+        if (p >= row_end && c > 0) break;
+        const char* fld; size_t flen; char* dyn = NULL;
+        const char* p0 = p;
+        p = scan_field(p, buf_end, delim, &fld, &flen, esc_buf, &dyn);
+        if (c == bad->col) {
+            cell_len = flen;
+            text_len = flen < sizeof text ? flen : sizeof text;
+            memcpy(text, fld, text_len);
+        }
+        if (dyn) ray_sys_free(dyn);
+        uint8_t k = 0;
+        if (!csv_strict_cell_end(p0, p, row_end, buf_end, delim, &k)) break;
+        cells++;
+    }
+
+    const char* name = NULL;
+    size_t name_len = 0;
+    if (bad->col >= 0) {
+        ray_t* nm = ray_sym_str(col_name_ids[bad->col]);   /* borrowed */
+        name = nm ? ray_str_ptr(nm) : "?";
+        name_len = nm ? ray_str_len(nm) : 1;
+    }
+    char post[96];
+    const char* tn = bad->col >= 0 ? ray_type_name(resolved_types[bad->col]) : "";
+    const char* an = (tn[0] == 'F' || tn[0] == 'I') ? "an" : "a";
+    bool more = cell_len > text_len;
+    size_t rsv = opts->reserve;
+    switch (bad->kind) {
+    case CSV_BAD_CELLS:
+        snprintf(post, sizeof post, ": expected %d cell%s, got %d", ncols, ncols == 1 ? "" : "s", cells);
+        return csv_strict_msg(op, path, line, NULL, 0, post, NULL, 0, false, "", rsv);
+    case CSV_BAD_LONE_CR:
+        return csv_strict_msg(op, path, line, NULL, 0,
+                              ": text after a CR inside the row (a row ends at LF or CRLF)",
+                              NULL, 0, false, "", rsv);
+    case CSV_BAD_UNCLOSED:
+        return csv_strict_msg(op, path, line, name, name_len,
+                              ": a quoted cell with no closing quote", NULL, 0, false, "", rsv);
+    case CSV_BAD_AFTER_QUOTE:
+        return csv_strict_msg(op, path, line, name, name_len,
+                              ": text after the closing quote", NULL, 0, false, "", rsv);
+    case CSV_BAD_RANGE:
+        snprintf(post, sizeof post, "\" is out of range for %s %s", an, tn);
+        break;
+    case CSV_BAD_NULLV:
+        snprintf(post, sizeof post, "\" reads as a null %s", tn);
+        break;
+    case CSV_BAD_PRECISION:
+        snprintf(post, sizeof post, "\" has more fraction digits than %s %s holds", an, tn);
+        break;
+    case CSV_BAD_UNDERFLOW:
+        snprintf(post, sizeof post, "\" underflows to zero for %s %s", an, tn);
+        break;
+    default:
+        snprintf(post, sizeof post, "\" is not %s %s", an, tn);
+        break;
+    }
+    return csv_strict_msg(op, path, line, name, name_len, ": \"", text, text_len, more, post, rsv);
+}
+
+/* Strict (#1885 review): the header's quoted cells are well formed, as a
+ * row's must be -- a quote closed, and nothing after it but the delimiter
+ * or the line end.  Returns the error, or NULL. */
+static ray_t* csv_strict_header(const ray_csv_opts_t* opts, const char* path,
+                                const char* buf, const char* buf_end,
+                                const char* text, char delim, int ncols) {
+    char esc_buf[8192];
+    const char* p = text;
+    for (int c = 0; c < ncols; c++) {
+        const char* fld; size_t flen; char* dyn = NULL;
+        const char* p0 = p;
+        p = scan_field(p, buf_end, delim, &fld, &flen, esc_buf, &dyn);
+        if (dyn) ray_sys_free(dyn);
+        uint8_t k = 0;
+        bool more = csv_strict_cell_end(p0, p, buf_end, buf_end, delim, &k);
+        if (k == CSV_BAD_UNCLOSED || k == CSV_BAD_AFTER_QUOTE) {
+            char pre[96];
+            snprintf(pre, sizeof pre, ": header cell %d: %s", c + 1,
+                     k == CSV_BAD_UNCLOSED ? "a quoted cell with no closing quote"
+                                           : "text after the closing quote");
+            return csv_strict_msg(opts->op ? opts->op : "csv", path,
+                                  csv_line_of(buf, buf_end, text), NULL, 0, pre,
+                                  NULL, 0, false, "", opts->reserve);
+        }
+        if (!more) break;
+    }
+    return NULL;
+}
+
+/* --------------------------------------------------------------------------
  * `INT` schema columns — auto narrowest integer width.
  *
  * The `INT` schema token arrives as RAY_CSV_AUTO_TAG in resolved_types[].
@@ -2725,12 +3485,15 @@ static bool csv_resolve_auto_streamed(const char* buf, size_t file_size,
     return true;
 }
 
-static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
+static ray_t* csv_materialize_rows(const char* path,
+                                   const char* buf, size_t file_size, size_t rows_end,
                                    const int64_t* row_offsets, int64_t n_rows,
                                    int ncols, char delimiter,
                                    const int64_t* col_name_ids,
                                    const int8_t* resolved_types,
-                                   struct ray_sym_domain_s* sym_dom) {
+                                   struct ray_sym_domain_s* sym_dom,
+                                   const ray_csv_opts_t* opts) {
+    bool strict = opts && opts->strict;
     /* Defensive guard: RAY_CSV_AUTO_TAG must be resolved to a concrete width
      * before reaching this point (by csv_resolve_auto_in_place or
      * csv_resolve_auto_streamed).  If a marker slips through, the resolution
@@ -2829,58 +3592,25 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         }
     }
 
+    csv_bad_t bad;
     {
-        ray_pool_t* pool = ray_pool_get();
-        bool use_parallel = pool && n_rows > 8192;
-
-        if (use_parallel) {
-            uint32_t n_workers = ray_pool_total_workers(pool);
-            size_t worker_flags_sz = (size_t)n_workers * (size_t)ncols * sizeof(bool);
-            bool* worker_flags = (bool*)ray_sys_alloc(worker_flags_sz * 2);
-            if (!worker_flags) {
-                use_parallel = false;
-            } else {
-                memset(worker_flags, 0, worker_flags_sz * 2);
-                bool* worker_had_null_buf = worker_flags;
-                bool* worker_had_escaped_buf = worker_flags +
-                    (size_t)n_workers * (size_t)ncols;
-
-                csv_par_ctx_t ctx = {
-                    .buf              = buf,
-                    .buf_size         = file_size,
-                    .row_offsets      = row_offsets,
-                    .n_rows           = n_rows,
-                    .n_cols           = ncols,
-                    .delim            = delimiter,
-                    .col_types        = parse_types,
-                    .resolved_types   = resolved_types,
-                    .col_data         = col_data,
-                    .str_refs         = str_ref_bufs,
-                    .worker_had_null  = worker_had_null_buf,
-                    .worker_had_escaped = worker_had_escaped_buf,
-                    .row_done         = row_done,
-                };
-
-                ray_pool_dispatch(pool, csv_parse_fn, &ctx, n_rows);
-
-                for (uint32_t w = 0; w < n_workers; w++) {
-                    for (int c = 0; c < ncols; c++) {
-                        if (worker_had_null_buf[(size_t)w * (size_t)ncols + (size_t)c])
-                            col_had_null[c] = true;
-                        if (worker_had_escaped_buf[(size_t)w * (size_t)ncols + (size_t)c])
-                            col_had_escaped[c] = true;
-                    }
-                }
-                ray_sys_free(worker_flags);
-            }
-        }
-
-        if (!use_parallel) {
-            (void)csv_parse_serial(buf, file_size, row_offsets, n_rows,
-                                   ncols, delimiter, parse_types, resolved_types,
-                                   col_data, str_ref_bufs, col_had_null,
-                                   col_had_escaped, row_done);
-        }
+        csv_par_ctx_t ctx = {
+            .buf                = buf,
+            .buf_size           = file_size,
+            .rows_end           = rows_end,
+            .row_offsets        = row_offsets,
+            .n_rows             = n_rows,
+            .n_cols             = ncols,
+            .delim              = delimiter,
+            .col_types          = parse_types,
+            .resolved_types     = resolved_types,
+            .col_data           = col_data,
+            .str_refs           = str_ref_bufs,
+            .worker_had_null    = col_had_null,
+            .worker_had_escaped = col_had_escaped,
+            .row_done           = row_done,
+        };
+        csv_parse_all(&ctx, strict, &bad);
     }
 
     if (ray_interrupted()) {
@@ -2890,6 +3620,17 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         scratch_free(row_done_hdr);
         for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
         return ray_error("cancel", "interrupted");
+    }
+
+    if (RAY_UNLIKELY(bad.row != INT64_MAX)) {
+        ray_t* e = csv_strict_error(opts, path, buf, file_size, rows_end, row_offsets, n_rows,
+                                    &bad, ncols, delimiter, col_name_ids, resolved_types);
+        csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
+                                 buf, file_size, row_done, col_had_escaped);
+        for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
+        scratch_free(row_done_hdr);
+        for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
+        return e;
     }
 
     if (has_text_cols) {
@@ -3046,7 +3787,9 @@ static inline size_t csv_bom_len(const char* buf, size_t size) {
  * fires. */
 static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool header,
                                         const int8_t* col_types_in, int32_t n_types,
-                                        const int64_t* col_names_in, int32_t n_names) {
+                                        const int64_t* col_names_in, int32_t n_names,
+                                        const ray_csv_opts_t* opts) {
+    bool strict = opts && opts->strict;
     if (ray_interrupted()) return ray_error("cancel", "interrupted");
 
     /* ---- 1. Open file and get size ---- */
@@ -3119,6 +3862,9 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
             p++;
         }
     }
+    /* Strict without a header: the schema says how many cells a row has,
+     * and the first row is checked as every other row is (#1885 review). */
+    if (strict && !header && col_types_in) ncols = n_types;
     if (ncols > CSV_MAX_COLS) {
         ray_vm_unmap_file(buf, file_size);
         /* fd already closed after mmap (line 1044) — do not close again */
@@ -3145,6 +3891,10 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
     int64_t col_name_ids[CSV_MAX_COLS];
 
     if (header) {
+        if (strict) {
+            ray_t* herr = csv_strict_header(opts, path, buf, buf_end, text, delimiter, ncols);
+            if (herr) { ray_vm_unmap_file(buf, file_size); return herr; }
+        }
         for (int c = 0; c < ncols; c++) {
             const char* fld;
             size_t flen;
@@ -3325,62 +4075,33 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
     }
 
     ray_progress_span_phase("parse", prog_scan_end, prog_parse_end - prog_scan_end);
+    csv_bad_t bad;
     {
-        ray_pool_t* pool = ray_pool_get();
-        bool use_parallel = pool && n_rows > 8192;
-
-        if (use_parallel) {
-            uint32_t n_workers = ray_pool_total_workers(pool);
-            size_t worker_flags_sz = (size_t)n_workers * (size_t)ncols * sizeof(bool);
-            bool* worker_flags = (bool*)ray_sys_alloc(worker_flags_sz * 2);
-            if (!worker_flags) {
-                use_parallel = false;
-            } else {
-                memset(worker_flags, 0, worker_flags_sz * 2);
-                bool* worker_had_null_buf = worker_flags;
-                bool* worker_had_escaped_buf = worker_flags +
-                    (size_t)n_workers * (size_t)ncols;
-
-                csv_par_ctx_t ctx = {
-                    .buf              = buf,
-                    .buf_size         = file_size,
-                    .row_offsets      = row_offsets,
-                    .n_rows           = n_rows,
-                    .n_cols           = ncols,
-                    .delim            = delimiter,
-                    .col_types        = parse_types,
-                    .resolved_types   = resolved_types,
-                    .col_data         = col_data,
-                    .str_refs         = str_ref_bufs,
-                    .worker_had_null  = worker_had_null_buf,
-                    .worker_had_escaped = worker_had_escaped_buf,
-                    .row_done         = row_done,
-                };
-
-                ray_pool_dispatch(pool, csv_parse_fn, &ctx, n_rows);
-
-                /* OR worker null flags into col_had_null */
-                for (uint32_t w = 0; w < n_workers; w++) {
-                    for (int c = 0; c < ncols; c++) {
-                        if (worker_had_null_buf[(size_t)w * (size_t)ncols + (size_t)c])
-                            col_had_null[c] = true;
-                        if (worker_had_escaped_buf[(size_t)w * (size_t)ncols + (size_t)c])
-                            col_had_escaped[c] = true;
-                    }
-                }
-                ray_sys_free(worker_flags);
-            }
-        }
-
-        if (!use_parallel) {
-            (void)csv_parse_serial(buf, file_size, row_offsets, n_rows,
-                                   ncols, delimiter, parse_types, resolved_types,
-                                   col_data, str_ref_bufs, col_had_null,
-                                   col_had_escaped, row_done);
-        }
+        csv_par_ctx_t ctx = {
+            .buf                = buf,
+            .buf_size           = file_size,
+            .rows_end           = file_size,
+            .row_offsets        = row_offsets,
+            .n_rows             = n_rows,
+            .n_cols             = ncols,
+            .delim              = delimiter,
+            .col_types          = parse_types,
+            .resolved_types     = resolved_types,
+            .col_data           = col_data,
+            .str_refs           = str_ref_bufs,
+            .worker_had_null    = col_had_null,
+            .worker_had_escaped = col_had_escaped,
+            .row_done           = row_done,
+        };
+        csv_parse_all(&ctx, strict, &bad);
     }
 
     if (ray_interrupted()) goto fail_parsed_cancel;
+    if (RAY_UNLIKELY(bad.row != INT64_MAX)) {
+        result = csv_strict_error(opts, path, buf, file_size, file_size, row_offsets, n_rows,
+                                  &bad, ncols, delimiter, col_name_ids, resolved_types);
+        goto fail_parsed;
+    }
 
     /* ---- 9b. Materialize RAY_STR columns AND batch-intern sym columns ----
      * These two phases touch disjoint columns and (after the GUID fix)
@@ -3512,6 +4233,15 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
     return result;
 
     /* Error paths */
+fail_parsed:            /* every row parsed; `result` is the error */
+    csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
+                             buf, file_size, row_done, col_had_escaped);
+    for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
+    scratch_free(row_done_hdr);
+    for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
+    scratch_free(row_offsets_hdr);
+    ray_vm_unmap_file(buf, file_size);
+    return result;
 fail_parsed_cancel:
     csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
                              buf, file_size, row_done, col_had_escaped);
@@ -3530,14 +4260,22 @@ fail_unmap:
     return ray_error("oom", NULL);
 }
 
+ray_t* ray_read_csv_ex(const char* path, char delimiter, bool header,
+                       const int8_t* col_types_in, int32_t n_types,
+                       const int64_t* col_names_in, int32_t n_names,
+                       const ray_csv_opts_t* opts) {
+    ray_t* r = csv_read_named_opts_inner(path, delimiter, header,
+                                         col_types_in, n_types,
+                                         col_names_in, n_names, opts);
+    ray_progress_span_end();
+    return r;
+}
+
 ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
                                const int8_t* col_types_in, int32_t n_types,
                                const int64_t* col_names_in, int32_t n_names) {
-    ray_t* r = csv_read_named_opts_inner(path, delimiter, header,
-                                         col_types_in, n_types,
-                                         col_names_in, n_names);
-    ray_progress_span_end();
-    return r;
+    return ray_read_csv_ex(path, delimiter, header, col_types_in, n_types,
+                           col_names_in, n_names, NULL);
 }
 
 ray_t* ray_read_csv_opts(const char* path, char delimiter, bool header,
@@ -3619,12 +4357,21 @@ bool ray_csv_source_failure(const char** call, int* errnum) {
     return true;
 }
 
+/* A chunk's strict error (#1885) goes to opts->err for the caller, which
+ * shows its message; any other chunk error is reported by its code alone. */
+static void csv_keep_strict_error(ray_t* tbl, ray_err_t err, ray_csv_opts_t* opts) {
+    if (!tbl) return;
+    if (err == RAY_ERR_PARSE && opts && opts->strict && !opts->err) opts->err = tbl;
+    else ray_error_free(tbl);
+}
+
 static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool header,
                                           const int8_t* col_types_in, int32_t n_types,
                                           const int64_t* col_names_in, int32_t n_names,
                                           const char* dir, int64_t rows_per_chunk,
                                           const char* sym_path, ray_compress_t mode,
-                                          const char* cur, ray_err_t cur_err) {
+                                          const char* cur, ray_err_t cur_err,
+                                          ray_csv_opts_t* opts) {
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !dir || !sym_path) return RAY_ERR_DOMAIN;
     if (rows_per_chunk <= 0) rows_per_chunk = CSV_PART_ROWS_DEFAULT;
@@ -3692,6 +4439,8 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
             q++;
         }
     }
+    /* strict without a header: the schema's cell count (#1885 review) */
+    if (opts && opts->strict && !header && col_types_in) ncols = n_types;
     if (ncols > CSV_MAX_COLS) {
         ray_vm_unmap_file(buf, file_size);
         return RAY_ERR_LIMIT;
@@ -3707,6 +4456,14 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     int64_t col_name_ids[CSV_MAX_COLS];
 
     if (header) {
+        if (opts && opts->strict) {
+            ray_t* herr = csv_strict_header(opts, path, buf, buf_end, text, delimiter, ncols);
+            if (herr) {
+                if (!opts->err) opts->err = herr; else ray_error_free(herr);
+                ray_vm_unmap_file(buf, file_size);
+                return RAY_ERR_PARSE;
+            }
+        }
         for (int c = 0; c < ncols; c++) {
             const char* fld;
             size_t flen;
@@ -3881,14 +4638,14 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         }
 
         int64_t tr_c1 = ray_profile_now_ns();
-        ray_t* tbl = csv_materialize_rows(buf, file_size, row_offsets,
+        ray_t* tbl = csv_materialize_rows(path, buf, file_size, next_offset, row_offsets,
                                           cnt, ncols, delimiter, col_name_ids,
-                                          resolved_types, sym_dom);
+                                          resolved_types, sym_dom, opts);
         scratch_free(row_offsets_hdr);
         if (!tbl || RAY_IS_ERR(tbl)) {
             err = (tbl && RAY_IS_ERR(tbl)) ? ray_err_from_obj(tbl)
                                            : RAY_ERR_OOM;
-            if (tbl) ray_release(tbl);
+            csv_keep_strict_error(tbl, err, opts);
             break;
         }
         int64_t tr_c2 = ray_profile_now_ns();
@@ -4041,6 +4798,15 @@ ray_err_t ray_csv_save_splayed_mode(const char* path, char delimiter, bool heade
                                     const int8_t* col_types_in, int32_t n_types,
                                     const int64_t* col_names_in, int32_t n_names,
                                     const char* dir, int64_t rows_per_chunk, ray_compress_t mode) {
+    return ray_csv_save_splayed_ex(path, delimiter, header, col_types_in, n_types,
+                                   col_names_in, n_names, dir, rows_per_chunk, mode, NULL);
+}
+
+ray_err_t ray_csv_save_splayed_ex(const char* path, char delimiter, bool header,
+                                  const int8_t* col_types_in, int32_t n_types,
+                                  const int64_t* col_names_in, int32_t n_names,
+                                  const char* dir, int64_t rows_per_chunk, ray_compress_t mode,
+                                  ray_csv_opts_t* opts) {
     g_csv_src_fail.call = NULL;   /* this import's own failure only */
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !dir) return RAY_ERR_DOMAIN;
@@ -4052,7 +4818,8 @@ ray_err_t ray_csv_save_splayed_mode(const char* path, char delimiter, bool heade
     if (err != RAY_OK) return err;
     err = csv_save_splayed_to_dir(path, delimiter, header, col_types_in, n_types,
                                   col_names_in, n_names, write.dir,
-                                  rows_per_chunk, sym_path, mode, write.cur, write.cur_err);
+                                  rows_per_chunk, sym_path, mode, write.cur, write.cur_err,
+                                  opts);
     return ray_splay_write_finish(&write, err, false);
 }
 
@@ -4061,6 +4828,7 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
                                          const int64_t* col_names_in, int32_t n_names,
                                          const char* root, const char* table_name,
                                          int64_t rows_per_part, bool staged,
+                                         ray_csv_opts_t* opts,
                                          ray_compress_t mode) {
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !root || !table_name) return RAY_ERR_DOMAIN;
@@ -4123,6 +4891,8 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
             q++;
         }
     }
+    /* strict without a header: the schema's cell count (#1885 review) */
+    if (opts && opts->strict && !header && col_types_in) ncols = n_types;
     if (ncols > CSV_MAX_COLS) {
         ray_vm_unmap_file(buf, file_size);
         return RAY_ERR_LIMIT;
@@ -4138,6 +4908,14 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
     int64_t col_name_ids[CSV_MAX_COLS];
 
     if (header) {
+        if (opts && opts->strict) {
+            ray_t* herr = csv_strict_header(opts, path, buf, buf_end, text, delimiter, ncols);
+            if (herr) {
+                if (!opts->err) opts->err = herr; else ray_error_free(herr);
+                ray_vm_unmap_file(buf, file_size);
+                return RAY_ERR_PARSE;
+            }
+        }
         for (int c = 0; c < ncols; c++) {
             const char* fld;
             size_t flen;
@@ -4252,13 +5030,13 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
             }
         }
 
-        ray_t* tbl = csv_materialize_rows(buf, file_size, row_offsets,
+        ray_t* tbl = csv_materialize_rows(path, buf, file_size, next_offset, row_offsets,
                                           cnt, ncols, delimiter, col_name_ids, resolved_types,
-                                          import_domain);
+                                          import_domain, opts);
         if (!tbl || RAY_IS_ERR(tbl)) {
             err = (tbl && RAY_IS_ERR(tbl)) ? ray_err_from_obj(tbl)
                                            : RAY_ERR_OOM;
-            if (tbl) ray_release(tbl);
+            csv_keep_strict_error(tbl, err, opts);
             scratch_free(row_offsets_hdr);
             if (trace)
                 fprintf(stderr, "csv.parted: materialize failure part=%" PRId64 " rows=%" PRId64 "\n",
@@ -4361,6 +5139,17 @@ ray_err_t ray_csv_save_parted_mode(const char* path, char delimiter, bool header
                                    const int64_t* col_names, int32_t n_names,
                                    const char* root, const char* table_name,
                                    int64_t rows_per_part, ray_compress_t mode) {
+    return ray_csv_save_parted_ex(path, delimiter, header, col_types, n_types,
+                                  col_names, n_names, root, table_name,
+                                  rows_per_part, mode, NULL);
+}
+
+ray_err_t ray_csv_save_parted_ex(const char* path, char delimiter, bool header,
+                                 const int8_t* col_types, int32_t n_types,
+                                 const int64_t* col_names, int32_t n_names,
+                                 const char* root, const char* table_name,
+                                 int64_t rows_per_part, ray_compress_t mode,
+                                 ray_csv_opts_t* opts) {
     g_csv_src_fail.call = NULL;   /* this import's own failure only */
     if (!path || !root || !*root || !table_name || !*table_name ||
         table_name[0] == '.' || strchr(table_name,'/') || strchr(table_name,'\\'))
@@ -4372,7 +5161,7 @@ ray_err_t ray_csv_save_parted_mode(const char* path, char delimiter, bool header
     struct stat st;
     if (stat(dest,&st) == 0)
         return csv_save_parted_impl(path,delimiter,header,col_types,n_types,
-                                   col_names,n_names,dest,table_name,rows_per_part,false,mode);
+                                   col_names,n_names,dest,table_name,rows_per_part,false,opts,mode);
     /* Fail on an unreadable input before claiming the staging directory:
      * failed staging is retained and blocks the root, which a mistyped
      * source path must not do. */
@@ -4394,7 +5183,7 @@ ray_err_t ray_csv_save_parted_mode(const char* path, char delimiter, bool header
     if (mkdir(staging,0755) != 0) return RAY_ERR_IO;
 #endif
     ray_err_t err = csv_save_parted_impl(path,delimiter,header,col_types,n_types,
-                                       col_names,n_names,staging,table_name,rows_per_part,true,mode);
+                                       col_names,n_names,staging,table_name,rows_per_part,true,opts,mode);
     if (err != RAY_OK) {
         /* Failed staging is kept for diagnosis only when it holds a
          * partition.  A failure before the first one (a type vector that

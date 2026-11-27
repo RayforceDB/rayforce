@@ -2469,6 +2469,150 @@ static test_result_t test_csv_splayed_cancel_symfile(void) {
     PASS();
 }
 
+/* Strict mode (#1885): every rule, for every column type, on the first row,
+ * a middle row and the last one, in a file the serial parse reads and one
+ * the parallel parse reads, with a header and without.  Each case swaps one
+ * line of a valid file for a bad one and expects the error to name its line
+ * and say why; the valid file itself must read. */
+typedef struct {
+    int8_t      type;
+    const char* good;
+    const char* not_type;    /* text that is not the type; NULL: any text is */
+    const char* range;       /* a value past the type's range, or NULL */
+    const char* nullv;       /* text that reads as the type's null, or NULL */
+    const char* precision;   /* digits past the type's precision, or NULL */
+    const char* underflow;   /* a non-zero text that stores as zero, and */
+    const char* underflow_neg; /* its negative, or NULL */
+} csv_strict_case_t;
+
+static const csv_strict_case_t csv_strict_cases[] = {
+    { RAY_BOOL,      "true", "yes", NULL, NULL, NULL, NULL, NULL },
+    { RAY_U8,        "7", "x", "300", NULL, NULL, NULL, NULL },
+    { RAY_I16,       "7", "x", "40000", "-32768", NULL, NULL, NULL },
+    { RAY_I32,       "7", "x", "3000000000", "-2147483648", NULL, NULL, NULL },
+    { RAY_I64,       "7", "x", "9223372036854775808", "-9223372036854775808", NULL, NULL, NULL },
+    { RAY_F32,       "1.5", "x", "1e39", NULL, NULL, "1e-50", "-1e-46" },
+    { RAY_F64,       "1.5", "x", "1e400", NULL, NULL, "1e-400", "-2e-324" },
+    { RAY_DATE,      "2024-01-02", "2024-13-01", NULL, NULL, NULL, NULL, NULL },
+    { RAY_TIME,      "10:00:00", "10:99:00", NULL, "-596:31:23.648", "10:00:00.1234", NULL, NULL },
+    { RAY_TIMESPAN,  "0D00:00:01", "1", "106752D00:00:00", "0Nn", "0D00:00:01.1234567891", NULL, NULL },
+    { RAY_TIMESTAMP, "2024-01-02T10:00:00", "noon", "9999-01-01T00:00:00",
+                     "1707-09-22T00:12:43.145224192", "2024-01-02T10:00:00.1234567891", NULL, NULL },
+    { RAY_SYM,       "s", NULL, NULL, NULL, NULL, NULL, NULL },
+    { RAY_STR,       "s", NULL, NULL, NULL, NULL, NULL, NULL },
+    { RAY_GUID,      "0a0b0c0d-0102-0304-0506-0708090a0b0c", "0a0b", NULL,
+                     "00000000-0000-0000-0000-000000000000", NULL, NULL, NULL },
+};
+
+/* Write `rows` rows "<i>,<good>" (after a "k,v" header when `header`), with
+ * row `bad_row` replaced by `bad` (no replacement when bad is NULL). */
+static bool csv_strict_write(const char* path, bool header, int rows,
+                             const char* good, int bad_row, const char* bad) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    if (header) fputs("k,v\n", f);
+    for (int i = 0; i < rows; i++) {
+        if (bad && i == bad_row) fprintf(f, "%s\n", bad);
+        else fprintf(f, "%d,%s\n", i, good);
+    }
+    return fclose(f) == 0;
+}
+
+static test_result_t test_csv_strict_matrix(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    const char* path = TMP_CSV;
+    int64_t names[2] = { ray_sym_intern("k", 1), ray_sym_intern("v", 1) };
+    static const int sizes[2] = { 10, 8300 };   /* serial; parallel (> 8192 rows) */
+    char bad[160], want[256], err[512];
+    int checked = 0;
+    for (size_t t = 0; t < sizeof csv_strict_cases / sizeof csv_strict_cases[0]; t++) {
+        const csv_strict_case_t* tc = &csv_strict_cases[t];
+        int8_t types[2] = { RAY_I64, tc->type };
+        for (int hdr = 0; hdr < 2; hdr++) {
+            for (int z = 0; z < 2; z++) {
+                int rows = sizes[z];
+                ray_csv_opts_t opts = { .strict = true, .op = ".csv.read" };
+                /* the valid file reads */
+                TEST_ASSERT_TRUE(csv_strict_write(path, hdr, rows, tc->good, -1, NULL));
+                ray_t* ok = ray_read_csv_ex(path, ',', hdr, types, 2, hdr ? NULL : names, hdr ? 0 : 2, &opts);
+                if (!ok || RAY_IS_ERR(ok)) {
+                    snprintf(err, sizeof err, "type %d %s %d rows: the valid file fails: %s",
+                             tc->type, hdr ? "header" : "headerless", rows,
+                             ok ? ray_err_msg(ok) : "NULL");
+                    ray_error_free(ok);
+                    FAIL(strdup(err));
+                }
+                TEST_ASSERT_EQ_I(ray_table_nrows(ok), rows);
+                ray_release(ok);
+                /* each rule at each place */
+                for (int rule = 0; rule < 11; rule++) {
+                    const char* why = NULL;
+                    switch (rule) {
+                    case 0: if (!tc->not_type) continue;
+                            snprintf(bad, sizeof bad, "%%d,%s", tc->not_type);
+                            snprintf(want, sizeof want, "column v: \"%s\" is not ", tc->not_type); break;
+                    case 1: if (!tc->range) continue;
+                            snprintf(bad, sizeof bad, "%%d,%s", tc->range);
+                            snprintf(want, sizeof want, "column v: \"%s\" is out of range for ", tc->range); break;
+                    case 2: if (!tc->nullv) continue;
+                            snprintf(bad, sizeof bad, "%%d,%s", tc->nullv);
+                            snprintf(want, sizeof want, "column v: \"%s\" reads as a null ", tc->nullv); break;
+                    case 3: if (!tc->precision) continue;
+                            snprintf(bad, sizeof bad, "%%d,%s", tc->precision);
+                            snprintf(want, sizeof want, "column v: \"%s\" has more fraction digits", tc->precision); break;
+                    case 4: snprintf(bad, sizeof bad, "%%d");
+                            why = ": expected 2 cells, got 1"; break;
+                    case 5: snprintf(bad, sizeof bad, "%%d,%s,9", tc->good);
+                            why = ": expected 2 cells, got 3"; break;
+                    case 6: snprintf(bad, sizeof bad, "%%d,\"%s\"x", tc->good);
+                            why = ", column v: text after the closing quote"; break;
+                    case 7: snprintf(bad, sizeof bad, "%%d,\"%s", tc->good);
+                            why = ", column v: a quoted cell with no closing quote"; break;
+                    case 8: snprintf(bad, sizeof bad, "%%d,%s\rjunk", tc->good);
+                            why = ": text after a CR inside the row"; break;
+                    case 9: case 10: {
+                            const char* u = rule == 9 ? tc->underflow : tc->underflow_neg;
+                            if (!u) continue;
+                            snprintf(bad, sizeof bad, "%%d,%s", u);
+                            snprintf(want, sizeof want, "column v: \"%s\" underflows to zero for ", u); break;
+                    }
+                    }
+                    if (why) snprintf(want, sizeof want, "%s", why + (why[0] == ',' ? 2 : 0));
+                    int places[3] = { 0, rows / 2, rows - 1 };
+                    for (int pl = 0; pl < 3; pl++) {
+                        int r = places[pl];
+                        char line[200];
+                        snprintf(line, sizeof line, bad, r);
+                        TEST_ASSERT_TRUE(csv_strict_write(path, hdr, rows, tc->good, r, line));
+                        ray_t* res = ray_read_csv_ex(path, ',', hdr, types, 2,
+                                                     hdr ? NULL : names, hdr ? 0 : 2, &opts);
+                        char head[128];
+                        snprintf(head, sizeof head, ".csv.read \"%s\": line %d", path, r + 1 + hdr);
+                        const char* msg = res && RAY_IS_ERR(res) ? ray_err_msg(res) : NULL;
+                        bool good = msg && strcmp(ray_err_code(res), "parse") == 0 &&
+                                    strncmp(msg, head, strlen(head)) == 0 && strstr(msg, want);
+                        if (!good) {
+                            snprintf(err, sizeof err, "type %d %s %d rows, rule %d at row %d: got %s; want \"%s\" ... \"%s\"",
+                                     tc->type, hdr ? "header" : "headerless", rows, rule, r,
+                                     msg ? msg : "no error", head, want);
+                            if (res && RAY_IS_ERR(res)) ray_error_free(res); else if (res) ray_release(res);
+                            FAIL(strdup(err));
+                        }
+                        ray_error_free(res);
+                        checked++;
+                    }
+                }
+            }
+        }
+    }
+    unlink(path);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    TEST_ASSERT_EQ_I(checked, 1248);
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
     { "csv/splayed_cancel", test_csv_splayed_cancel, NULL, NULL },
     { "csv/splayed_cancel_hash", test_csv_splayed_cancel_hash, NULL, NULL },
@@ -2536,5 +2680,6 @@ const test_entry_t csv_entries[] = {
     { "csv/scan_boundary_matrix", test_csv_scan_boundary_matrix,            NULL, NULL },
     { "csv/sym_id_order",         test_csv_sym_id_order,                    NULL, NULL },
     { "csv/streaming_infers_like_read", test_csv_streaming_infers_like_read, NULL, NULL },
+    { "csv/strict_matrix",        test_csv_strict_matrix,                   NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

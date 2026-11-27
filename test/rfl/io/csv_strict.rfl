@@ -1,0 +1,269 @@
+;; @requires: posix  (fixtures are written through a POSIX shell via .sys.exec)
+;; .csv.read {strict: true} (#1885): a row whose cell count is not the
+;; schema's, a malformed quoted cell, or a non-empty cell that does not parse
+;; as its column's type is a `parse` error naming the file's line and the
+;; column.  An empty cell is a null in both modes; the default stays lenient.
+;; Fixtures use the rf_test_csvst_ prefix (the Makefile removes rf_test_*.csv).
+
+(.sys.exec "rm -rf rf_test_csvst_* rf_test_csvst_sp rf_test_csvst_pt rf_test_csvst_pt.csv-partial rf_test_csvst_pt2") -- 0
+(set M (fn [f] (try (do (f) "no error") (fn [e] (at e 'msg)))))
+(set C (fn [f] (try (do (f) "no error") (fn [e] (at e 'code)))))
+
+;; ── the option: a leading dict, as .csv.splayed and .csv.parted take it ─────
+(.sys.exec "printf 'a,b,c\\n1,x,2.5\\n2,y\\n3,z,abc\\n' > rf_test_csvst_bad.csv") -- 0
+(M (fn [] (.csv.read {stric: true} [I64 SYM F64] "rf_test_csvst_bad.csv"))) -- "unknown option 'stric' (only strict is accepted)"
+(M (fn [] (.csv.read {compress: true} [I64 SYM F64] "rf_test_csvst_bad.csv"))) -- "unknown option 'compress' (only strict is accepted)"
+(M (fn [] (.csv.read {strict: 1} [I64 SYM F64] "rf_test_csvst_bad.csv"))) -- "strict must be true or false"
+(M (fn [] (.csv.read {strict: "yes"} "rf_test_csvst_bad.csv"))) -- "strict must be true or false"
+(M (fn [] (.csv.read {strict: true} {strict: true} "rf_test_csvst_bad.csv"))) -- ".csv.read: a second options dict"
+(C (fn [] (.csv.read {stric: true} "rf_test_csvst_bad.csv"))) -- 'domain
+
+;; ── the default and {strict: false} stay lenient ─────────────────────────────
+(set L (.csv.read [I64 SYM F64] "rf_test_csvst_bad.csv"))
+(at L 'c) -- [2.5 0Nf 0Nf]
+(identical L (.csv.read {strict: false} [I64 SYM F64] "rf_test_csvst_bad.csv")) -- true
+(identical L (.csv.read {} [I64 SYM F64] "rf_test_csvst_bad.csv")) -- true
+
+;; ── cell count, with a header: the header is line 1 ─────────────────────────
+(.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_bad.csv") !- parse
+(M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_bad.csv"))) -- ".csv.read \"rf_test_csvst_bad.csv\": line 3: expected 3 cells, got 2"
+;; the schema inferred from the file is checked the same way
+(M (fn [] (.csv.read {strict: true} "rf_test_csvst_bad.csv"))) -- ".csv.read \"rf_test_csvst_bad.csv\": line 3: expected 3 cells, got 2"
+(.sys.exec "printf 'a,b,c\\n1,x,2.5\\n2,y,3.5,9\\n' > rf_test_csvst_more.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_more.csv"))) -- ".csv.read \"rf_test_csvst_more.csv\": line 3: expected 3 cells, got 4"
+;; a trailing delimiter is one more (empty) cell
+(.sys.exec "printf 'a,b,c\\n1,x,2.5,\\n' > rf_test_csvst_trail.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_trail.csv"))) -- ".csv.read \"rf_test_csvst_trail.csv\": line 2: expected 3 cells, got 4"
+
+;; ── a bad cell names the column, its text and the type ──────────────────────
+(.sys.exec "printf 'a,b,c\\n1,x,2.5\\n2,y,3.5\\n3,z,abc\\n' > rf_test_csvst_cell.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_cell.csv"))) -- ".csv.read \"rf_test_csvst_cell.csv\": line 4, column c: \"abc\" is not an F64"
+(at (.csv.read [I64 SYM F64] "rf_test_csvst_cell.csv") 'c) -- [2.5 3.5 0Nf]
+
+;; ── without a header (names given): line 1 is the first row ─────────────────
+(.sys.exec "printf '1,x,2.5\\n2,y,oops\\n' > rf_test_csvst_nohdr.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [a b c] [I64 SYM F64] "rf_test_csvst_nohdr.csv"))) -- ".csv.read \"rf_test_csvst_nohdr.csv\": line 2, column c: \"oops\" is not an F64"
+
+;; ── the line is the file's: a quoted newline counts, as do CRLF and lone CR ─
+(.sys.exec "printf 'a,b,c\\n1,\"two\\nlines\",2.5\\n2,y,bad\\n' > rf_test_csvst_qnl.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 STR F64] "rf_test_csvst_qnl.csv"))) -- ".csv.read \"rf_test_csvst_qnl.csv\": line 4, column c: \"bad\" is not an F64"
+(.sys.exec "printf 'a,b,c\\r\\n1,x,2.5\\r\\n2,y,\\r\\n3,z,bad\\r\\n' > rf_test_csvst_crlf.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_crlf.csv"))) -- ".csv.read \"rf_test_csvst_crlf.csv\": line 4, column c: \"bad\" is not an F64"
+;; a file with quotes splits rows at a lone CR as well
+(.sys.exec "printf 'a,b,c\\r1,\"x\",2.5\\r2,y\\r' > rf_test_csvst_cr.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_cr.csv"))) -- ".csv.read \"rf_test_csvst_cr.csv\": line 3: expected 3 cells, got 2"
+;; one without quotes splits at LF only and ends a cell at CR: lenient reads
+;; one row and drops the text after its first CR, which strict refuses
+(.sys.exec "printf 'a,b,c\\r1,x,2.5\\r2,y,3.5\\r' > rf_test_csvst_cr2.csv") -- 0
+(count (.csv.read [I64 SYM F64] "rf_test_csvst_cr2.csv")) -- 1
+(M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_cr2.csv"))) -- ".csv.read \"rf_test_csvst_cr2.csv\": line 2: text after a CR inside the row (a row ends at LF or CRLF)"
+;; a bad cell that itself spans lines is reported at the line its row starts on
+(.sys.exec "printf 'a,b\\n\"1\\n2\",x\\n' > rf_test_csvst_qbad.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 SYM] "rf_test_csvst_qbad.csv"))) -- ".csv.read \"rf_test_csvst_qbad.csv\": line 2, column a: \"1\\n2\" is not an I64"
+
+;; ── empty cells are nulls; a CRLF file whose last cell is empty is fine ─────
+(at (.csv.read [I64 SYM F64] "rf_test_csvst_crlf.csv") 'c) -- [2.5 0Nf 0Nf]
+(.sys.exec "printf 'a,b,c\\r\\n1,x,2.5\\r\\n2,,\\r\\n,z,3.5\\r\\n' > rf_test_csvst_empty.csv") -- 0
+(set E (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_empty.csv"))
+(at E 'a) -- [1 2 0Nl]
+(at E 'c) -- [2.5 0Nf 3.5]
+(identical E (.csv.read [I64 SYM F64] "rf_test_csvst_empty.csv")) -- true
+;; a quoted empty cell is empty too
+(.sys.exec "printf 'a,b\\n\"\",x\\n' > rf_test_csvst_qempty.csv") -- 0
+(at (.csv.read {strict: true} [I64 SYM] "rf_test_csvst_qempty.csv") 'a) -- [0Nl]
+
+;; ── a final line without a newline is an ordinary row ───────────────────────
+(.sys.exec "printf 'a,b,c\\n1,x,2.5\\n2,y,3.5' > rf_test_csvst_nonl.csv") -- 0
+(at (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_nonl.csv") 'c) -- [2.5 3.5]
+(.sys.exec "printf 'a,b,c\\n1,x,2.5\\n2,y' > rf_test_csvst_nonl2.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_nonl2.csv"))) -- ".csv.read \"rf_test_csvst_nonl2.csv\": line 3: expected 3 cells, got 2"
+
+;; ── a blank line is one empty cell: refused unless the schema has one column ─
+;; (lenient reads it as a row of nulls -- a trailing blank line too)
+(.sys.exec "printf 'a,b,c\\n1,x,2.5\\n\\n2,y,3.5\\n' > rf_test_csvst_blank.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_blank.csv"))) -- ".csv.read \"rf_test_csvst_blank.csv\": line 3: expected 3 cells, got 1"
+(.sys.exec "printf 'a,b,c\\n1,x,2.5\\n\\n' > rf_test_csvst_blank2.csv") -- 0
+(count (.csv.read [I64 SYM F64] "rf_test_csvst_blank2.csv")) -- 2
+(M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_blank2.csv"))) -- ".csv.read \"rf_test_csvst_blank2.csv\": line 3: expected 3 cells, got 1"
+(.sys.exec "printf 'a\\n1\\n\\n2\\n' > rf_test_csvst_one.csv") -- 0
+(at (.csv.read {strict: true} [I64] "rf_test_csvst_one.csv") 'a) -- [1 0Nl 2]
+
+;; ── whitespace around a number: lenient reads a null, so strict refuses ─────
+(.sys.exec "printf 'a,b\\n 1,2.5\\n' > rf_test_csvst_ws1.csv; printf 'a,b\\n1,2.5 \\n' > rf_test_csvst_ws2.csv; printf 'a,b\\n+1,+2.5\\n' > rf_test_csvst_ws3.csv") -- 0
+(at (.csv.read [I64 F64] "rf_test_csvst_ws1.csv") 'a) -- [0Nl]
+(M (fn [] (.csv.read {strict: true} [I64 F64] "rf_test_csvst_ws1.csv"))) -- ".csv.read \"rf_test_csvst_ws1.csv\": line 2, column a: \" 1\" is not an I64"
+(M (fn [] (.csv.read {strict: true} [I64 F64] "rf_test_csvst_ws2.csv"))) -- ".csv.read \"rf_test_csvst_ws2.csv\": line 2, column b: \"2.5 \" is not an F64"
+(at (.csv.read {strict: true} [I64 F64] "rf_test_csvst_ws3.csv") 'b) -- [2.5]
+;; text keeps its spaces in either mode
+(at (.csv.read {strict: true} [STR STR] "rf_test_csvst_ws1.csv") 'a) -- (list " 1")
+
+;; ── malformed quotes ────────────────────────────────────────────────────────
+(.sys.exec "printf 'a,b\\n\"ab\"cd,1\\n' > rf_test_csvst_q1.csv; printf 'a,b\\n1,\"ab\\n' > rf_test_csvst_q2.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [STR I64] "rf_test_csvst_q1.csv"))) -- ".csv.read \"rf_test_csvst_q1.csv\": line 2, column a: text after the closing quote"
+(M (fn [] (.csv.read {strict: true} [I64 STR] "rf_test_csvst_q2.csv"))) -- ".csv.read \"rf_test_csvst_q2.csv\": line 2, column b: a quoted cell with no closing quote"
+;; quoted cells with delimiters, escaped quotes and newlines are well formed
+(.sys.exec "printf 'a,b\\n\"x,y\",\"say \"\"hi\"\"\"\\n\"p\\nq\",\"\"\\n' > rf_test_csvst_q3.csv") -- 0
+(at (.csv.read {strict: true} [STR STR] "rf_test_csvst_q3.csv") 'b) -- (list "say \"hi\"" "")
+
+;; ── long cell text is cut at a character boundary ───────────────────────────
+(.sys.exec "printf 'a,b\\n1,' > rf_test_csvst_long.csv; i=0; while [ $i -lt 60 ]; do printf '\\303\\251' >> rf_test_csvst_long.csv; i=$((i+1)); done; printf '\\n' >> rf_test_csvst_long.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 I64] "rf_test_csvst_long.csv"))) -- ".csv.read \"rf_test_csvst_long.csv\": line 2, column b: \"éééééééééééééééééééé...\" is not an I64"
+;; control bytes in the cell are escaped in the message
+(.sys.exec "printf 'a,b\\n1,x\\ty\\n' > rf_test_csvst_tab.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 I64] "rf_test_csvst_tab.csv"))) -- ".csv.read \"rf_test_csvst_tab.csv\": line 2, column b: \"x\\ty\" is not an I64"
+
+;; ── every column type: strict reads a valid file exactly as lenient does ────
+(.sys.exec "printf 'b,u,h,i,j,e,f,d,t,s,p,y,r,g\\ntrue,1,1,1,1,1.5,1.5,2024.01.02,10:00:00.000,0D00:00:01,2024.01.02D10:00:00.000000000,a,x,0a0b0c0d-0102-0304-0506-0708090a0b0c\\n,,,,,,,,,,,,,\\nFALSE,255,-7,-70000,9000000000,-2e3,3.25e-2,2024-03-04,23:59:59,1D02:03:04.5,2024-03-04T01:02:03,\"q,r\",\"multi\\nline\",0A0B0C0D-0102-0304-0506-0708090A0B0C\\n' > rf_test_csvst_types.csv") -- 0
+(set TS [B8 U8 I16 I32 I64 F32 F64 DATE TIME TIMESPAN TIMESTAMP SYM STR GUID])
+(set TL (.csv.read TS "rf_test_csvst_types.csv"))
+(identical TL (.csv.read {strict: true} TS "rf_test_csvst_types.csv")) -- true
+(identical (.csv.read "rf_test_csvst_types.csv") (.csv.read {strict: true} "rf_test_csvst_types.csv")) -- true
+;; what .csv.write writes, nulls included, reads back under strict
+(.csv.write TL "rf_test_csvst_rt.csv")
+(identical TL (.csv.read {strict: true} TS "rf_test_csvst_rt.csv")) -- true
+
+;; ── every column type: a non-empty cell lenient cannot read is refused ──────
+(set B (fn [t v] (.sys.exec (format "printf 'k,v\\n1,%\\n' > rf_test_csvst_t.csv" v)) (M (fn [] (.csv.read {strict: true} (concat [I64] t) "rf_test_csvst_t.csv")))))
+(B [B8] "yes") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"yes\" is not a B8"
+(B [U8] "x1") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"x1\" is not a U8"
+(B [I16] "1.5") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"1.5\" is not an I16"
+(B [I32] "abc") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"abc\" is not an I32"
+(B [I64] "1e3") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"1e3\" is not an I64"
+(B [F32] "1.2.3") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"1.2.3\" is not an F32"
+(B [F64] "nan") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"nan\" is not an F64"
+(B [DATE] "2024-13-45") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"2024-13-45\" is not a DATE"
+(B [TIME] "25:99") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"25:99\" is not a TIME"
+(B [TIMESPAN] "1") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"1\" is not a TIMESPAN"
+(B [TIMESTAMP] "noon") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"noon\" is not a TIMESTAMP"
+(B [GUID] "0a0b") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"0a0b\" is not a GUID"
+(B [SYM] "anything") -- "no error"
+(B [STR] "anything") -- "no error"
+
+;; ── a number out of its column's range: lenient wraps it, keeps the null
+;;    sentinel or makes an infinity; strict refuses it, at every width ────────
+(.sys.exec "printf 'u,h,i,e\\n300,40000,3000000000,1e39\\n' > rf_test_csvst_wrap.csv") -- 0
+(set W (.csv.read [U8 I16 I32 F32] "rf_test_csvst_wrap.csv"))
+(at W 'u) -- [0x2c]
+(at W 'h) -- [-25536]
+(at W 'i) -- [-1294967296]
+(set R (fn [t v] (.sys.exec (format "printf 'k,v\\n1,%\\n' > rf_test_csvst_t.csv" v)) (M (fn [] (.csv.read {strict: true} (concat [I64] t) "rf_test_csvst_t.csv")))))
+(R [U8] "300") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"300\" is out of range for a U8"
+(R [U8] "-1") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"-1\" is out of range for a U8"
+(R [U8] "99999999999999999999") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"99999999999999999999\" is out of range for a U8"
+(R [U8] "255") -- "no error"
+(R [U8] "0") -- "no error"
+(R [I16] "40000") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"40000\" is out of range for an I16"
+(R [I16] "-32769") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"-32769\" is out of range for an I16"
+;; the type's minimum is its null sentinel, so it is not a value either
+(R [I16] "-32768") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"-32768\" reads as a null I16"
+(R [I16] "-32767") -- "no error"
+(R [I16] "32767") -- "no error"
+(R [I32] "3000000000") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"3000000000\" is out of range for an I32"
+(R [I32] "-2147483648") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"-2147483648\" reads as a null I32"
+(R [I32] "2147483647") -- "no error"
+(R [I64] "9223372036854775808") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"9223372036854775808\" is out of range for an I64"
+(R [I64] "-9223372036854775808") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"-9223372036854775808\" reads as a null I64"
+(R [I64] "-9223372036854775807") -- "no error"
+(R [I64] "9223372036854775807") -- "no error"
+;; a float too big for its type is an infinity, which is a null (#1828)
+(R [F32] "1e39") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"1e39\" is out of range for an F32"
+(R [F32] "-1e39") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"-1e39\" is out of range for an F32"
+(R [F32] "3.4e38") -- "no error"
+(R [F64] "1e400") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"1e400\" is out of range for an F64"
+(R [F64] "1.7e308") -- "no error"
+(R [F64] "inf") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"inf\" is not an F64"
+;; the parallel reader refuses one too
+(.sys.exec "awk 'BEGIN{print \"a,b\"; for(i=1;i<=20000;i++) printf \"%d,%d\\n\", i, (i==15000 ? 70000 : i%30000) }' > rf_test_csvst_wbig.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 I16] "rf_test_csvst_wbig.csv"))) -- ".csv.read \"rf_test_csvst_wbig.csv\": line 15001, column b: \"70000\" is out of range for an I16"
+
+;; ── the parallel parse: the first bad line of the file, whatever the split ──
+;; 100000 rows (past the 8192-row serial cutoff), a quoted newline in row 10,
+;; a short row at 30000 and a bad cell at 20000 and 90000: line 20002 wins.
+(.sys.exec "awk 'BEGIN{print \"a,b,c\"; for(i=1;i<=100000;i++){ if(i==10) printf \"%d,\\\"two\\nlines\\\",1.5\\n\", i; else if(i==20000||i==90000) printf \"%d,x,zz\\n\", i; else if(i==30000) printf \"%d,x\\n\", i; else printf \"%d,s%d,%d.5\\n\", i, i%7, i } }' > rf_test_csvst_big.csv") -- 0
+(count (.csv.read [I64 STR F64] "rf_test_csvst_big.csv")) -- 100000
+(M (fn [] (.csv.read {strict: true} [I64 STR F64] "rf_test_csvst_big.csv"))) -- ".csv.read \"rf_test_csvst_big.csv\": line 20002, column c: \"zz\" is not an F64"
+(.sys.exec "sed 's/^20000,x,zz$/20000,x,1/' rf_test_csvst_big.csv > rf_test_csvst_big.tmp && mv rf_test_csvst_big.tmp rf_test_csvst_big.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 STR F64] "rf_test_csvst_big.csv"))) -- ".csv.read \"rf_test_csvst_big.csv\": line 30002: expected 3 cells, got 2"
+
+;; ── .csv.splayed and .csv.parted share the reader, and the option ──────────
+(M (fn [] (.csv.splayed {strict: true} [I64 STR F64] "rf_test_csvst_big.csv" "rf_test_csvst_sp"))) -- ".csv.splayed \"rf_test_csvst_big.csv\": line 30002: expected 3 cells, got 2"
+(M (fn [] (.csv.splayed {strict: true compress: false} [I64 SYM F64] "rf_test_csvst_cell.csv" "rf_test_csvst_sp"))) -- ".csv.splayed \"rf_test_csvst_cell.csv\": line 4, column c: \"abc\" is not an F64"
+(M (fn [] (.csv.splayed {strict: 1} [I64 SYM F64] "rf_test_csvst_cell.csv" "rf_test_csvst_sp"))) -- "strict must be true or false"
+(M (fn [] (.csv.splayed {strictly: true} [I64 SYM F64] "rf_test_csvst_cell.csv" "rf_test_csvst_sp"))) -- "unknown option 'strictly' (only compress and strict are accepted)"
+(count (.csv.splayed {strict: true} [I64 SYM F64] "rf_test_csvst_empty.csv" "rf_test_csvst_sp")) -- 3
+;; a later partition's bad line, after earlier partitions were written
+(M (fn [] (.csv.parted {strict: true} [I64 STR F64] "rf_test_csvst_big.csv" 10000 "rf_test_csvst_pt" 't))) -- ".csv.parted \"rf_test_csvst_big.csv\": line 30002: expected 3 cells, got 2; partial output retained in \"rf_test_csvst_pt.csv-partial\""
+(.sys.exec "rm -rf rf_test_csvst_pt.csv-partial") -- 0
+(count (.csv.parted {strict: true compress: true} [I64 SYM F64] "rf_test_csvst_empty.csv" 2 "rf_test_csvst_pt2" 't)) -- 3
+
+;; ── review round 1 (#1885) ────────────────────────────────────────────────
+;; a value the type stores as its null, or past its range, is refused for the
+;; temporal types and GUID too; the default reads them as before
+(.sys.exec "printf 'v\\n-596:31:23.648\\n' > rf_test_csvst_r1.csv; printf 'v\\n00000000-0000-0000-0000-000000000000\\n' > rf_test_csvst_r2.csv; printf 'v\\n9999-01-01T00:00:00\\n' > rf_test_csvst_r3.csv; printf 'v\\n106752D00:00:00\\n' > rf_test_csvst_r4.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [TIME] "rf_test_csvst_r1.csv"))) -- ".csv.read \"rf_test_csvst_r1.csv\": line 2, column v: \"-596:31:23.648\" reads as a null TIME"
+(M (fn [] (.csv.read {strict: true} [GUID] "rf_test_csvst_r2.csv"))) -- ".csv.read \"rf_test_csvst_r2.csv\": line 2, column v: \"00000000-0000-0000-0000-000000000000\" reads as a null GUID"
+(M (fn [] (.csv.read {strict: true} [TIMESTAMP] "rf_test_csvst_r3.csv"))) -- ".csv.read \"rf_test_csvst_r3.csv\": line 2, column v: \"9999-01-01T00:00:00\" is out of range for a TIMESTAMP"
+(M (fn [] (.csv.read {strict: true} [TIMESPAN] "rf_test_csvst_r4.csv"))) -- ".csv.read \"rf_test_csvst_r4.csv\": line 2, column v: \"106752D00:00:00\" is out of range for a TIMESPAN"
+(M (fn [] (.csv.splayed {strict: true} [TIMESTAMP] "rf_test_csvst_r3.csv" "rf_test_csvst_sp"))) -- ".csv.splayed \"rf_test_csvst_r3.csv\": line 2, column v: \"9999-01-01T00:00:00\" is out of range for a TIMESTAMP"
+(M (fn [] (.csv.parted {strict: true} [TIMESPAN] "rf_test_csvst_r4.csv" "rf_test_csvst_pt" 't))) -- ".csv.parted \"rf_test_csvst_r4.csv\": line 2, column v: \"106752D00:00:00\" is out of range for a TIMESPAN"
+;; the extremes that do fit
+(.sys.exec "printf 'p,n\\n2292-04-10T23:47:16.854775807,106751D23:47:16.854775806\\n1707-09-22T00:12:43.145224193,0Wn\\n' > rf_test_csvst_r5.csv") -- 0
+(count (.csv.read {strict: true} [TIMESTAMP TIMESPAN] "rf_test_csvst_r5.csv")) -- 2
+
+;; the first row is checked as any row is, without a header ...
+(.sys.exec "printf '1\\n2,3\\n' > rf_test_csvst_h1.csv; printf '1,2,3\\n2,3\\n' > rf_test_csvst_h2.csv; printf '\\n2,3\\n' > rf_test_csvst_h3.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [a b] [I64 I64] "rf_test_csvst_h1.csv"))) -- ".csv.read \"rf_test_csvst_h1.csv\": line 1: expected 2 cells, got 1"
+(M (fn [] (.csv.read {strict: true} [a b] [I64 I64] "rf_test_csvst_h2.csv"))) -- ".csv.read \"rf_test_csvst_h2.csv\": line 1: expected 2 cells, got 3"
+(M (fn [] (.csv.read {strict: true} [a b] [I64 I64] "rf_test_csvst_h3.csv"))) -- ".csv.read \"rf_test_csvst_h3.csv\": line 1: expected 2 cells, got 1"
+(M (fn [] (.csv.splayed {strict: true} [a b] [I64 I64] "rf_test_csvst_h1.csv" "rf_test_csvst_sp"))) -- ".csv.splayed \"rf_test_csvst_h1.csv\": line 1: expected 2 cells, got 1"
+(M (fn [] (.csv.parted {strict: true} [a b] [I64 I64] "rf_test_csvst_h1.csv" "rf_test_csvst_pt" 't))) -- ".csv.parted \"rf_test_csvst_h1.csv\": line 1: expected 2 cells, got 1"
+;; (the default still sizes the table from the first line)
+(C (fn [] (.csv.read [a b] [I64 I64] "rf_test_csvst_h1.csv"))) -- 'length
+;; ... and a header's quoted cells must be well formed
+(.sys.exec "printf '\"v\\n1\\n' > rf_test_csvst_h4.csv; printf '\"v\"junk\\n1\\n' > rf_test_csvst_h5.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [STR] "rf_test_csvst_h4.csv"))) -- ".csv.read \"rf_test_csvst_h4.csv\": line 1: header cell 1: a quoted cell with no closing quote"
+(M (fn [] (.csv.read {strict: true} [STR] "rf_test_csvst_h5.csv"))) -- ".csv.read \"rf_test_csvst_h5.csv\": line 1: header cell 1: text after the closing quote"
+(M (fn [] (.csv.splayed {strict: true} [STR] "rf_test_csvst_h5.csv" "rf_test_csvst_sp"))) -- ".csv.splayed \"rf_test_csvst_h5.csv\": line 1: header cell 1: text after the closing quote"
+(M (fn [] (.csv.parted {strict: true} [STR] "rf_test_csvst_h4.csv" "rf_test_csvst_pt" 't))) -- ".csv.parted \"rf_test_csvst_h4.csv\": line 1: header cell 1: a quoted cell with no closing quote"
+
+;; every argument is consumed by the arrangement: a later dict is an error
+(.sys.exec "printf 'v\\n1\\n' > rf_test_csvst_ok.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64] "rf_test_csvst_ok.csv" {strict: false}))) -- ".csv.read: a second options dict"
+(M (fn [] (.csv.read [I64] "rf_test_csvst_ok.csv" {strict: true}))) -- ".csv.read: the options dict must be the first argument"
+(M (fn [] (.csv.read [I64] "rf_test_csvst_ok.csv" 42))) -- ".csv.read: 1 argument past its schema and path"
+(C (fn [] (.csv.read [I64] "rf_test_csvst_ok.csv" 42))) -- 'arity
+(M (fn [] (.csv.splayed {strict: true} [I64] "rf_test_csvst_ok.csv" {strict: false} "rf_test_csvst_sp"))) -- "csv.splayed: a second options dict"
+(M (fn [] (.csv.parted {strict: true} [I64] "rf_test_csvst_ok.csv" {x: 1} "rf_test_csvst_pt" 't))) -- "csv.parted: a second options dict"
+
+;; a message that would pass 255 bytes is cut in the cell text only, on whole
+;; characters and escapes, and keeps the parted note whole
+(set LD "rf_test_csvst_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+(.sys.exec (format "mkdir -p % && printf 'a,b\\n1,2\\n3,' > %/c.csv && i=0; while [ $i -lt 60 ]; do printf '\\001' >> %/c.csv; i=$((i+1)); done; printf '\\n' >> %/c.csv" LD LD LD LD)) -- 0
+(set E1 (M (fn [] (.csv.read {strict: true} [I64 I64] (format "%/c.csv" LD)))))
+(count E1) -- 255
+(last (split E1 "\\x01")) -- "...\" is not an I64"
+(.sys.exec (format "rm -rf %/rt %/rt.csv-partial" LD LD)) -- 0
+(set E2 (M (fn [] (.csv.parted {strict: true} [I64 I64] (format "%/c.csv" LD) 1 (format "%/rt" LD) 't))))
+(count (split E2 "...\" is not an I64; partial output retained in \"")) -- 2
+(last (split E2 "/")) -- "rt.csv-partial\""
+(<= (count E2) 255) -- true
+
+;; ── review round 2 (#1885): a non-zero float that stores as zero ──────────
+;; rounding, to a subnormal too, is kept; a total loss to zero is refused
+(R [F64] "1e-400") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"1e-400\" underflows to zero for an F64"
+(R [F64] "2e-324") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"2e-324\" underflows to zero for an F64"
+(R [F64] "-2e-324") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"-2e-324\" underflows to zero for an F64"
+(R [F32] "1e-50") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"1e-50\" underflows to zero for an F32"
+(R [F32] "-1e-46") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"-1e-46\" underflows to zero for an F32"
+(R [F64] "5e-324") -- "no error"
+(R [F64] "1e-310") -- "no error"
+(R [F32] "1e-45") -- "no error"
+(R [F32] "1e-40") -- "no error"
+(R [F64] "0") -- "no error"
+(R [F64] "-0.0e-400") -- "no error"
+(R [F32] "0.000e-50") -- "no error"
+;; the default stores zero
+(.sys.exec "printf 'v\\n1e-400\\n' > rf_test_csvst_uf.csv") -- 0
+(at (.csv.read [F64] "rf_test_csvst_uf.csv") 'v) -- [0.0]
+
+(.sys.exec "rm -rf rf_test_csvst_* rf_test_csvst_sp rf_test_csvst_pt rf_test_csvst_pt.csv-partial rf_test_csvst_pt2") -- 0

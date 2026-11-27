@@ -664,7 +664,7 @@ static const ray_sig_entry_t own_sigs[] = {
      "Define a Datalog rule (head + body clauses)"},
     {"env", "(env <ignored: any, usually 0>)",
      "List all global environment bindings"},
-    {".csv.read", "(.csv.read [<names: sym vector>] [<types: sym vector>] <path: str>)",
+    {".csv.read", "(.csv.read [<options: dict>] [<names: sym vector>] [<types: sym vector>] <path: str>)",
      "Load CSV file into table (mmap, parallel parse)"},
     {".csv.write", "(.csv.write <t: table> <path: str> [<options>])",
      "Write table to CSV file"},

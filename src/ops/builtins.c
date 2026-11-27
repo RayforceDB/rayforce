@@ -862,7 +862,68 @@ static int8_t resolve_type_name(int64_t sym_id) {
     return result;
 }
 
+/* The leading options dict of the CSV loaders (#1885): `strict` on each,
+ * `compress` on the ones that write columns (`writes`).  As for compress
+ * alone: the keys are symbols, an unknown key or a non-bool value is a
+ * domain error. */
+static ray_t* csv_load_opts_parse(ray_t* opts, bool writes,
+                                  ray_compress_t* mode, bool* strict) {
+    *mode = RAY_COMPRESS_ABSENT;
+    *strict = false;
+    ray_t* keys = ray_dict_keys(opts);
+    if (keys && keys->len > 0 && keys->type != RAY_SYM)
+        return ray_error("domain", "option keys must be symbols");
+    for (int64_t i = 0; keys && i < keys->len; i++) {
+        ray_t* k = ray_sym_vec_cell(keys, i);
+        size_t kl = k ? ray_str_len(k) : 0;
+        const char* kp = k ? ray_str_ptr(k) : "?";
+        bool known = (kl == 6 && memcmp(kp, "strict", 6) == 0) ||
+                     (writes && kl == 8 && memcmp(kp, "compress", 8) == 0);
+        if (!known)
+            return ray_error("domain", "unknown option '%.*s' (only %s accepted)",
+                             k ? (int)kl : 1, kp,
+                             writes ? "compress and strict are" : "strict is");
+    }
+    if (writes) {
+        ray_t* oerr = ray_compress_opt_parse(opts, false, mode);
+        if (oerr) return oerr;
+    }
+    ray_t* key = ray_sym(ray_sym_intern("strict", 6));
+    if (!key || RAY_IS_ERR(key)) return key ? key : ray_error("oom", NULL);
+    ray_t* v = ray_dict_get(opts, key);
+    ray_release(key);
+    if (!v) return NULL;
+    if (RAY_IS_ERR(v)) return v;
+    bool ok = v->type == -RAY_BOOL;
+    if (ok) *strict = v->b8 != 0;
+    ray_release(v);
+    return ok ? NULL : ray_error("domain", "strict must be true or false");
+}
+
+/* Arguments a CSV loader's arrangement left over (#1885 review): an options
+ * dict there is a second one, or one that does not lead; anything else is
+ * one argument too many.  Each arrangement consumes exactly its own. */
+static ray_t* csv_extra_args(const char* op, ray_t** extra, int64_t k, bool had_opts) {
+    for (int64_t i = 0; i < k; i++)
+        if (extra[i] && extra[i]->type == RAY_DICT)
+            return had_opts ? ray_error("domain", "%s: a second options dict", op)
+                            : ray_error("domain", "%s: the options dict must be the first argument", op);
+    return ray_error("arity", "%s: %lld argument%s past its schema and path", op,
+                     (long long)k, k == 1 ? "" : "s");
+}
+
 ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
+    ray_csv_opts_t copts = { .strict = false, .op = ".csv.read", .err = NULL };
+    bool had_opts = false;
+    if (n >= 1 && args[0] && args[0]->type == RAY_DICT) {
+        if (n >= 2 && args[1] && args[1]->type == RAY_DICT)
+            return ray_error("domain", ".csv.read: a second options dict");
+        had_opts = true;
+        ray_compress_t unused;
+        ray_t* oerr = csv_load_opts_parse(args[0], false, &unused, &copts.strict);
+        if (oerr) return oerr;
+        args++; n--;
+    }
     if (n < 1 || n > 3) return ray_error("arity", ".csv.read: expects 1 to 3 arguments, got %lld", (long long)n);
 
     /* (.csv.read [types] "path"), (.csv.read [names] [types] "path"), or (.csv.read "path") */
@@ -880,6 +941,8 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
     } else {
         path_obj = args[0];
     }
+    int64_t used = names ? 3 : schema ? 2 : 1;
+    if (n != used) return csv_extra_args(".csv.read", args + used, n - used, had_opts);
 
     const char* path = NULL;
     if (path_obj->type == -RAY_STR)
@@ -907,15 +970,15 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
         }
         ray_t* tbl = names
             // cppcheck-suppress uninitvar // col_types is filled for all ncols (<= 256, checked above); col_names only when names is set, the only case it is passed
-            ? ray_read_csv_named_opts(path, 0, false, col_types, (int32_t)ncols,
-                                      col_names, (int32_t)ncols)
-            : ray_read_csv_opts(path, 0, true, col_types, (int32_t)ncols);
+            ? ray_read_csv_ex(path, 0, false, col_types, (int32_t)ncols,
+                              col_names, (int32_t)ncols, &copts)
+            : ray_read_csv_ex(path, 0, true, col_types, (int32_t)ncols, NULL, 0, &copts);
         if (!tbl) { char pbuf[RAY_ERR_PATH_MAX + 1]; return ray_error("io", ".csv.read \"%s\": read failed", ray_err_path(path, pbuf)); }
         if (RAY_IS_ERR(tbl)) return tbl;
         return tbl;
     }
 
-    ray_t* tbl = ray_read_csv(path);
+    ray_t* tbl = ray_read_csv_ex(path, 0, true, NULL, 0, NULL, 0, &copts);
     if (!tbl) { char pbuf[RAY_ERR_PATH_MAX + 1]; return ray_error("io", ".csv.read \"%s\": read failed", ray_err_path(path, pbuf)); }
     if (RAY_IS_ERR(tbl)) return tbl;
     return tbl;
@@ -988,10 +1051,13 @@ static ray_t* csv_import_error(ray_err_t err, const char* op, const char* src, c
 
 ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
     ray_compress_t mode = RAY_COMPRESS_ABSENT;
+    ray_csv_opts_t copts = { .strict = false, .op = ".csv.splayed", .err = NULL };
+    bool had_opts = false;
     if (n >= 1 && args[0] && args[0]->type == RAY_DICT) {
         if (n >= 2 && args[1] && args[1]->type == RAY_DICT)
             return ray_error("domain", "csv.splayed: a second options dict");
-        ray_t* oerr = ray_compress_opt_parse(args[0], true, &mode);
+        had_opts = true;
+        ray_t* oerr = csv_load_opts_parse(args[0], true, &mode, &copts.strict);
         if (oerr) return oerr;
         args++; n--;
     }
@@ -1016,6 +1082,10 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
         path_obj = args[0];
     } else {
         return ray_error("domain", "csv.splayed: invalid argument arrangement");
+    }
+    {
+        int64_t used = names ? 3 : schema ? 2 : 1;
+        if (data_n != used) return csv_extra_args("csv.splayed", args + used, data_n - used, had_opts);
     }
     if (!path_obj || path_obj->type != -RAY_STR) return ray_error("type", "csv.splayed: source path must be str, got %s", path_obj ? ray_type_name(path_obj->type) : "null");
     const char* path = ray_str_ptr(path_obj);
@@ -1048,10 +1118,11 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
         }
     }
 
-    ray_err_t err = ray_csv_save_splayed_mode(path, 0, header,
-                                              types_arg, ncols,
-                                              names_arg, ncols,
-                                              dir, 0, mode);
+    ray_err_t err = ray_csv_save_splayed_ex(path, 0, header,
+                                            types_arg, ncols,
+                                            names_arg, ncols,
+                                            dir, 0, mode, &copts);
+    if (copts.err) return copts.err;
     if (err != RAY_OK) {
         ray_t* serr = err == RAY_ERR_IO ? csv_source_error(".csv.splayed", path) : NULL;
         return serr ? serr : csv_import_error(err, ".csv.splayed", path, dir);
@@ -1070,10 +1141,13 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
 
 ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
     ray_compress_t mode = RAY_COMPRESS_ABSENT;
+    ray_csv_opts_t copts = { .strict = false, .op = ".csv.parted", .err = NULL };
+    bool had_opts = false;
     if (n >= 1 && args[0] && args[0]->type == RAY_DICT) {
         if (n >= 2 && args[1] && args[1]->type == RAY_DICT)
             return ray_error("domain", "csv.parted: a second options dict");
-        ray_t* oerr = ray_compress_opt_parse(args[0], true, &mode);
+        had_opts = true;
+        ray_t* oerr = csv_load_opts_parse(args[0], true, &mode, &copts.strict);
         if (oerr) return oerr;
         args++; n--;
     }
@@ -1112,6 +1186,10 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
         path_obj = args[0];
     } else {
         return ray_error("domain", "csv.parted: invalid argument arrangement");
+    }
+    {
+        int64_t used = names ? 3 : schema ? 2 : 1;
+        if (data_n != used) return csv_extra_args("csv.parted", args + used, data_n - used, had_opts);
     }
 
     if (!path_obj || path_obj->type != -RAY_STR) return ray_error("type", "csv.parted: source path must be str, got %s", path_obj ? ray_type_name(path_obj->type) : "null");
@@ -1158,10 +1236,31 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
         return ray_error("io", "csv.parted: %s is left from an earlier failed import; remove it to retry",
                          staging);
 
-    ray_err_t err = ray_csv_save_parted_mode(path, 0, header,
-                                              types_arg, ncols,
-                                              names_arg, ncols,
-                                              root, table_name, rows_per_part, mode);
+    /* A strict error may be followed by the note on retained output: the
+     * message is composed to leave it room, so cutting the cell text can
+     * never cut the note (#1885 review). */
+    char note[128];
+    {
+        char sbuf[RAY_ERR_PATH_MAX + 1];
+        /* the clipped path is at most 60 bytes; the precision says so */
+        snprintf(note, sizeof note, "; partial output retained in \"%.64s\"",
+                 ray_err_path_n(staging, sbuf, 60));
+        copts.reserve = strlen(note);
+    }
+    ray_err_t err = ray_csv_save_parted_ex(path, 0, header,
+                                           types_arg, ncols,
+                                           names_arg, ncols,
+                                           root, table_name, rows_per_part, mode, &copts);
+    if (copts.err) {
+        struct stat st;
+        if (stat(dest, &st) != 0 && stat(staging, &st) == 0) {
+            char m[256];
+            snprintf(m, sizeof m, "%s", ray_err_msg(copts.err));
+            ray_error_free(copts.err);
+            return ray_error("parse", "%s%s", m, note);
+        }
+        return copts.err;
+    }
     if (err != RAY_OK) {
         struct stat st;
         if (stat(dest, &st) != 0 && stat(staging, &st) == 0)
