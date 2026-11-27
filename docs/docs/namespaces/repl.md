@@ -98,7 +98,7 @@ The three describe a builtin as the engine records it, not as a guess from its n
   - `min` and `max` are described with one argument, as aggregates (`[false]`), although `(min a b)` maps element-wise;
   - `and` and `or` are described in their two-operand form (`[true true]`), and map their operands element by element in and out of a query: `(and [true false true] [true true false])` is `[true false false]`.
   - `if` is described in its two-operand form too (`[true true]`), but that is how a **query** evaluates it: there, `(if c 7)` over a column `c` gives one value per row (`[7 0 7]` for `c` = `[true false true]`). An ordinary call with a boolean-vector condition needs an else arm: `(if [true false true] 7)` is a `domain` error ("a boolean-vector condition needs an else arm"), while `(if [true false true] 7 9)` is `[7 9 7]`.
-- **Not every reducing builtin is registered as an aggregation.** `first` and `last` reduce but are not registered so, and are `aggregate: false`.
+- **`first`, `last`, `top` and `bot` are aggregations too.** In a query they reduce a column, or each group, to one value (`top` and `bot`: the `k` largest or smallest), and are `aggregate: true`. Outside a query `first` and `last` take an element by position, as their own pages say.
 
 A builtin's calling convention is not the set of forms it accepts. `min` is unary as a function value, but `(min 1 2)` takes two numbers. So `arity` is left unknown for a builtin, and `usage` spells its forms out. The answer follows the name's current value: an alias reports the function it holds, and a reassignment reports the new one. A name that is not a symbol raises `type`.
 

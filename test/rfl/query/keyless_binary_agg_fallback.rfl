@@ -38,9 +38,9 @@
 (at (select {from: T s: (percentile f 50)}) 's) -- (at (select {from: T s: (percentile f 50) z: (first (+ d 0))}) 's)
 (at (select {from: T s: (percentile f 50) where: (> v 15)}) 's) -- (at (select {from: T s: (percentile f 50) z: (first (+ d 0)) where: (> v 15)}) 's)
 (at (select {from: T s: (percentile f 50) where: (> v 100)}) 's) -- (at (select {from: T s: (percentile f 50) z: (first (+ d 0)) where: (> v 100)}) 's)
-(at (select {from: T s: (median f)}) 's) -- (at (select {from: T s: (median f) z: (first (+ d 0))}) 's)
-(at (select {from: T s: (median f) where: (> v 15)}) 's) -- (at (select {from: T s: (median f) z: (first (+ d 0)) where: (> v 15)}) 's)
-(at (select {from: T s: (median f) where: (> v 100)}) 's) -- (at (select {from: T s: (median f) z: (first (+ d 0)) where: (> v 100)}) 's)
+(at (select {from: T s: (med f)}) 's) -- (at (select {from: T s: (med f) z: (first (+ d 0))}) 's)
+(at (select {from: T s: (med f) where: (> v 15)}) 's) -- (at (select {from: T s: (med f) z: (first (+ d 0)) where: (> v 15)}) 's)
+(at (select {from: T s: (med f) where: (> v 100)}) 's) -- (at (select {from: T s: (med f) z: (first (+ d 0)) where: (> v 100)}) 's)
 
 ;; planned = the builtin over the kept rows
 (at (select {from: T s: (cov c f)}) 's) -- (enlist (cov [1 5 3] [1.5 2.0 4.0]))
@@ -48,7 +48,7 @@
 (at (select {from: T s: (top c 2)}) 's) -- (list [5 3])
 (at (select {from: T s: (bot c 2) where: (> v 15)}) 's) -- (list [3 5])
 (at (select {from: T s: (top c 2) z: (first (+ d 0))}) 's) -- (list [5 3])
-(at (select {from: T s: (median f) z: (first (+ d 0))}) 's) -- [2.0]
+(at (select {from: T s: (med f) z: (first (+ d 0))}) 's) -- [2.0]
 (at (select {from: T s: (quantile f 0.5) z: (first (+ d 0))}) 's) -- [2.0]
 
 ;; over no rows: the builtin's answer over no values, one row

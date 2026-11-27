@@ -37,11 +37,13 @@
 ;; scalar `med` builtin.  median is holistic and previously had no n_keys==0
 ;; accumulator, so the select form returned 0 instead of the median. ──
 (set Tmed (table [v] (list [1.0 2.0 3.0 4.0 5.0])))
-(at (select {m: (median v) from: Tmed}) 'm)            -- [3.0]
-(== (med [1.0 2.0 3.0 4.0 5.0]) (at (at (select {m: (median v) from: Tmed}) 'm) 0)) -- true
+(at (select {m: (med v) from: Tmed}) 'm)            -- [3.0]
 ;; even count → average of the two middles; I64 input → F64 result
 (set Tmed2 (table [v] (list [10 20 30 40])))
-(at (select {m: (median v) from: Tmed2}) 'm)           -- [25.0]
+(at (select {m: (med v) from: Tmed2}) 'm)           -- [25.0]
 ;; selection-aware: median of the rows passing the filter only
 (set Tmed3 (table [v] (list [1.0 2.0 3.0 4.0 5.0 100.0])))
-(at (select {m: (median v) from: Tmed3 where: (< v 50.0)}) 'm) -- [3.0]
+(at (select {m: (med v) from: Tmed3 where: (< v 50.0)}) 'm) -- [3.0]
+;; median is no builtin and no aggregate spelling: med is the only name (#1814)
+(at (select {m: (median v) from: Tmed}) 'm) !- name
+(median [1.0 2.0 3.0]) !- name

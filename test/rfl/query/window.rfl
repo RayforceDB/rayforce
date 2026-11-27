@@ -124,7 +124,7 @@
 
 ;; ── errors ────────────────────────────────────────────────────────────────────
 ;; (a) unknown func
-(window {from: T funcs: {x: (median v)}}) !- domain
+(window {from: T funcs: {x: (med v)}}) !- domain
 ;; (b) bad frame symbol
 (window {from: T frame: 'bogus funcs: {mn: (min v)}}) !- domain
 ;; (b2) trailing row count must be positive
