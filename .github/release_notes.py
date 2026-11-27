@@ -176,6 +176,10 @@ SUBJECT = re.compile(r'^([a-zA-Z]+)(?:\([^)]*\))?(!?):\s*(.*)$')
 # A trailer line in the trailer block, by git's rules (git interpret-trailers),
 # plus the one key Conventional Commits spells with a space.
 TRAILER = re.compile(r'^(BREAKING CHANGE|[A-Za-z0-9-]+)[ \t]*:[ \t]*(.*)$')
+# The closing lines GitHub and this repository write in the same paragraph
+# (`Fixes #12`, `Part of #1814`): no `Key: value`, but trailer-like, so they
+# count toward the block's ratio of trailers without being trailers.
+CLOSING = re.compile(r'^(?:Fixes|Fixed|Closes|Closed|Resolves|Resolved|Refs|Part of)\b', re.I)
 
 
 FENCE = re.compile(r'^[ \t]*(`{3,}|~{3,})')
@@ -211,7 +215,7 @@ def trailers(body):
     if not paragraphs or not paragraphs[-1].strip():
         return []
     lines = paragraphs[-1].split('\n')
-    found, own = [], 0
+    found, own, closing = [], 0, 0
     for line in lines:
         if line[:1] in (' ', '\t'):
             if found and found[-1] is not None:
@@ -220,8 +224,9 @@ def trailers(body):
         match = TRAILER.match(line)
         found.append((match[1], match[2].strip()) if match else None)
         own += 1
+        closing += 1 if not match and CLOSING.match(line) else 0
     trails = [t for t in found if t is not None]
-    if not trails or 4 * len(trails) < own:
+    if not trails or 4 * (len(trails) + closing) < own:
         return []
     return trails
 
