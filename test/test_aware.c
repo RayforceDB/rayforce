@@ -3699,6 +3699,74 @@ static test_result_t test_distinct_str_cancel(void) {
     PASS();
 }
 
+/* #1783: a group by one key column with no outputs finds each group's
+ * first row on the calling thread as far as every group has one, the rest
+ * on the pool, and gathers every column at those rows; each pass polls for
+ * a cancel (ray_cancel_poll).  The seam raises the cancel at the nth poll:
+ * each n the route reaches answers `cancel` and leaves no block behind
+ * (no more live blocks than before it);
+ * past its polls it answers in full, the answer of the uncancelled run.
+ * The routes: integer keys read through a direct table (unique, 140,000
+ * rows), F64 keys through a hash table, a few groups with one seen last
+ * (the calling thread stops at no early row), and a where:.  On a route
+ * that never polls the seam never fires: the first n answers in full. */
+static test_result_t test_group_keys_only_cancel(void) {
+    aw_eval_ok("(set T (table [k v s] (list (reverse (til 140000)) (til 140000) (at ['a 'b 'c] (% (til 140000) 3)))))");
+    aw_eval_ok("(set F (table [k v] (list (as 'F64 (% (* (til 140000) 7919) 70001)) (til 140000))))");
+    aw_eval_ok("(set L (table [k v] (list (+ (% (til 140000) 3) (* 10 (== (til 140000) 139999))) (til 140000))))");
+    static const char* const qs[] = {
+        "(select {from: T by: k})",
+        "(select {from: F by: k})",
+        "(select {from: L by: k})",
+        "(select {from: T where: (> v 5) by: k})",
+    };
+    for (size_t q = 0; q < sizeof qs / sizeof *qs; q++) {
+        ray_t* want = ray_eval_str(qs[q]);
+        TEST_ASSERT_FMT(want && !RAY_IS_ERR(want) && want->type == RAY_TABLE, "%s: no answer", qs[q]);
+        ray_env_set(ray_sym_intern("W", 1), want);
+        ray_release(want);
+        ray_t* warm = ray_eval_str(qs[q]);   /* the caches a run fills, filled */
+        if (warm && RAY_IS_ERR(warm)) ray_error_free(warm); else if (warm) ray_release(warm);
+        uint32_t polls = 0;
+        for (uint32_t n = 1; n <= 64; n++) {
+            ray_heap_gc();
+            int64_t live0 = aw_live_blocks();
+            ray_test_cancel_at_poll(n);
+            ray_t* got = ray_eval_str(qs[q]);
+            ray_test_cancel_at_poll(0);
+            ray_clear_interrupt();
+            TEST_ASSERT_NOT_NULL(got);
+            if (RAY_IS_ERR(got)) {
+                TEST_ASSERT_FMT(strcmp(ray_err_code(got), "cancel") == 0, "%s, cancel at poll %u: %s",
+                                qs[q], n, ray_err_code(got));
+                ray_error_free(got);
+                ray_heap_gc();
+                /* no block left: a cancelled run may reclaim an earlier
+                 * run's freed blocks, so it may end below where it began */
+                /* No block left behind.  The count is the calling thread's:
+                 * the F64 grouping's blocks come from the workers' heaps and
+                 * are freed here, so even an uncancelled run of it ends a
+                 * few thousand below where it began; no run may end above. */
+                TEST_ASSERT_FMT(aw_live_blocks() <= live0, "%s, cancel at poll %u: %lld blocks left",
+                                qs[q], n, (long long)(aw_live_blocks() - live0));
+                polls = n;
+                continue;
+            }
+            ray_env_set(ray_sym_intern("Q", 1), got);
+            ray_release(got);
+            ray_t* v = ray_eval_str("(== (repr Q) (repr W))");
+            bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+            if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+            TEST_ASSERT_FMT(ok, "%s, cancel at poll %u: not the answer", qs[q], n);
+            break;
+        }
+        TEST_ASSERT_FMT(polls >= 1, "%s: no cancel poll", qs[q]);
+    }
+    aw_eval_ok("(set T 0)"); aw_eval_ok("(set F 0)"); aw_eval_ok("(set L 0)");
+    aw_eval_ok("(set W 0)"); aw_eval_ok("(set Q 0)");
+    PASS();
+}
+
 /* sel_compact over a selection of 80000 rows gathers its columns on the
  * pool from the selection's morsels (#1757); a cancel landing before its
  * first dispatch leaves the cells unwritten, which fresh blocks fill with
@@ -6421,6 +6489,7 @@ const test_entry_t aware_entries[] = {
     { "aware/topk_cancel_at_dispatch", test_topk_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/sel_compact_cancel_at_dispatch", test_sel_compact_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/distinct_str_cancel", test_distinct_str_cancel, aw_setup, aw_teardown },
+    { "aware/group_keys_only_cancel", test_group_keys_only_cancel, aw_setup, aw_teardown },
     { "aware/topk_inplace", test_topk_inplace, aw_setup, aw_teardown },
     { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
     { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },
