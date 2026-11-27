@@ -1,0 +1,29 @@
+;; #1795: distinct over a SYM vector dedups with a presence array, a byte
+;; for each symbol of the vector's domain, which for an in-memory vector is
+;; every symbol the runtime interned.  It took that route only for a domain
+;; of at most 65,536 symbols, and the hashset otherwise, a row at a time;
+;; the radix kernel took no SYM.  The array now serves a domain of up to
+;; 2^23 symbols, and the radix kernel a larger one or a short vector of a
+;; wide domain.
+;; Over 65,536 symbols interned, whatever the vector holds:
+(set ex (as 'SYMBOL (map (fn [i] (format "e1795_%" i)) (til 100000))))
+(set sy (as 'SYMBOL (map (fn [i] (format "s1795_%" i)) (til 1000))))
+(set ix (% (* (til 1000000) 7919) 1000))
+(set v (at sy ix))
+;; the values in first-occurrence order, as the I64 distinct (another
+;; route) gives them, bare and as a select projection
+(distinct v) -- (at sy (distinct ix))
+(select {k: (distinct k) from: (table [k] (list v))}) -- (table [k] (list (at sy (distinct ix))))
+(count (distinct v)) -- 1000
+;; the null symbol is a value like any other
+(set vn (at (as 'SYM (concat [""] (map (fn [i] (format "s1795_%" i)) (til 1000)))) (% ix 7)))
+(distinct vn) -- (at (as 'SYM (concat [""] (map (fn [i] (format "s1795_%" i)) (til 1000)))) (distinct (% ix 7)))
+;; a vector shorter than the domain: the radix kernel, the same values
+(set w (take v 70000))
+(distinct w) -- (at sy (distinct (take ix 70000)))
+(distinct (reverse w)) -- (at sy (distinct (reverse (take ix 70000))))
+;; the presence array costs a byte a symbol, the hashset 16 bytes a row:
+;; the distinct of 1,000,000 rows peaks under 12 bytes a row (the hashset,
+;; with its row index, about 25)
+(set pk (at (.mem.ts (distinct v)) 'peak-live-bytes))
+(< pk (* 12 (count v))) -- true

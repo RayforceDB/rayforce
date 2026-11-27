@@ -1800,6 +1800,7 @@ typedef struct {
     int64_t     total;
     uint8_t     is_f64;
     int8_t      type;
+    uint8_t     attrs;         /* a SYM column's width */
 } dv_scatter_ctx_t;
 
 static void dv_scatter_fn(void* ctx, uint32_t worker_id,
@@ -1846,6 +1847,14 @@ static void dv_scatter_fn(void* ctx, uint32_t worker_id,
     } else if (x->type == RAY_I16) {
         const int16_t* d = (const int16_t*)base;
         DV_SCATTER_BODY(d[i])
+    } else if (x->type == RAY_SYM) {
+        /* the symbol ids at the column's width, as cd_hist_fn reads them */
+        switch (x->attrs & RAY_SYM_W_MASK) {
+            case RAY_SYM_W8:  { const uint8_t*  d = (const uint8_t*)base;  DV_SCATTER_BODY((int64_t)d[i]) break; }
+            case RAY_SYM_W16: { const uint16_t* d = (const uint16_t*)base; DV_SCATTER_BODY((int64_t)d[i]) break; }
+            case RAY_SYM_W32: { const uint32_t* d = (const uint32_t*)base; DV_SCATTER_BODY((int64_t)d[i]) break; }
+            default:          { const int64_t*  d = (const int64_t*)base;  DV_SCATTER_BODY(d[i]) break; }
+        }
     }
     #undef DV_SCATTER_BODY
 }
@@ -2191,6 +2200,7 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
     switch (in_type) {
     case RAY_I16: case RAY_I32: case RAY_I64:
     case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
+    case RAY_SYM:   /* the ids: a symbol is its id within the column's domain */
         break;
     case RAY_GUID:
         return distinct_guid_scan(input, false);
@@ -2282,7 +2292,7 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
     dv_scatter_ctx_t sctx = {
         .base = base, .out_buf = out_buf, .rid_buf = rid_buf, .cursor = cursor,
         .p_mask = p_mask, .grain = grain, .total = len,
-        .is_f64 = (in_type == RAY_F64), .type = in_type,
+        .is_f64 = (in_type == RAY_F64), .type = in_type, .attrs = input->attrs,
     };
     ray_pool_dispatch_n(pool, dv_scatter_fn, &sctx, n_tasks);
 
