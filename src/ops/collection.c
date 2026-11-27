@@ -4640,8 +4640,13 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
      * floats up front: as_i64(f64) reads the bit pattern and would cause
      * e.g. (take 1.0 2.0) to attempt a 4.6-quintillion-element allocation
      * and surface as "oom" — misleading for what is really a type error. */
-    if (ray_is_atom(n_obj) && (n_obj->type == -RAY_F64 || n_obj->type == -RAY_F32))
+    /* A B8 count is a type error too, as for drop and rotate: a boolean
+     * is not a count (#1785). */
+    switch (n_obj->type) {
+    case -RAY_F64: case -RAY_F32: case -RAY_BOOL:
         return ray_error("type", "take: expected (take collection count) where count is an integer atom, or a [start amount] range; got collection %s and count %s", ray_type_name(vec->type), ray_type_name(n_obj->type));
+    default: break;
+    }
     /* A function value has a positive type but holds no elements. */
     if (vec && (vec->type == RAY_LAMBDA || vec->type == RAY_UNARY ||
                 vec->type == RAY_BINARY || vec->type == RAY_VARY))
@@ -5460,6 +5465,112 @@ static bool at_table_indirect(ray_t* tbl) {
     return false;
 }
 
+/* The keys `at` takes as a position, in a vector, a list or a string: an
+ * integer atom of a type as_i64 reads as its value.  Any other key is
+ * at_key_type_error. */
+static inline bool at_int_key_type(int8_t t) {
+    switch (t) {
+    case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: return true;
+    default: return false;
+    }
+}
+static inline bool at_int_key(ray_t* k) {
+    switch (k->type) {
+    case -RAY_I64: case -RAY_I32: case -RAY_I16: case -RAY_U8: return true;
+    default: return false;
+    }
+}
+static ray_t* at_key_type_error(int8_t atom_type) {
+    return ray_error("type", "at: index must be an integer, got %s", ray_type_name(atom_type));
+}
+
+/* (at <string> <collection key>), the string branch of ray_at_fn below */
+static __attribute__((noinline)) ray_t* at_str_keys(ray_t* vec, const char* s, size_t slen, ray_t* idx) {
+    int64_t idxlen = ray_len(idx);
+    if (idxlen == 0) return ray_str("", 0);
+    /* a vector's cells are atoms of its type: the first one names it */
+    if (ray_is_vec(idx) && !at_int_key_type(idx->type))
+        return at_key_type_error((int8_t)-idx->type);
+    char sbuf[8192];
+    char* buf = sbuf;
+    if ((size_t)idxlen > sizeof(sbuf)) {
+        buf = ray_alloc_raw((size_t)idxlen);
+        if (!buf) return ray_error("oom", NULL);
+    }
+    ray_t* r = NULL;
+    if (ray_is_vec(idx)) {
+        /* an integer vector: its cells read in place, no atom per key */
+        const void* d = ray_data(idx);
+        for (int64_t j = 0; j < idxlen; j++) {
+            int64_t k;
+            switch (idx->type) {
+            case RAY_I64: k = ((const int64_t*)d)[j]; break;
+            case RAY_I32: k = ((const int32_t*)d)[j]; break;
+            case RAY_I16: k = ((const int16_t*)d)[j]; break;
+            default:      k = ((const uint8_t*)d)[j]; break;
+            }
+            if (k < 0 || (size_t)k >= slen) {
+                r = ray_error("domain", "at: string index %lld out of range for length %lld", (long long)k, (long long)slen);
+                break;
+            }
+            buf[j] = s[k];
+        }
+        if (!r) r = ray_str(buf, (size_t)idxlen);
+        if (buf != sbuf) ray_free_raw(buf);
+        return r;
+    }
+    /* a LIST, left to right */
+    ray_t* nested = NULL;   /* the list answer, once a cell is a collection */
+    ray_t** cells = (ray_t**)ray_data(idx);
+    for (int64_t j = 0; j < idxlen; j++) {
+        ray_t* c = cells[j];
+        int64_t k;
+        if (RAY_LIKELY(c->type == -RAY_I64)) {
+            k = c->i64;
+        } else if (at_int_key(c)) {
+            k = as_i64(c);
+        } else if (is_collection(c)) {
+            if (!nested) {
+                /* the cells before it were characters: each its string */
+                nested = ray_list_new(idxlen);
+                for (int64_t p = 0; p < j && nested && !RAY_IS_ERR(nested); p++) {
+                    ray_t* ch = ray_str(&buf[p], 1);
+                    if (!ch || RAY_IS_ERR(ch)) { ray_release(nested); nested = ch ? ch : ray_error("oom", NULL); break; }
+                    nested = ray_list_append(nested, ch);
+                    ray_release(ch);
+                }
+                if (!nested || RAY_IS_ERR(nested)) { r = nested ? nested : ray_error("oom", NULL); nested = NULL; break; }
+            }
+            ray_t* v = ray_at_fn(vec, c);
+            if (!v || RAY_IS_ERR(v)) { r = v ? v : ray_error("oom", NULL); break; }
+            nested = ray_list_append(nested, v);
+            ray_release(v);
+            if (!nested || RAY_IS_ERR(nested)) { r = nested ? nested : ray_error("oom", NULL); nested = NULL; break; }
+            continue;
+        } else {
+            r = at_key_type_error(c->type);
+            break;
+        }
+        if (k < 0 || (size_t)k >= slen) {
+            r = ray_error("domain", "at: string index %lld out of range for length %lld", (long long)k, (long long)slen);
+            break;
+        }
+        if (nested) {
+            ray_t* ch = ray_str(&s[k], 1);
+            if (!ch || RAY_IS_ERR(ch)) { r = ch ? ch : ray_error("oom", NULL); break; }
+            nested = ray_list_append(nested, ch);
+            ray_release(ch);
+            if (!nested || RAY_IS_ERR(nested)) { r = nested ? nested : ray_error("oom", NULL); nested = NULL; break; }
+        } else {
+            buf[j] = s[k];
+        }
+    }
+    if (r) { if (nested) ray_release(nested); }
+    else r = nested ? nested : ray_str(buf, (size_t)idxlen);
+    if (buf != sbuf) ray_free_raw(buf);
+    return r;
+}
+
 ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
     /* Table column access by symbol key — return the typed vector directly.
@@ -5616,35 +5727,22 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         return ray_typed_null(-RAY_I64); /* 0Nl for missing key */
     }
 
-    /* String indexing: (at "hello" 1) → 'e', (at "hello" [0 4]) → "ho" */
+    /* String indexing: (at "hello" 1) → 'e', (at "hello" [0 4]) → "ho".
+     * The keys are a vector's (at_int_key): an integer atom, or a
+     * collection of them; any other key is the vector's type error, not
+     * its payload read as a position (#1785).  A collection key is read
+     * left to right, as the vector branch walks one: the first cell it
+     * cannot take names the error, and a cell that is itself a collection
+     * makes the answer the list of each cell's answer.  An empty key of
+     * any type is the empty string. */
     if (ray_is_atom(vec) && (-vec->type) == RAY_STR) {
         const char* s = ray_str_ptr(vec);
         size_t slen = ray_str_len(vec);
-        if (is_collection(idx)) {
-            /* Multiple indices → build string from chars */
-            int64_t idxlen = ray_len(idx);
-            char sbuf[8192];
-            char* buf = sbuf;
-            if ((size_t)idxlen > sizeof(sbuf)) {
-                buf = ray_alloc_raw((size_t)idxlen);
-                if (!buf) return ray_error("oom", NULL);
-            }
-            for (int64_t j = 0; j < idxlen; j++) {
-                int alloc = 0;
-                ray_t* ie = collection_elem(idx, j, &alloc);
-                int64_t k = as_i64(ie);
-                if (alloc) ray_release(ie);
-                if (k < 0 || (size_t)k >= slen) {
-                    if (buf != sbuf) ray_free_raw(buf);
-                    return ray_error("domain", "at: string index %lld out of range for length %lld", (long long)k, (long long)slen);
-                }
-                buf[j] = s[k];
-            }
-            ray_t* r = ray_str(buf, (size_t)idxlen);
-            if (buf != sbuf) ray_free_raw(buf);
-            return r;
-        }
-        int64_t i = as_i64(idx);
+        if (is_collection(idx)) return at_str_keys(vec, s, slen, idx);
+        int64_t i;
+        if (RAY_LIKELY(idx->type == -RAY_I64)) i = idx->i64;
+        else if (at_int_key(idx)) i = as_i64(idx);
+        else return at_key_type_error(idx->type);
         if (i < 0 || (size_t)i >= slen) return ray_error("domain", "at: string index %lld out of range for length %lld", (long long)i, (long long)slen);
         /* Return 1-char string atom */
         return ray_str(&s[i], 1);
@@ -5694,9 +5792,7 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         return result;
     }
 
-    if (idx->type != -RAY_I64 && idx->type != -RAY_I32 &&
-        idx->type != -RAY_I16 && idx->type != -RAY_U8)
-        return ray_error("type", "at: index must be an integer, got %s", ray_type_name(idx->type));
+    if (!at_int_key(idx)) return at_key_type_error(idx->type);
     int64_t i = as_i64(idx);
 
     /* Typed vector: extract element directly */

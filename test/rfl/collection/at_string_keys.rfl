@@ -1,0 +1,48 @@
+;; (at <string> <key>) takes the keys a vector takes, an integer atom or a
+;; collection of them, and answers the vector's type error for any other
+;; key, never the key's payload read as a position (#1785).
+(set code (fn [e] (at e 'code)))
+(set msg (fn [e] (at e 'msg)))
+(at "boom" 'msg) !- type
+(at "boom" 1.5) !- type
+(at "boom" "msg") !- type
+(at "boom" true) !- type
+(at "boom" (as 'DATE 2)) !- type
+(try (at "boom" 'msg) msg) -- "at: index must be an integer, got sym"
+;; every key kind: the string and a vector agree on which keys are refused,
+;; and with the same message
+(set same (fn [k] (identical (try (at "boom" k) msg) (try (at [10 20 30 40] k) msg))))
+(set bad (list true 1.5 0Nf (as 'F32 1.5) 'msg "msg" (as 'DATE 2) (as 'TIME 1) (as 'TIMESTAMP 1) (as 'TIMESPAN 1) (first (guid 1))))
+(map same bad) -- (take [true] 11)
+(set badv (list [true false] [1.5 2.0] ['a 'b] (as 'DATE [1 2]) ["a" "b"] (guid 2) (list 1 'a) (list 1 1.5)))
+(map same badv) -- (take [true] 8)
+;; the integer widths are positions, single and many
+(map (fn [k] (at "boom" k)) (list 1 1i 1h 0x01)) -- (list "o" "o" "o" "o")
+(map (fn [k] (at "boom" k)) (list [1 3] (as 'I32 [1 3]) (as 'I16 [1 3]) (as 'U8 [1 3]) (list 1 3))) -- (list "om" "om" "om" "om" "om")
+(at "boom" (list)) -- ""
+;; a nested key is a list of each cell's answer, as for a vector
+(at "boom" (list [0 1] [2])) -- (list "bo" "o")
+(at "boom" (list [0 1] 'a)) !- type
+;; an empty key of any type is the empty string, as on a vector it is an
+;; empty list, also inside a nested key
+(set empties (list (as 'F64 []) (as 'B8 []) (as 'F32 []) (as 'SYM []) (as 'STR []) (as 'DATE []) (as 'TIME []) (as 'TIMESTAMP []) (as 'TIMESPAN []) (as 'GUID []) (as 'I64 []) (list)))
+(map (fn [k] (at "boom" k)) empties) -- (take (list "") 12)
+(map (fn [k] (at "" k)) empties) -- (take (list "") 12)
+(count (at "boom" (list (as 'F64 [])))) -- 1
+(at (at "boom" (list (as 'F64 []))) 0) -- ""
+;; the first key the walk cannot take names the error, left to right and
+;; into nested keys, as for a vector
+(set first-bad (fn [k] (identical (try (at "boom" k) msg) (try (at [10 20 30 40] k) msg))))
+(map first-bad (list (list [true] 'a) (list [1.5] 'a) (list 'a [true]) (list 1 (list 2 'x) 1.5) (list [0] (list [1] 'z)))) -- (take [true] 5)
+(try (at "boom" (list [true] 'a)) msg) -- "at: index must be an integer, got b8"
+(at "boom" (list 1 [0 1] 2)) -- (list "o" "bo" "o")
+;; out of range, negative and null positions stay a domain error for a
+;; string (it has no null character)
+(at "boom" 9) !- domain
+(at "boom" -1) !- domain
+(at "boom" 0N) !- domain
+(at "boom" [0N 1]) !- domain
+;; take: a boolean count is a type error, as for drop and rotate
+(take [1 2 3] true) !- type
+(take "boom" false) !- type
+(take [1 2 3] 2) -- [1 2]

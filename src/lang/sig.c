@@ -255,7 +255,7 @@ static const ray_sig_entry_t sigs[] = {
      "Smallest N elements (ascending)"},
     {"take", "(take <collection: vector, list, str, dict or table> <count: int, or a [start amount] range>)",
      "Take first N elements (negative N takes from end); past the length it cycles"},
-    /* docs:  (`select … take:` stops at the table's length). A parted table handle (`.db.parted.get`) is taken as its flat table: the same rows `(at table (til n))` returns, cycling past the row count */
+    /* docs:  (`select … take:` stops at the table's length). A float or boolean count is a `type` error, as for `drop`. A parted table handle (`.db.parted.get`) is taken as its flat table: the same rows `(at table (til n))` returns, cycling past the row count */
     {"drop", "(drop <collection: vector, list, str, dict or table> <count: int>)",
      "Drop first N elements (negative N drops from end)"},
     {"rotate", "(rotate <collection: vector, list, str, dict or table> <count: int>)",
@@ -292,6 +292,7 @@ static const ray_sig_entry_t sigs[] = {
      "N random integers from 0 up to, not including, `max`; **deterministic**: the same sequence in every process"},
     {"at", "(at <collection: vector, list, str, dict or table> <index: int, an integer vector, or a dict key>)",
      "Index a collection; vector keys batch dictionary lookups. A typed vector indexed by an integer vector keeps its type: a null or out-of-range index gives the type's null (`false`/`0x00` for BOOL/U8)"},
+    /* docs: . A string takes the same keys: an integer atom gives a one-character string, a collection of them a string, `(at "boom" [1 3])` is `"om"`, and an empty key of any type the empty string; any other key, a boolean or a date included, is the same `type` error as for a vector (`at: index must be an integer, got sym`), and an out-of-range, negative or null position on a string is a `domain` error */
     {"get", "(get <source: dict or table> <key: sym>)",
      "Lookup key in dict or column in table"},
     {"identical", "(identical <a: any> <b: any>)",
