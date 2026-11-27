@@ -273,6 +273,14 @@ itself binds (an earlier output, a `let`), has an effect, fails, or gives a
 closure, and every computed head of a select that can have an effect in any
 clause (a helper that sets a global, a lambda the head gives that does) ([#1815](https://github.com/RayforceDB/rayforce/issues/1815)).
 
+Under `by:` the same holds for a head that gives a builtin, outside an
+aggregate's arguments: `((at D 'r) i)` is each group's rows reversed, as
+`(reverse i)` is. A computed head left as written there (one giving a lambda,
+or one the rules above keep) is evaluated per group, so it reads each group's
+rows too. Inside an aggregate's arguments the head is left as written: the
+aggregate already reads each group's rows of its operand
+([#1772](https://github.com/RayforceDB/rayforce/issues/1772)).
+
 ```lisp
 (set T (table [i c] (list [10 20 30] [true false true])))
 (set D (dict ['f 'r] (list filter reverse)))

@@ -4966,6 +4966,46 @@ static int expr_refs_row_column(ray_t* expr, ray_t* tbl) {
     return 0;
 }
 
+/* Does `expr` name a helper, called or given to a call, whose body reads a
+ * column of `tbl` as expr_refs_row_column reads one (#1772)?  The helper
+ * given to a higher-order builtin, `(map f [1 2])` with f (fn [v] (+ v c)),
+ * reads the rows a lambda literal written there, `(map (fn [v] (+ v c))
+ * [1 2])`, shows it reads: under by: each group's.  A name bound to a
+ * lambda (a global, or a parameter or let seen through the scope) is
+ * followed into its body, and that body's helpers in turn; a name a column
+ * or local of `tbl` hides is the column's or the local's, as the walk above
+ * reads it. */
+static int expr_helper_arg_reads_column(ray_t* expr, ray_t* tbl, int depth) {
+    if (!expr || depth > 8) return 0;
+    if (expr->type == -RAY_SYM && !(expr->attrs & ATTR_QUOTED)) {
+        if (tbl_has_col(tbl, expr->i64) || ray_sym_is_dotted(expr->i64)) return 0;
+        ray_t* fn = ray_env_get(expr->i64);
+        if (!fn || fn->type != RAY_LAMBDA) return 0;
+        ray_t* body = LAMBDA_BODY(fn);
+        if (!body || body->type != RAY_LIST) return 0;
+        for (int64_t i = 0; i < body->len; i++) {
+            ray_t* st = ((ray_t**)ray_data(body))[i];
+            if (expr_refs_row_column(st, tbl) || expr_helper_arg_reads_column(st, tbl, depth + 1)) return 1;
+        }
+        return 0;
+    }
+    if (expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED) || is_agg_expr(expr)) return 0;
+    ray_t** elems = (ray_t**)ray_data(expr);
+    int64_t n = ray_len(expr);
+    if (n == 0) return 0;
+    if (elems[0] && elems[0]->type == RAY_LIST) return 0;
+    if (elems[0] && elems[0]->type == -RAY_SYM && !(elems[0]->attrs & ATTR_QUOTED)) {
+        ray_t* h = ray_env_get(elems[0]->i64);   /* (quote x) is data */
+        if (h && h->type == RAY_VARY && (const void*)(uintptr_t)h->i64 == (const void*)ray_quote_fn) return 0;
+        /* a helper called reads what its body reads: (fn [v] (f v)) reads
+         * f's columns */
+        if (h && h->type == RAY_LAMBDA && expr_helper_arg_reads_column(elems[0], tbl, depth + 1)) return 1;
+    }
+    for (int64_t i = 1; i < n; i++)
+        if (expr_helper_arg_reads_column(elems[i], tbl, depth + 1)) return 1;
+    return 0;
+}
+
 /* min/max overload on arity: only their unary calls reduce rows.  Keep
  * the name-only resolver for aggregate specifications and other signatures. */
 static uint16_t resolve_agg_call_opcode(int64_t sym_id, int64_t nargs) {
@@ -5502,7 +5542,11 @@ static bool builtin_runs_code(const ray_t* b);
  * query runs, so the early evaluation, which reads the global of that name,
  * would not see the function the head gives there. */
 #define HEAD_BINDS_MAX 64
-typedef struct { int64_t ids[HEAD_BINDS_MAX]; int n; } head_binds_t;
+typedef struct {
+    int64_t ids[HEAD_BINDS_MAX];
+    int n;
+    bool builtins_only;   /* under by: a head giving a lambda stays as written */
+} head_binds_t;
 
 static bool head_binds_has(const head_binds_t* b, int64_t id) {
     for (int i = 0; b && i < b->n; i++) if (b->ids[i] == id) return true;
@@ -5651,6 +5695,22 @@ static ray_t* query_lambda_form(ray_t* lam) {
     return out;
 }
 
+/* Is `fn` an aggregate the planner reads as one (resolve_agg_opcode): the
+ * function object a name of that set holds, judged by the object, so a
+ * rebinding of the name or another name for it reads as it is. */
+static bool fn_is_planner_agg(const ray_t* fn) {
+    static const char* const names[] = {
+        "sum", "avg", "min", "max", "dev", "var", "all", "any", "cov", "prod", "last", "scov",
+        "wsum", "wavg", "count", "first", "stddev", "dev_pop", "var_pop", "stddev_pop",
+        "pearson_corr", "med", "median", "top", "bot", "mode", "quantile", "percentile" };
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return false;
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+        ray_t* a = ray_env_get_global(ray_sym_intern(names[i], strlen(names[i])));
+        if (a && a->type == fn->type && a->i64 == fn->i64) return true;
+    }
+    return false;
+}
+
 /* `e` with each computed call head that gives a function
  * (query_computed_head_fn) written as the call of that function (#1815): a
  * builtin as its name, when that name holds the same builtin here (no
@@ -5664,12 +5724,24 @@ static ray_t* query_name_computed_heads(ray_t* e, ray_t* tbl, const head_binds_t
     ray_t** es = (ray_t**)ray_data(e);
     if (wv_head_is_form(es[0], NULL, (const void*)ray_fn) ||
         wv_head_is_form(es[0], NULL, (const void*)ray_quote_fn)) return NULL;
+    /* Under by: an aggregate's arguments are left as written: there the
+     * aggregate reads each group's rows of its operand already (#1807). */
+    if (binds && binds->builtins_only && es[0] && es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED) &&
+        fn_is_planner_agg(ray_env_get(es[0]->i64))) return NULL;
     ray_t* out = NULL;
     for (int64_t i = 0; i < e->len; i++) {
         ray_t* sub = NULL;
+        if (i > 0 && out && binds && binds->builtins_only) {
+            /* the head just written as an aggregate's name: its arguments
+             * are an aggregate's */
+            ray_t* h = ((ray_t**)ray_data(out))[0];
+            if (h && h->type == -RAY_SYM && fn_is_planner_agg(ray_env_get(h->i64))) break;
+        }
         if (i == 0 && es[0] && es[0]->type == RAY_LIST) {
             ray_t* cf = query_computed_head_fn(es[0], tbl, binds);
-            if (cf && cf->type == RAY_LAMBDA) {
+            if (cf && cf->type == RAY_LAMBDA && binds && binds->builtins_only) {
+                ray_release(cf);   /* under by: its text is no named helper's call */
+            } else if (cf && cf->type == RAY_LAMBDA) {
                 /* a lambda is called as its text written in place is */
                 sub = query_lambda_form(cf);
                 ray_release(cf);
@@ -23711,8 +23783,12 @@ static ray_t* named_heads_upsert(ray_t* engine, int64_t kid, ray_t* v) {
  * as the call of that function, reading `tbl`, so every route, planned or
  * not, gives the named call's answer (#1815).  `((at D 'f) i c)` is the column
  * `(filter i c)` gives, and `(first ((at D 'r) i))` under a where: the
- * first of the kept rows reversed, not one cell each.  Under by: the
- * outputs are left as written.  NULL when no head is renamed. */
+ * first of the kept rows reversed, not one cell each.  Under by: so is
+ * a head giving a builtin outside an aggregate's arguments (#1772):
+ * `((at D 'r) i)` is each group's rows reversed, as `(reverse i)` is.  A
+ * head in an aggregate's arguments, and one giving a lambda (whose text
+ * there need not be the named helper's call), are left as written.  NULL when no
+ * head is renamed. */
 static ray_t* select_plan_named_heads(ray_t* dict, ray_t* tbl) {
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
@@ -23721,17 +23797,27 @@ static ray_t* select_plan_named_heads(ray_t* dict, ray_t* tbl) {
     bool any = false;
     for (int64_t i = 0; i < vals->len && !any; i++)
         any = expr_has_list_head(((ray_t**)ray_data(vals))[i], 0);
-    if (!any || dict_get(dict, "by")) return NULL;
+    if (!any) return NULL;
+    ray_t* by = dict_get(dict, "by");
     const int64_t* rid = select_clause_ids();
     int64_t nd = ray_dict_len(dict);
     /* every let or set in a clause, then, output by output, the outputs
      * before it (an output reads those, by name or quoted, and a global of
      * its own name or a later one's); more than the set holds and nothing
      * is rewritten */
-    head_binds_t binds = { .n = 0 };
+    head_binds_t binds = { .n = 0, .builtins_only = by != NULL };
     for (int64_t i = 0; i < nd; i++)
         if (sym_cell_runtime_id(keys, i) != rid[0] &&
             !head_binds_collect(((ray_t**)ray_data(vals))[i], &binds, 0)) return NULL;
+    /* the names a by: dict binds, its keys, too */
+    if (by && by->type == RAY_DICT) {
+        ray_t* bk = ray_dict_keys(by);
+        if (!bk || bk->type != RAY_SYM) return NULL;
+        for (int64_t i = 0; i < ray_dict_len(by); i++) {
+            if (binds.n >= HEAD_BINDS_MAX) return NULL;
+            binds.ids[binds.n++] = sym_cell_runtime_id(bk, i);
+        }
+    }
     ray_t* engine = NULL;
     for (int64_t i = 0; i < nd; i++) {
         int64_t kid = sym_cell_runtime_id(keys, i);
@@ -24402,6 +24488,19 @@ static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, i
      * (#1429) */
     if (!tbl && call_is_fold_or_at(e)) return true;
     ray_t** es = (ray_t**)ray_data(e);
+    /* in the query's own expression, a call through a computed head the
+     * entry left as written (one giving a lambda under by:,
+     * select_plan_named_heads) is code this walk cannot see: per group,
+     * as a helper past the budget is (#1772) */
+    if (tbl && e->len > 0 && es[0] && es[0]->type == RAY_LIST && !(es[0]->attrs & ATTR_QUOTED) &&
+        es[0]->len > 0) {
+        ray_t* h0 = ((ray_t**)ray_data(es[0]))[0];
+        ray_t* f0 = h0 && h0->type == -RAY_SYM && !(h0->attrs & ATTR_QUOTED) ? ray_env_get(h0->i64) : NULL;
+        bool form = f0 && f0->type == RAY_VARY &&
+                    ((const void*)(uintptr_t)f0->i64 == (const void*)ray_fn ||
+                     (const void*)(uintptr_t)f0->i64 == (const void*)ray_quote_fn);
+        if (!form) return true;
+    }
     for (int64_t i = 0; i < e->len; i++)
         if (query_code_needs_group(es[i], tbl, i == 0, depth + 1, budget, verbs)) return true;
     return false;
@@ -31248,6 +31347,10 @@ by_dict_done:
                         ray_is_vec(full_val) || full_val->type == RAY_LIST;
                     int full_is_row_aligned =
                         is_indexable && full_val->len == eval_nrows;
+                    /* a helper given to a call reads the group, as its
+                     * body written there would (#1772) */
+                    if (!refs_column && !full_is_row_aligned)
+                        refs_column = expr_helper_arg_reads_column(val_expr_item, eval_tbl, 0);
 
                     if (refs_column && !full_is_row_aligned) {
                         /* Non-streaming aggregation fallback: the full-table
@@ -34817,6 +34920,10 @@ by_dict_done:
                     int full_is_row_aligned =
                         is_indexable && full_val->len == nrows &&
                         !query_name_whole_list(nonagg_exprs[ni], tbl);
+                    /* a helper given to a call reads the group, as its
+                     * body written there would (#1772) */
+                    if (!refs_column && !full_is_row_aligned)
+                        refs_column = expr_helper_arg_reads_column(nonagg_exprs[ni], tbl, 0);
 
                     if (refs_column && !full_is_row_aligned) {
                         /* Non-streaming fallback: the expression didn't
