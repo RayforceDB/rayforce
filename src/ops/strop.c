@@ -259,12 +259,15 @@ static ray_t* string_unary_fn(ray_t* x, uint16_t opcode,
                               ray_op_t* (*ctor)(ray_graph_t*, ray_op_t*)) {
     if (!x || RAY_IS_ERR(x)) return x;
     if (ray_is_lazy(x)) {
-        ray_t* perr = ray_lazy_promote(x);              /* a column reference becomes its scan */
-        if (perr) return perr;
-        ray_op_t* prev = RAY_LAZY_OP(x);
-        if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
-            return ray_error("type", "string transform: expected string or symbol vector");
-        return ray_lazy_append(x, opcode);
+        /* a handle to extend: x, or a fresh one when x is shared (#1860) */
+        ray_t* own = ray_lazy_own(x);
+        if (!own || RAY_IS_ERR(own)) return own ? own : ray_error("oom", NULL);
+        ray_op_t* prev = RAY_LAZY_OP(own);
+        ray_t* res = (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
+            ? ray_error("type", "string transform: expected string or symbol vector")
+            : ray_lazy_append(own, opcode);
+        if (own != x) ray_release(own);
+        return res;
     }
     if (ray_is_atom(x))
         return string_unary_atom(x, opcode);
@@ -354,19 +357,23 @@ ray_t* ray_substr_fn(ray_t** args, int64_t n) {
         return ray_error("type", "substr: length must be an integer atom or I64/I32 vector");
 
     if (ray_is_lazy(str)) {
-        ray_t* perr = ray_lazy_promote(str);            /* a column reference becomes its scan */
-        if (perr) return perr;
-        ray_graph_t* g = RAY_LAZY_GRAPH(str);
-        ray_op_t* prev = RAY_LAZY_OP(str);
-        if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
+        /* a handle to extend in place: str, or a fresh one when str is
+         * shared (#1860); the result is owned either way */
+        ray_t* own = ray_lazy_own(str);
+        if (!own || RAY_IS_ERR(own)) return own ? own : ray_error("oom", NULL);
+        if (own == str) ray_retain(own);
+        ray_graph_t* g = RAY_LAZY_GRAPH(own);
+        ray_op_t* prev = RAY_LAZY_OP(own);
+        if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM)) {
+            ray_release(own);
             return ray_error("type", "substr: expected string or symbol vector");
+        }
         ray_op_t* s = const_node_from_obj(g, start);
         ray_op_t* l = const_node_from_obj(g, len);
         ray_op_t* op = (s && l) ? ray_substr(g, prev, s, l) : NULL;
-        if (!op) return ray_error("oom", NULL);
-        RAY_LAZY_OP(str) = op;
-        ray_retain(str);
-        return str;
+        if (!op) { ray_release(own); return ray_error("oom", NULL); }
+        RAY_LAZY_OP(own) = op;
+        return own;
     }
 
     if (ray_is_atom(str))
@@ -453,19 +460,23 @@ ray_t* ray_replace_fn(ray_t** args, int64_t n) {
         return ray_error("type", "replace: to must be string or symbol atom");
 
     if (ray_is_lazy(str)) {
-        ray_t* perr = ray_lazy_promote(str);            /* a column reference becomes its scan */
-        if (perr) return perr;
-        ray_graph_t* g = RAY_LAZY_GRAPH(str);
-        ray_op_t* prev = RAY_LAZY_OP(str);
-        if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
+        /* a handle to extend in place: str, or a fresh one when str is
+         * shared (#1860); the result is owned either way */
+        ray_t* own = ray_lazy_own(str);
+        if (!own || RAY_IS_ERR(own)) return own ? own : ray_error("oom", NULL);
+        if (own == str) ray_retain(own);
+        ray_graph_t* g = RAY_LAZY_GRAPH(own);
+        ray_op_t* prev = RAY_LAZY_OP(own);
+        if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM)) {
+            ray_release(own);
             return ray_error("type", "replace: expected string or symbol vector");
+        }
         ray_op_t* f = const_node_from_obj(g, from);
         ray_op_t* t = const_node_from_obj(g, to);
         ray_op_t* op = (f && t) ? ray_replace(g, prev, f, t) : NULL;
-        if (!op) return ray_error("oom", NULL);
-        RAY_LAZY_OP(str) = op;
-        ray_retain(str);
-        return str;
+        if (!op) { ray_release(own); return ray_error("oom", NULL); }
+        RAY_LAZY_OP(own) = op;
+        return own;
     }
 
     if (ray_is_atom(str))
@@ -629,18 +640,22 @@ static ray_t* str_find_impl(ray_t* hay, ray_t* pattern) {
     str_needle_t search = { np, nl };
 
     if (ray_is_lazy(hay)) {
-        ray_t* perr = ray_lazy_promote(hay);            /* a column reference becomes its scan */
-        if (perr) return perr;
-        ray_graph_t* g = RAY_LAZY_GRAPH(hay);
-        ray_op_t* prev = RAY_LAZY_OP(hay);
-        if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
+        /* a handle to extend in place: hay, or a fresh one when hay is
+         * shared (#1860); the result is owned either way */
+        ray_t* own = ray_lazy_own(hay);
+        if (!own || RAY_IS_ERR(own)) return own ? own : ray_error("oom", NULL);
+        if (own == hay) ray_retain(own);
+        ray_graph_t* g = RAY_LAZY_GRAPH(own);
+        ray_op_t* prev = RAY_LAZY_OP(own);
+        if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM)) {
+            ray_release(own);
             return ray_error("type", "str-find: expected string or symbol vector");
+        }
         ray_op_t* p = const_node_from_obj(g, pattern);
         ray_op_t* op = p ? ray_str_find_op(g, prev, p) : NULL;
-        if (!op) return ray_error("oom", NULL);
-        RAY_LAZY_OP(hay) = op;
-        ray_retain(hay);
-        return hay;
+        if (!op) { ray_release(own); return ray_error("oom", NULL); }
+        RAY_LAZY_OP(own) = op;
+        return own;
     }
 
     const char* hp = NULL;

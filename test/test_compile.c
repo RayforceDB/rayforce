@@ -36,6 +36,7 @@
 #include "lang/parse.h"
 #include "core/runtime.h"   /* __VM, ray_vm_init: a VM for the small-stack thread */
 #include "ops/ops.h"
+#include "core/pool.h"      /* ray_pool_init / ray_pool_destroy: the worker count */
 #include <stdlib.h>
 #include <string.h>
 #if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
@@ -159,30 +160,42 @@ static test_result_t test_compile_if_forces_lazy_condition(void) {
     PASS();
 }
 
-/* A stale lazy alias is rejected before graph construction dereferences its
- * cleared root.  This is a defensive backstop for callers outside bindings. */
-static test_result_t test_compile_spent_lazy_returns_error(void) {
+/* A lazy handle with two owners stays readable for each (#1860): one
+ * owner's materialization, or an extension of it, settles the handle to its
+ * value, which the other owner reads again.  It used to be spent for the
+ * other owner ("lazy handle already materialized"). */
+static test_result_t test_compile_shared_lazy_reads_again(void) {
     ray_t* vec = ray_eval_str("[1 2 1]");
     TEST_ASSERT_NOT_NULL(vec);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
     ray_t* lazy = ray_distinct_fn(vec);
     TEST_ASSERT_NOT_NULL(lazy);
     TEST_ASSERT_FALSE(RAY_IS_ERR(lazy));
-    ray_retain(lazy); /* preserve one alias after materialization consumes one */
-    ray_t* concrete = ray_lazy_materialize(lazy);
+    TEST_ASSERT_TRUE(ray_is_lazy(lazy));
+    ray_retain(lazy);                              /* two owners */
+    ray_t* concrete = ray_lazy_materialize(lazy);  /* the first owner's read */
     TEST_ASSERT_NOT_NULL(concrete);
     TEST_ASSERT_FALSE(RAY_IS_ERR(concrete));
+    TEST_ASSERT_EQ_I(concrete->len, 2);
 
-    ray_t* err = ray_lazy_append(lazy, OP_COUNT);
-    TEST_ASSERT_NOT_NULL(err);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
-    ray_error_free(err);
+    ray_retain(lazy);                              /* two owners again */
+    ray_t* cnt = ray_lazy_append(lazy, OP_COUNT);  /* shared: a fresh handle */
+    TEST_ASSERT_NOT_NULL(cnt);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(cnt));
+    TEST_ASSERT_TRUE(cnt != lazy && ray_is_lazy(cnt));
+    ray_release(lazy);                             /* the caller's argument */
+    ray_t* n = ray_lazy_materialize(cnt);
+    TEST_ASSERT_TRUE(n && !RAY_IS_ERR(n) && n->type == -RAY_I64 && n->i64 == 2);
+    ray_release(n);
 
-    err = ray_lazy_materialize(lazy); /* consumes the final lazy alias */
-    TEST_ASSERT_NOT_NULL(err);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
-    ray_error_free(err);
+    ray_t* again = ray_lazy_materialize(lazy);     /* the last owner reads the value */
+    TEST_ASSERT_NOT_NULL(again);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(again));
+    TEST_ASSERT_EQ_I(again->len, 2);
+    TEST_ASSERT_EQ_I(((const int64_t*)ray_data(again))[0], ((const int64_t*)ray_data(concrete))[0]);
+    TEST_ASSERT_EQ_I(((const int64_t*)ray_data(again))[1], ((const int64_t*)ray_data(concrete))[1]);
 
+    ray_release(again);
     ray_release(concrete);
     ray_release(vec);
     PASS();
@@ -1184,6 +1197,123 @@ static test_result_t test_compile_depth_guard_small_stack(void) {
 /* ════════════════════════════════════════════════════════════════════
  * Entry table
  * ════════════════════════════════════════════════════════════════════ */
+/* One lazy handle shared by many owners on many workers (#1860), with 2 and
+ * 8 workers and a graph large enough to go parallel.  A pmap over a list
+ * that repeats it reads the settled handle on every worker.  A dispatch
+ * whose every task reads the same unsettled handle settles it once: one
+ * task wins the claim and runs the graph, whose own dispatch runs inline on
+ * that worker (a dispatch made inside another does), while the others wait
+ * for the result.  Every read gets the value; a failing handle settles to
+ * its error, and every read raises that error, never a spent handle. */
+typedef struct {
+    ray_t* lazy;
+    bool failing;
+    _Atomic int64_t good, bad;
+} shared_lazy_ctx_t;
+
+/* One task per element: this owner's reference to the shared handle, read. */
+static void shared_lazy_task(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    shared_lazy_ctx_t* c = (shared_lazy_ctx_t*)ctx;
+    for (int64_t i = start; i < end; i++) {
+        ray_retain(c->lazy);
+        ray_t* r = ray_lazy_materialize(c->lazy);   /* consumes this reference */
+        bool ok = c->failing ? (RAY_IS_ERR(r) && strcmp(ray_err_code(r), "type") == 0)
+                             : (r && !RAY_IS_ERR(r) && r->len == 1003);
+        if (ok) c->good++; else c->bad++;
+        if (r && RAY_IS_ERR(r)) ray_error_free(r);
+        else if (r) ray_release(r);
+    }
+}
+
+static test_result_t test_compile_shared_lazy_pmap_settles_once(void) {
+    static const uint32_t n_workers[] = { 1, 7 };   /* 2 and 8 with the caller */
+    int64_t sym_l = ray_sym_intern("L1860", 5);
+    for (int c = 0; c < 2; c++) {
+        ray_pool_destroy();
+        TEST_ASSERT_EQ_I(ray_pool_init(n_workers[c]), RAY_OK);
+        for (int failing = 0; failing < 2; failing++) {
+            ray_t* x = ray_eval_str(failing ? "['a 'b 'a]" : "(% (til 2000000) 1003)");
+            TEST_ASSERT_TRUE(x && !RAY_IS_ERR(x));
+            ray_t* lazy = ray_distinct_fn(x);
+            TEST_ASSERT_TRUE(lazy && ray_is_lazy(lazy));
+            if (failing) {
+                ray_t* s = ray_sum_fn(lazy);         /* (sum (distinct syms)): fails when it runs */
+                ray_release(lazy);
+                lazy = s;
+                TEST_ASSERT_TRUE(lazy && ray_is_lazy(lazy));
+            }
+            ray_t* lst = ray_list_new(1000);
+            for (int i = 0; i < 1000 && lst && !RAY_IS_ERR(lst); i++) lst = ray_list_append(lst, lazy);
+            TEST_ASSERT_TRUE(lst && !RAY_IS_ERR(lst));
+            ray_release(lazy);                       /* the list holds 1000 references */
+            TEST_ASSERT_EQ_I(ray_env_set(sym_l, lst), RAY_OK);
+            ray_release(lst);
+            ray_t* r = ray_eval_str(failing
+                ? "(pmap (fn [v] (try (count v) (fn [e] (at e 'code)))) L1860)"
+                : "(pmap (fn [v] (count v)) L1860)");
+            TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+            TEST_ASSERT_EQ_I(r->len, 1000);
+            for (int64_t i = 0; i < 1000; i++) {
+                if (failing) {
+                    ray_t* e = r->type == RAY_LIST ? ((ray_t**)ray_data(r))[i] : NULL;
+                    int64_t code = r->type == RAY_SYM ? ((int64_t*)ray_data(r))[i]
+                                 : e && e->type == -RAY_SYM ? e->i64 : -1;
+                    TEST_ASSERT_EQ_I(code, ray_sym_intern("type", 4));
+                } else {
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[i], 1003);
+                }
+            }
+            ray_release(r);
+
+            /* every task of a dispatch reads one unsettled shared handle */
+            ray_t* y = ray_eval_str(failing ? "['a 'b 'a]" : "(% (til 2000000) 1003)");
+            TEST_ASSERT_TRUE(y && !RAY_IS_ERR(y));
+            ray_t* l2 = ray_distinct_fn(y);
+            if (failing) { ray_t* s = ray_sum_fn(l2); ray_release(l2); l2 = s; }
+            TEST_ASSERT_TRUE(l2 && ray_is_lazy(l2));
+            ray_retain(l2);                            /* shared from the start */
+            shared_lazy_ctx_t sc = { .lazy = l2, .failing = failing != 0 };
+            int64_t n_tasks = 64 * (int64_t)ray_pool_total_workers(ray_pool_get());
+            ray_pool_dispatch_grain(ray_pool_get(), shared_lazy_task, &sc, n_tasks, 1);
+            TEST_ASSERT_EQ_I(sc.good, n_tasks);
+            TEST_ASSERT_EQ_I(sc.bad, 0);
+            ray_release(l2);
+            ray_release(l2);
+            ray_release(y);
+            ray_release(x);
+        }
+    }
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init(0), RAY_OK);
+    PASS();
+}
+
+/* A failing lazy handle with three owners (#1860): each owner's read, a
+ * materialization or an extension, raises the value's own error, never a
+ * spent handle, and each error is the reader's to free. */
+static test_result_t test_compile_shared_lazy_failure_for_each(void) {
+    ray_t* x = ray_eval_str("['a 'b 'a]");
+    TEST_ASSERT_TRUE(x && !RAY_IS_ERR(x));
+    ray_t* d = ray_distinct_fn(x);
+    ray_t* lazy = ray_sum_fn(d);                   /* fails when it runs */
+    ray_release(d);
+    TEST_ASSERT_TRUE(lazy && ray_is_lazy(lazy));
+    ray_retain(lazy); ray_retain(lazy);            /* three owners */
+    ray_t* e1 = ray_lazy_materialize(lazy);        /* the first owner's read */
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e1) && strcmp(ray_err_code(e1), "type") == 0);
+    ray_error_free(e1);
+    ray_t* e2 = ray_lazy_append(lazy, OP_COUNT);   /* the second owner extends it */
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e2) && strcmp(ray_err_code(e2), "type") == 0);
+    ray_error_free(e2);
+    ray_release(lazy);                             /* the second owner's reference */
+    ray_t* e3 = ray_lazy_materialize(lazy);        /* the last owner's read */
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e3) && strcmp(ray_err_code(e3), "type") == 0);
+    ray_error_free(e3);
+    ray_release(x);
+    PASS();
+}
+
 const test_entry_t compile_entries[] = {
     { "compile/set_inside_fn",       test_compile_set_inside_fn,       compile_setup, compile_teardown },
     { "compile/set_forces_lazy_value", test_compile_set_forces_lazy_value, compile_setup, compile_teardown },
@@ -1191,7 +1321,7 @@ const test_entry_t compile_entries[] = {
     { "compile/if_no_else_true",     test_compile_if_no_else_true,     compile_setup, compile_teardown },
     { "compile/if_no_else_false",    test_compile_if_no_else_false,    compile_setup, compile_teardown },
     { "compile/if_forces_lazy_condition", test_compile_if_forces_lazy_condition, compile_setup, compile_teardown },
-    { "compile/spent_lazy_returns_error", test_compile_spent_lazy_returns_error, compile_setup, compile_teardown },
+    { "compile/shared_lazy_reads_again", test_compile_shared_lazy_reads_again, compile_setup, compile_teardown },
     { "compile/do_inside_fn",        test_compile_do_inside_fn,        compile_setup, compile_teardown },
     { "compile/do_multi_exprs",      test_compile_do_multi_exprs,      compile_setup, compile_teardown },
     { "compile/nested_fn",           test_compile_nested_fn,           compile_setup, compile_teardown },
@@ -1278,5 +1408,7 @@ const test_entry_t compile_entries[] = {
     { "compile/self_zero_args",      test_compile_self_zero_args,      compile_setup, compile_teardown },
     { "compile/default_switch_case", test_compile_default_switch_case, compile_setup, compile_teardown },
     { "compile/depth_guard_small_stack", test_compile_depth_guard_small_stack, compile_setup, compile_teardown },
+    { "compile/shared_lazy_pmap_settles_once", test_compile_shared_lazy_pmap_settles_once, compile_setup, compile_teardown },
+    { "compile/shared_lazy_failure_for_each", test_compile_shared_lazy_failure_for_each, compile_setup, compile_teardown },
     { NULL, NULL, NULL, NULL },
 };

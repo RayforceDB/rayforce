@@ -143,6 +143,62 @@ _Thread_local ray_resolve_cache_t g_resolve_cache[1 << RAY_RESOLVE_CACHE_BITS];
 static inline void env_frames_moved(void) { g_frame_epoch++; }
 static inline void env_globals_moved(void) { atomic_fetch_add_explicit(&g_global_epoch, 1, memory_order_relaxed); }
 
+/* A frame's value at `i` holding a lazy handle, forced on this, its first
+ * read (#1860).  A compiled frame's window (OP_SCOPE_EVAL, OP_IFTREE) binds
+ * the frame's slots as they are, and a lazy handle is single-use: read in
+ * the window as it stands, a call would extend that very object and the
+ * window's result consume it, so the slot would hold a dead handle for the
+ * next read.  Forced here, the read gets the concrete value, which replaces
+ * the handle in the frame and in each VM slot the frame mirrors, as
+ * OP_LOADENV replaces it in its slot.  Nothing is forced unless read, and a
+ * read inside timeit or .mem.ts is measured there.  On a failure the
+ * bindings are cleared and the error returned (an owned error object). */
+static __attribute__((noinline, cold)) ray_t* env_frame_force(ray_scope_frame_t* f, int32_t i) {
+    ray_t* lazy = f->vals[i];
+    int64_t key = f->keys[i];
+    bool shared = lazy->rc > 1;
+    ray_t* concrete = ray_lazy_materialize(lazy);   /* consumes the frame's ref */
+    bool ok = concrete && !RAY_IS_ERR(concrete);
+    env_frames_moved();
+    if (!ok && shared) {
+        /* The handle failed for every owner and keeps its error
+         * (RAY_LAZY_G_FAILED): the bindings keep it too, so a later read
+         * raises the value's own error again, not an undefined name. */
+        ray_retain(lazy);
+        return concrete ? concrete : ray_error("type", NULL);
+    }
+    f->vals[i] = ok ? concrete : NULL;
+    if (f->slot_values)
+        for (int32_t j = 0; j < f->slot_count; j++) {
+            if (f->slot_names[j] != key || f->slot_values[j] != lazy) continue;
+            ray_release(lazy);                       /* the slot's ref */
+            if (ok) ray_retain(concrete);
+            f->slot_values[j] = ok ? concrete : NULL;
+        }
+    return ok ? concrete : (concrete ? concrete : ray_error("type", NULL));
+}
+
+/* A frame's value at `i`, as a read sees it: a lazy handle forced. */
+static inline ray_t* env_frame_read(ray_scope_frame_t* f, int32_t i) {
+    ray_t* v = f->vals[i];
+    return v && ray_is_lazy(v) ? env_frame_force(f, i) : v;
+}
+
+/* A read that found the lazy handle `lazy` bound to `sym`: force it at the
+ * binding that holds it (env_frame_force), the nearest frame binding that
+ * very object to the name.  The lookups themselves stay as they are, so a
+ * read of a concrete value costs nothing more; only a lazy one comes here.
+ * A lazy value held anywhere else (none is: globals, lets, captures and
+ * call frames bind concrete values) is returned as found. */
+static __attribute__((noinline, cold)) ray_t* env_force_binding(int64_t sym, ray_t* lazy) {
+    for (int32_t d = __VM ? __VM->scope_depth - 1 : -1; d >= 0; d--) {
+        ray_scope_frame_t* f = &__VM->scope_stack[d];
+        for (int32_t i = 0; i < f->count; i++)
+            if (f->keys[i] == sym && f->vals[i] == lazy) return env_frame_force(f, i);
+    }
+    return lazy;
+}
+
 /* ---- Local scope stack ---- */
 
 /* The scope stack lives on the per-thread VM (core/runtime.h) — one
@@ -325,15 +381,13 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
             if (ray_is_lazy(f->vals[i])) {
                 /* A lazy handle is single-use: capture (and keep bound) the
                  * concrete value, or the closure's second call would read a
-                 * handle its first call consumed. */
-                env_frames_moved();
-                ray_t* concrete = ray_lazy_materialize(f->vals[i]);   /* consumes the frame's ref */
-                if (!concrete || RAY_IS_ERR(concrete)) {
-                    f->vals[i] = NULL;
+                 * handle its first call consumed; a VM slot the frame
+                 * mirrors keeps it too (env_frame_force). */
+                ray_t* concrete = env_frame_force(f, i);
+                if (RAY_IS_ERR(concrete)) {
                     ray_release(keys); ray_release(vals); if (flags) ray_release(flags);
-                    return concrete ? concrete : ray_error("type", NULL);
+                    return concrete;
                 }
-                f->vals[i] = concrete;
             }
             vals = ray_list_append_take(vals, f->vals[i]);
             if (!vals || RAY_IS_ERR(vals)) {
@@ -698,7 +752,12 @@ static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
     int n = ray_sym_segs(sym_id, &segs);
     if (n < 2) return NULL;
 
-    return env_walk_path(env_lookup_flat_impl(segs[0], rows, in_callee), segs, n);
+    ray_t* root = env_lookup_flat_impl(segs[0], rows, in_callee);
+    if (__builtin_expect(root && ray_is_lazy(root), 0)) {
+        root = env_force_binding(segs[0], root);
+        if (RAY_IS_ERR(root)) return root;       /* owned: the root's forcing failed */
+    }
+    return env_walk_path(root, segs, n);
 }
 
 /* The dotted walk below a resolved head `v` (borrowed): segs[1..n-1] as
@@ -1249,7 +1308,8 @@ static ray_err_t target_flat(int64_t name, bool via_callee, int32_t* scope, ray_
                 (f->kind == RAY_SCOPE_CALL && f->table && i >= f->table_from))
                 return RAY_ERR_DOMAIN;
             *scope = d;
-            *value = f->vals[i];
+            *value = env_frame_read(f, i);
+            if (*value && RAY_IS_ERR(*value)) { ray_error_free(*value); *value = NULL; return RAY_ERR_DOMAIN; }
             return *value ? RAY_OK : RAY_ERR_NAME;
         }
         if (f->eval_window) in_callee = true;

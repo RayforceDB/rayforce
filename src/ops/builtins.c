@@ -709,11 +709,11 @@ ray_t* ray_resolve_fn(ray_t** args, int64_t n) {
     /* If not a table, return as-is */
     if (tbl->type != RAY_TABLE) {
         if (tbl->type == -RAY_SYM) {
-            ray_t* val = ray_env_get(tbl->i64);
+            /* the value the name holds, read (a lazy local forced, its
+             * error returned, #1860): owned, or NULL for no binding */
+            ray_t* val = ray_env_resolve(tbl->i64);
             ray_release(tbl);
-            if (!val) return RAY_NULL_OBJ;
-            ray_retain(val);
-            return val;
+            return val ? val : RAY_NULL_OBJ;
         }
         return tbl;
     }

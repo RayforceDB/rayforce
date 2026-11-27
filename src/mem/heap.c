@@ -1330,10 +1330,14 @@ RAY_INLINE void ray_release_owned_refs(ray_t* v) {
         }
         if (v->type == RAY_LAZY) {
             ray_graph_t* g = RAY_LAZY_GRAPH(v);
-            if (g) {
+            if (g == RAY_LAZY_G_SETTLED && RAY_LAZY_OP(v))       /* its kept result (graph.c) */
+                ray_release((ray_t*)RAY_LAZY_OP(v));
+            else if (g == RAY_LAZY_G_FAILED && RAY_LAZY_OP(v))   /* its kept error */
+                ray_error_free((ray_t*)RAY_LAZY_OP(v));
+            else if (g && !RAY_LAZY_G_STATE(g))
                 ray_graph_free(g);
-                RAY_LAZY_GRAPH(v) = NULL;
-            }
+            if (RAY_LAZY_G_STATE(g)) RAY_LAZY_OP(v) = NULL;
+            RAY_LAZY_GRAPH(v) = NULL;
             if (v->attrs & RAY_LAZY_COLREF) {           /* a column reference holds its table */
                 ray_t** tp = (ray_t**)ray_data(v);
                 if (*tp) { ray_release(*tp); *tp = NULL; }
@@ -1493,6 +1497,13 @@ bool ray_retain_owned_refs(ray_t* v) {
             if (v->attrs & RAY_LAZY_COLREF) {
                 ray_t* t = *(ray_t**)ray_data(v);
                 if (t) ray_retain(t);
+            }
+            if (RAY_LAZY_OP(v) && RAY_LAZY_GRAPH(v) == RAY_LAZY_G_SETTLED)
+                ray_retain((ray_t*)RAY_LAZY_OP(v));      /* the copy keeps the result too */
+            if (RAY_LAZY_OP(v) && RAY_LAZY_GRAPH(v) == RAY_LAZY_G_FAILED) {   /* and its own error */
+                ray_t* e = (ray_t*)RAY_LAZY_OP(v);
+                const char* m = ray_err_msg(e);
+                RAY_LAZY_OP(v) = (ray_op_t*)(m ? ray_error(ray_err_code(e), "%s", m) : ray_error(ray_err_code(e), NULL));
             }
             return true;
         }

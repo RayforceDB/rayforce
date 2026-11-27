@@ -1102,6 +1102,19 @@ ray_t*    ray_lazy_append(ray_t* lazy, uint16_t opcode);
  * answer it on the bound source; ray_lazy_append / ray_lazy_materialize and
  * every other reader of the lazy slots promote or force it first. */
 #define RAY_LAZY_COLREF 0x01
+/* A shared handle's settling (graph.c, lazy_settle; #1860) is kept in its
+ * GRAPH slot, which only the lazy functions read (attrs and rc are read by
+ * ray_retain on any thread): claimed, then done, the result kept (OP holds
+ * it, owned), or failed, the error kept (OP holds it, owned; each read
+ * raises a copy). */
+#define RAY_LAZY_G_SETTLING ((ray_graph_t*)(uintptr_t)1)
+#define RAY_LAZY_G_SETTLED  ((ray_graph_t*)(uintptr_t)2)
+#define RAY_LAZY_G_FAILED   ((ray_graph_t*)(uintptr_t)3)
+#define RAY_LAZY_G_STATE(g) ((uintptr_t)(g) - 1 < 3)   /* one of the three */
+/* A handle the caller may extend in place: `lazy` itself when it has one
+ * owner and has not settled (a column reference promoted), else a fresh
+ * single-owner handle over its settled value (owned).  Or an error. */
+ray_t*    ray_lazy_own(ray_t* lazy);
 ray_t*    ray_lazy_colref(ray_t* tbl, int64_t sym);          /* retains tbl */
 bool      ray_lazy_colref_get(ray_t* lazy, ray_t** tbl, int64_t* sym);   /* borrowed */
 /* Turn a column reference into the OP_SCAN graph it stands for, in place;

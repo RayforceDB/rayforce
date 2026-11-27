@@ -1,0 +1,92 @@
+;; A lazy value bound to a parameter (distinct, asc, reverse, sums, a
+;; distinct over a column) is read inside a form the tree walker runs, and
+;; read again after it (#1860).  The window bound the slot's lazy handle as
+;; it was; a call there extended that very object and its result consumed
+;; it, so the next read found "lazy handle already materialized" (and,
+;; or, timeit, if over a vector condition, the query forms) or a wrong
+;; answer (eval, resolve: 1).  The window now forces each lazy local its
+;; forms read, on that read, as every other read of a local is forced.
+(set T (table [a b] (list [1 2 1 3] [10 20 30 40])))
+
+;; the report's repros
+(set f (fn [v] (do (and true (> (count v) 0)) (count v))))
+(f (distinct [1 2 1])) -- 2
+(set g (fn [v] (and (> (count v) 0) (> (count v) 1))))
+(g (distinct [1 2 1])) -- true
+(set h (fn [v] (do (or false (count v)) (sum v))))
+(h (distinct [1 2 1])) -- 3
+;; and what did not fail
+((fn [v] (and true (count v))) (distinct [1 2 1])) -- true
+((fn [v] (do (count v) (and true (count v)))) (distinct [1 2 1])) -- true
+((fn [v] (do (count v) (count v))) (distinct [1 2 1])) -- 2
+(f (do (let d (distinct [1 2 1])) d)) -- 2
+
+;; every form that runs in a window, read twice
+((fn [v] (do (or false (count v)) (count v))) (asc [3 1 2])) -- 3
+((fn [v] (do (and true (or false (> (count v) 9)) true) (count v))) (reverse [1 2 3])) -- 3
+((fn [v] (do (if (and true (> (count v) 0)) 1 0) (count v))) (sums [1 2 3])) -- 3
+((fn [v] (do (if [true false] (count v) 0) (count v))) (distinct [1 2 1])) -- 2
+((fn [v] (do (timeit (count v)) (count v))) (distinct [1 2 1])) -- 2
+((fn [v] (do (eval (quote (count v))) (count v))) (distinct [1 2 1])) -- 2
+((fn [v] (do (count (resolve 'v)) (count v))) (distinct [1 2 1])) -- 2
+((fn [v] (do (try (count v) 0) (count v))) (distinct [1 2 1])) -- 2
+((fn [v] (do ((fn [] (count v))) (count v))) (distinct [1 2 1])) -- 2
+;; a distinct over a column, and a second lazy parameter read after
+((fn [v] (do (and true (> (count v) 0)) (count v))) (distinct (at T 'a))) -- 3
+((fn [v u] (do (and true (> (count u) 0)) (count v) (count u))) (distinct [1 2 1]) (distinct [4 4 5])) -- 2
+;; a lazy local the window does not mention is left lazy, and read after
+((fn [v] (do (and true (> 1 0)) (count v))) (distinct [1 2 1])) -- 2
+((fn [v] (do (or false 0) (sum v))) (distinct [1 2 1])) -- 3
+
+;; globals, closure captures, let and set bind a concrete value already
+(set gv1860 (distinct [1 2 1]))
+((fn [] (do (and true (> (count gv1860) 0)) (count gv1860)))) -- 2
+(set mk1860 (fn [v] (fn [] (do (and true (> (count v) 0)) (count v)))))
+((mk1860 (distinct [1 2 1]))) -- 2
+((fn [v] (do (let w v) (and true (> (count w) 0)) (count w))) (distinct [1 2 1])) -- 2
+;; a lazy local is forced on its read, never ahead of it: a short-circuited
+;; operand, a quoted form, a shadowing let and a quoted eval leave it
+;; unread, so a deferred error in it never surfaces, as with an unread
+;; concrete value
+(set bad1860 (fn [] (sum (distinct ['a 'b]))))
+((fn [v] (and false (count v))) (bad1860)) -- false
+((fn [v] (or true (count v))) (bad1860)) -- true
+((fn [v] (quote (count v))) (bad1860)) -- (quote (count v))
+((fn [v] (and true (do (let v [9]) (> (count v) 0)))) (bad1860)) -- true
+((fn [v] (do (quote eval) 0)) (bad1860)) -- 0
+(set marker1860 0)
+((fn [v] (and (do (set marker1860 1) false) (count v))) (bad1860)) -- false
+marker1860 -- 1
+;; read inside timeit and .mem.ts, the lazy work is measured there
+(set X1860 (% (til 1000000) 100003))
+(> ((fn [v] (at (.mem.ts (count v)) 'allocated-bytes)) (distinct X1860)) 100000) -- true
+;; a mutation through a computed name inside a window reaches the concrete value
+((fn [v go] (do (and go (alter (as 'SYM "v") concat [3])) (count v))) (distinct [1 2 1]) true) -- 3
+((fn [v go] (do (and go (alter (as 'SYM "v") concat [3])) (count v))) [1 2] true) -- 3
+((fn [v] (do (if [true false] (do (alter (as 'SYM "v") concat [3]) 1) 0) (count v))) (distinct [1 2 1])) -- 3
+;; an error caught around the window leaves the forced value in the slot
+((fn [v] (do (try (and true (+ (count v) "x")) 0) (count v))) (distinct [1 2 1])) -- 2
+;; the query planner looks names up to plan, which is no read: an operand it
+;; skips leaves the lazy value unforced, as dev did
+((fn [v] (count (select {from: (table [a] (list [1 2])) where: (and false (> (count v) 0))}))) (bad1860)) -- 0
+((fn [v] (count (select {from: (table [a] (list [1 2])) where: (or true (> (count v) 0))}))) (bad1860)) -- 2
+((fn [v] (count (select {from: (table [a] (list [1 2])) where: (if false (> (count v) 0) false)}))) (bad1860)) -- 0
+;; a read of a dotted name or through resolve forces the root and gives its
+;; error, as a read of the name itself does
+(try ((fn [v] (and true v.a)) (bad1860)) (fn [e] (at e 'code))) -- (try ((fn [v] (and true (count v))) (bad1860)) (fn [e] (at e 'code)))
+(try ((fn [v] (resolve (as 'SYM "v.a"))) (bad1860)) (fn [e] (at e 'code))) -- (try ((fn [v] (and true (count v))) (bad1860)) (fn [e] (at e 'code)))
+((fn [v] (do (count (resolve 'v)) (count v))) (asc [3 1 2])) -- 3
+;; every read that forces gives the forcing error back once: a thousand
+;; failing calls through each path keep no memory (run under ASan too)
+(set nb1860 (fn [f] (at (.mem.ts (do (times 1000 (try (f (bad1860)) (fn [e] 0))) 0)) 'net-bytes)))
+(set paths1860 (list (fn [v] (and true (count v))) (fn [v] (and true v.a)) (fn [v] (and true ((fn [] (count v))))) (fn [v] (and true (alter (as 'SYM "v") concat [3]))) (fn [v] (if [true false] (count v) 0)) (fn [v] (count (select {from: (table [a] (list [1 2])) where: (and true (> (count v) 0))}))) (fn [v] (eval (quote (count v)))) (fn [v] (resolve (as 'SYM "v.a")))))
+(map nb1860 paths1860)
+(map nb1860 paths1860) -- [0 0 0 0 0 0 0 0]
+;; the string operations extend a lazy value in place: on a shared handle
+;; they extend a fresh one, and the parameter stays as it was
+((fn [v] (do (and true (> (count (upper v)) 0)) v)) (distinct ["a" "b" "a"])) -- ["a" "b"]
+((fn [v] (do (and true (> (count (trim v)) 0)) (count v))) (distinct ["a" "b" "a"])) -- 2
+((fn [v] (do (and true (> (count (substr v 0 1)) 0)) v)) (distinct ["ab" "cd" "ab"])) -- ["ab" "cd"]
+((fn [v] (do (and true (> (count (replace v "a" "x")) 0)) v)) (distinct ["ab" "cd" "ab"])) -- ["ab" "cd"]
+((fn [v] (do (and true (> (count (str-find v "b")) 0)) v)) (distinct ["ab" "cd" "ab"])) -- ["ab" "cd"]
+((fn [v] (do (and true (> (count (lower v)) 0)) (upper v))) (distinct ["a" "b" "a"])) -- ["A" "B"]

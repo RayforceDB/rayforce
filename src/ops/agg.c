@@ -1223,7 +1223,11 @@ ray_t* ray_max_fn(ray_t* x) {
  * take the positional cell, and the first(asc) -> min idiom still applies. */
 static bool lazy_null_free(ray_t* x) {
     if (!x || x->type != RAY_LAZY) return false;
+    /* a shared or settled handle is not walked: another owner may be
+     * settling it (graph.c, #1860); not known null-free, no shortcut */
+    if (__atomic_load_n(&x->rc, __ATOMIC_RELAXED) > 1) return false;
     ray_graph_t* g = RAY_LAZY_GRAPH(x);
+    if (RAY_LAZY_G_STATE(g)) return false;
     ray_op_t* op = RAY_LAZY_OP(x);
     if (!g || !op) return false;
     while (op && (op->opcode == OP_ASC || op->opcode == OP_DESC ||
