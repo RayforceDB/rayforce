@@ -735,7 +735,7 @@ ray_err_t ray_rel_save(ray_rel_t* rel, const char* dir) {
     meta_data[3] = rel->fwd.sorted ? 1 : 0;
     meta_data[4] = rel->rev.sorted ? 1 : 0;
     ray_t* meta_vec = ray_vec_from_raw(RAY_I64, meta_data, 5);
-    if (!meta_vec || RAY_IS_ERR(meta_vec)) return RAY_ERR_OOM;
+    if (!meta_vec || RAY_IS_ERR(meta_vec)) { ray_error_free(meta_vec); return RAY_ERR_OOM; }   /* its error, owned here */
     err = ray_col_save(meta_vec, path);
     ray_release(meta_vec);
 

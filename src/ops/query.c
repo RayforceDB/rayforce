@@ -12592,14 +12592,19 @@ static ray_t* bind_col_slice(int64_t sym, ray_t* col, ray_t* idx_list) {
  * detects a mid-loop type mismatch and has to demote to a list. */
 static ray_t* typed_vec_to_list(ray_t* tv, int64_t fill, int64_t n_groups) {
     ray_t* list_col = ray_alloc(n_groups * sizeof(ray_t*));
-    if (!list_col) return ray_error("oom", NULL);
+    if (!list_col || RAY_IS_ERR(list_col)) { ray_error_free(list_col); return ray_error("oom", NULL); }
     list_col->type = RAY_LIST;
     list_col->len = 0;
     ray_t** out = (ray_t**)ray_data(list_col);
     for (int64_t k = 0; k < fill; k++) {
         int allocated = 0;
         ray_t* atom = collection_elem(tv, k, &allocated);
-        if (!allocated && atom) ray_retain(atom);
+        if (!atom || RAY_IS_ERR(atom)) {   /* never a NULL cell (#1851) */
+            ray_error_free(atom);          /* made by collection_elem, owned here */
+            ray_release(list_col);         /* owned here: the k cells made so far */
+            return ray_error("oom", NULL);
+        }
+        if (!allocated) ray_retain(atom);
         out[k] = atom;
         list_col->len = k + 1;
     }
@@ -14561,10 +14566,16 @@ static ray_t* query_eval_bound(ray_t* e, ray_t* tbl) {
  * only for an expression holding such an `if`. */
 static ray_t* rw_if_mix_err(ray_t* e, ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE || !rw_has_if(e, tbl, 0)) return NULL;
+    /* A graph or compile that failed to allocate is the failure (#1851):
+     * read as "no refusal", the per-row pass boxed the cells the planner
+     * would have refused. */
     ray_graph_t* g = ray_graph_new(tbl);
-    if (!g) return NULL;
-    ray_t* err = !compile_expr_dag(g, e) && g->if_refused ? graph_take_compile_err(g) : NULL;
-    ray_graph_free(g);
+    if (!g) return ray_error("oom", NULL);
+    ray_t* err = NULL;
+    if (!compile_expr_dag(g, e) && g->compile_err &&
+        (g->if_refused || strcmp(ray_err_code(g->compile_err), "oom") == 0))
+        err = graph_take_compile_err(g);   /* owned: handed to the caller */
+    ray_graph_free(g);                     /* frees a compile error not taken */
     return err;
 }
 

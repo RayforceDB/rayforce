@@ -457,9 +457,10 @@ cleanup:;
 
     if (!v_start || RAY_IS_ERR(v_start) || !v_end || RAY_IS_ERR(v_end) ||
         !v_depth || RAY_IS_ERR(v_depth)) {
-        if (v_start && !RAY_IS_ERR(v_start)) ray_release(v_start);
-        if (v_end && !RAY_IS_ERR(v_end)) ray_release(v_end);
-        if (v_depth && !RAY_IS_ERR(v_depth)) ray_release(v_depth);
+        /* each is owned here: a vector released, a failed one's error freed */
+        if (v_start && RAY_IS_ERR(v_start)) ray_error_free(v_start); else ray_release(v_start);
+        if (v_end && RAY_IS_ERR(v_end)) ray_error_free(v_end); else ray_release(v_end);
+        if (v_depth && RAY_IS_ERR(v_depth)) ray_error_free(v_depth); else ray_release(v_depth);
         return ray_error("oom", NULL);
     }
 
@@ -528,8 +529,9 @@ ray_t* exec_shortest_path(ray_graph_t* g, ray_op_t* op,
         int64_t zero = 0;
         ray_t* v_depth = ray_vec_from_raw(RAY_I64, &zero, 1);
         if (!v_node || RAY_IS_ERR(v_node) || !v_depth || RAY_IS_ERR(v_depth)) {
-            if (v_node && !RAY_IS_ERR(v_node)) ray_release(v_node);
-            if (v_depth && !RAY_IS_ERR(v_depth)) ray_release(v_depth);
+            /* each is owned here: a vector released, a failed one's error freed */
+            if (v_node && RAY_IS_ERR(v_node)) ray_error_free(v_node); else ray_release(v_node);
+            if (v_depth && RAY_IS_ERR(v_depth)) ray_error_free(v_depth); else ray_release(v_depth);
             return ray_error("oom", NULL);
         }
         ray_t* result = ray_table_new(2);
@@ -635,8 +637,9 @@ bfs_done:
     ray_t* v_node = ray_vec_from_raw(RAY_I64, path_buf, path_len);
     ray_t* v_depth = ray_vec_new(RAY_I64, path_len);
     if (!v_node || RAY_IS_ERR(v_node) || !v_depth || RAY_IS_ERR(v_depth)) {
-        if (v_node && !RAY_IS_ERR(v_node)) ray_release(v_node);
-        if (v_depth && !RAY_IS_ERR(v_depth)) ray_release(v_depth);
+        /* each is owned here: a vector released, a failed one's error freed */
+        if (v_node && RAY_IS_ERR(v_node)) ray_error_free(v_node); else ray_release(v_node);
+        if (v_depth && RAY_IS_ERR(v_depth)) ray_error_free(v_depth); else ray_release(v_depth);
         return ray_error("oom", NULL);
     }
     v_depth->len = path_len;
@@ -1184,6 +1187,7 @@ ray_t* exec_wco_join(ray_graph_t* g, ray_op_t* op) {
         ray_t* vec = ray_vec_from_raw(RAY_I64, ctx.col_data[v], ctx.out_count);
         ray_free(ctx.buf_hdrs[v]);
         if (!vec || RAY_IS_ERR(vec)) {
+            ray_error_free(vec);   /* the failed copy's error, owned here */
             for (uint8_t j = v + 1; j < n_vars; j++) ray_free(ctx.buf_hdrs[j]);
             scratch_free(col_data_block);
             ray_release(result);
