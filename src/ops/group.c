@@ -10605,7 +10605,7 @@ static bool group_materialize_prod_slots(agg_prod_t* prod, ray_t** agg_vecs,
     for (uint32_t a = 0; a < n_aggs; a++) {
         if (!prod[a].enabled) continue;
         ray_t* v = ray_vec_new(RAY_F64, nrows > 0 ? nrows : 1);
-        if (!v || RAY_IS_ERR(v)) return false;
+        if (!v || RAY_IS_ERR(v)) { ray_error_free(v); return false; }
         v->len = nrows;
         prod_fill_ctx_t fc = { .prod = &prod[a], .dst = (double*)ray_data(v), .vec = v };
         ray_pool_t* pool = ray_pool_get();
@@ -13691,7 +13691,7 @@ static ray_t* group_eval_part_expr(ray_graph_t* g, ray_t* parted_tbl,
                                    const int64_t* src_syms, int n_src,
                                    uint32_t root, int32_t p) {
     ray_t* sub = ray_table_new(n_src > 0 ? (int64_t)n_src : 1);
-    if (!sub || RAY_IS_ERR(sub)) return NULL;
+    if (!sub || RAY_IS_ERR(sub)) { ray_error_free(sub); return NULL; }
     for (int j = 0; j < n_src; j++) {
         ray_t* seg = ray_table_parted_seg(parted_tbl, src_syms[j], p);
         if (!seg) { ray_release(sub); return NULL; }
@@ -15077,7 +15077,7 @@ __attribute__((noinline)) static ray_t* exec_group_core(ray_graph_t* g, ray_op_t
     /* Substitute each dict'd STR key column with its int32 code vector. */
     int64_t ncols = ray_table_ncols(tbl);
     ray_t* sub = ray_table_new(ncols);
-    if (!sub || RAY_IS_ERR(sub)) { result = exec_group_run(g, op, tbl, group_limit); goto grp_done; }
+    if (!sub || RAY_IS_ERR(sub)) { ray_error_free(sub); result = exec_group_run(g, op, tbl, group_limit); goto grp_done; }
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name = ray_table_col_name(tbl, c);
         ray_t* use = ray_table_slot_idx(tbl, c);     /* pass encoded slots on undecoded */
@@ -15099,7 +15099,7 @@ __attribute__((noinline)) static ray_t* exec_group_core(ray_graph_t* g, ray_op_t
                 break;
             }
         sub = ray_table_add_col(sub, name, use);
-        if (!sub || RAY_IS_ERR(sub)) { result = exec_group_run(g, op, tbl, group_limit); goto grp_done; }
+        if (!sub || RAY_IS_ERR(sub)) { ray_error_free(sub); result = exec_group_run(g, op, tbl, group_limit); goto grp_done; }
     }
 
     result = exec_group_run(g, op, sub, group_limit);
@@ -16048,6 +16048,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * DA path. */
     ray_t* result = ray_table_new(1 + n_aggs);
     if (!result || RAY_IS_ERR(result)) {
+        ray_error_free(result);
         scratch_free(sum_hdr); scratch_free(cnt_hdr);
         scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
         scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
@@ -16056,7 +16057,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     }
     ray_t* kc = col_vec_new(key_col, K > 0 ? K : 1);
     if (!kc || RAY_IS_ERR(kc)) {
-        if (kc) ray_release(kc);
+        ray_error_free(kc);
         ray_release(result);
         scratch_free(sum_hdr); scratch_free(cnt_hdr);
         scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
@@ -16542,6 +16543,9 @@ static ray_t* exec_group_v2_exprs_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     ray_sym_intern(knames[k], strlen(knames[k])), ksynth[k]);
             if (!sub || RAY_IS_ERR(sub)) ok = false;
         }
+        /* a failed table or add_col: its error goes (add_col consumed the
+         * table), and the legacy path runs */
+        if (sub && RAY_IS_ERR(sub)) { ray_error_free(sub); sub = NULL; }
     }
     ray_op_t* op2 = NULL;
     if (ok) {
@@ -17736,14 +17740,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                         int64_t out_ncols = out_nkeys + n_aggs;
                         ray_t* result = ray_table_new((int64_t)out_ncols);
                         if (!result || RAY_IS_ERR(result))
-                            return ray_error("oom", NULL);
+                            return result ? result : ray_error("oom", NULL);
                         ray_retain(src_col);
                         ray_t* tmp_r = ray_table_add_col(result, src_sym, src_col);
                         ray_release(src_col);
-                        if (!tmp_r || RAY_IS_ERR(tmp_r)) {
-                            ray_release(result);
-                            return ray_error("oom", NULL);
-                        }
+                        if (!tmp_r || RAY_IS_ERR(tmp_r))   /* add_col consumed result */
+                            return tmp_r ? tmp_r : ray_error("oom", NULL);
                         result = tmp_r;
                         for (uint32_t a = 0; a < n_aggs; a++) {
                             ray_retain(cnt_col);
@@ -17755,10 +17757,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                             }
                             tmp_r = ray_table_add_col(result, agg_name, cnt_col);
                             ray_release(cnt_col);
-                            if (!tmp_r || RAY_IS_ERR(tmp_r)) {
-                                ray_release(result);
-                                return ray_error("oom", NULL);
-                            }
+                            if (!tmp_r || RAY_IS_ERR(tmp_r))   /* add_col consumed result */
+                                return tmp_r ? tmp_r : ray_error("oom", NULL);
                             result = tmp_r;
                         }
                         return result;
@@ -24440,7 +24440,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
              * borrow_syms, which is already deduplicated.) */
             (void)unique_agg;
             ray_t* sub = ray_table_new((int64_t)(n_borrow + n_keys + n_aggs + 1));
-            if (!sub || RAY_IS_ERR(sub)) goto batch_fail;
+            if (!sub || RAY_IS_ERR(sub)) { ray_error_free(sub); goto batch_fail; }
 
             int64_t part_nrows = -1;
             int64_t fill_budget = GRP_NULL_FILL_BUDGET;     /* one sub-table's fills live at a time */
@@ -24703,7 +24703,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         if (merge_tbl) { ray_release(merge_tbl); merge_tbl = NULL; }
         merge_tbl = ray_table_new((int64_t)(n_keys + part_n_aggs));
         if (!merge_tbl || RAY_IS_ERR(merge_tbl)) {
-            merge_tbl = NULL; goto batch_fail;
+            ray_error_free(merge_tbl); merge_tbl = NULL; goto batch_fail;
         }
 
         /* Key columns.  Read by position: running keeps key k at column k,
@@ -24985,6 +24985,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         running = new_running;
 
         if (!running || RAY_IS_ERR(running)) {
+            /* the concat fallback runs; the merge's error goes with it */
+            ray_error_free(running);
+            running = NULL;
             ray_release(merge_tbl);
             goto pp_cleanup;
         }
@@ -25037,6 +25040,7 @@ batch_fail:
     ray_t* result = running;
 
     if (!result || RAY_IS_ERR(result)) {
+        ray_error_free(result);   /* the concat fallback runs */
         if (merge_tbl) ray_release(merge_tbl);
         goto pp_cleanup;
     }
@@ -25076,6 +25080,7 @@ batch_fail:
     if (has_avg || has_stddev || frow_sym >= 0) {   /* drops the decomposed and hidden slots */
         ray_t* trimmed = ray_table_new((int64_t)(n_keys + n_aggs));
         if (!trimmed || RAY_IS_ERR(trimmed)) {
+            ray_error_free(trimmed);
             ray_release(result);
             if (merge_tbl) ray_release(merge_tbl);
             goto pp_cleanup;
@@ -25124,6 +25129,7 @@ batch_fail:
                 int64_t nrows = sum_col->len;
                 ray_t* avg_col = ray_vec_new(RAY_F64, nrows);
                 if (!avg_col || RAY_IS_ERR(avg_col)) {
+                    ray_error_free(avg_col);   /* the concat fallback runs */
                     ray_release(trimmed); ray_release(result);
                     if (merge_tbl) ray_release(merge_tbl);
                     goto pp_cleanup;
@@ -25201,6 +25207,7 @@ batch_fail:
                 int64_t nrows = vp_col->len;
                 ray_t* out_col = ray_vec_new(RAY_F64, nrows);
                 if (!out_col || RAY_IS_ERR(out_col)) {
+                    ray_error_free(out_col);   /* the concat fallback runs */
                     ray_release(trimmed); ray_release(result);
                     if (merge_tbl) ray_release(merge_tbl);
                     goto pp_cleanup;

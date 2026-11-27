@@ -46,6 +46,18 @@ static void graph_compile_failure(ray_graph_t* g, ray_t* err) {
         ray_error_free(err);
 }
 
+/* Every builder refuses an input node it was handed NULL: a node that
+ * failed to build (its allocation failure recorded in g->compile_err, or a
+ * shape its builder declines) has no id to read.  The builder answers NULL
+ * in turn, so a plan built under a failure ends in a NULL root, which
+ * ray_execute answers with the recorded error (#1817).  An array of n
+ * inputs is checked element by element; a NULL array holds none. */
+static inline bool graph_ins_ok(ray_op_t* const* ins, uint32_t n) {
+    if (!ins) return n == 0;
+    for (uint32_t i = 0; i < n; i++) if (!ins[i]) return false;
+    return true;
+}
+
 /* Graph edges are stable uint32 node ids (indices into g->nodes), so a
    realloc of g->nodes needs no pointer fixups — the former graph_fix_ptr /
    graph_fixup_ptrs / graph_fixup_ext_ptrs machinery is gone entirely. */
@@ -413,6 +425,7 @@ ray_op_t* ray_const_table(ray_graph_t* g, ray_t* tbl) {
  * -------------------------------------------------------------------------- */
 
 static ray_op_t* make_unary(ray_graph_t* g, uint16_t opcode, ray_op_t* a, int8_t out_type) {
+    if (!a) return NULL;   /* an input that failed to build */
     /* Save ID before alloc — realloc may invalidate the pointer */
     uint32_t a_id = a->id;
     uint32_t est = a->est_rows;
@@ -430,6 +443,7 @@ static ray_op_t* make_unary(ray_graph_t* g, uint16_t opcode, ray_op_t* a, int8_t
 
 static ray_op_t* make_unary_param(ray_graph_t* g, uint16_t opcode, ray_op_t* a,
                                   int8_t out_type, int64_t param) {
+    if (!a) return NULL;   /* an input that failed to build */
     uint32_t a_id = a->id;
     uint32_t est = a->est_rows;
     ray_op_ext_t* ext = graph_alloc_ext_node(g);
@@ -448,6 +462,7 @@ static ray_op_t* make_unary_param(ray_graph_t* g, uint16_t opcode, ray_op_t* a,
 }
 
 static ray_op_t* make_binary(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_op_t* b, int8_t out_type) {
+    if (!a || !b) return NULL;   /* an input that failed to build */
     /* Save IDs before alloc — realloc may invalidate the pointers */
     uint32_t a_id = a->id;
     uint32_t b_id = b->id;
@@ -529,8 +544,8 @@ static int8_t promote_if_type(int8_t a, int8_t b) {
  * Unary element-wise ops
  * -------------------------------------------------------------------------- */
 
-ray_op_t* ray_neg(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_NEG, a, a->out_type); }
-ray_op_t* ray_abs(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_ABS, a, a->out_type); }
+ray_op_t* ray_neg(ray_graph_t* g, ray_op_t* a)     { return a ? make_unary(g, OP_NEG, a, a->out_type) : NULL; }
+ray_op_t* ray_abs(ray_graph_t* g, ray_op_t* a)     { return a ? make_unary(g, OP_ABS, a, a->out_type) : NULL; }
 ray_op_t* ray_not(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_NOT, a, RAY_BOOL); }
 ray_op_t* ray_sqrt_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_SQRT, a, RAY_F64); }
 ray_op_t* ray_log_op(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_LOG, a, RAY_F64); }
@@ -543,9 +558,9 @@ ray_op_t* ray_tan_op(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_TAN
 ray_op_t* ray_atan_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_ATAN, a, RAY_F64); }
 ray_op_t* ray_reciprocal_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_RECIPROCAL, a, RAY_F64); }
 ray_op_t* ray_signum_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_SIGNUM, a, RAY_I64); }
-ray_op_t* ray_ceil_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_CEIL, a, a->out_type); }
-ray_op_t* ray_floor_op(ray_graph_t* g, ray_op_t* a){ return make_unary(g, OP_FLOOR, a, a->out_type); }
-ray_op_t* ray_round_op(ray_graph_t* g, ray_op_t* a){ return make_unary(g, OP_ROUND, a, a->out_type); }
+ray_op_t* ray_ceil_op(ray_graph_t* g, ray_op_t* a) { return a ? make_unary(g, OP_CEIL, a, a->out_type) : NULL; }
+ray_op_t* ray_floor_op(ray_graph_t* g, ray_op_t* a){ return a ? make_unary(g, OP_FLOOR, a, a->out_type) : NULL; }
+ray_op_t* ray_round_op(ray_graph_t* g, ray_op_t* a){ return a ? make_unary(g, OP_ROUND, a, a->out_type) : NULL; }
 ray_op_t* ray_isnull(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_ISNULL, a, RAY_BOOL); }
 
 ray_op_t* ray_cast(ray_graph_t* g, ray_op_t* a, int8_t target_type) {
@@ -648,6 +663,7 @@ static int cmp_is_symbol_value(ray_graph_t* g, ray_op_t* x) {
 }
 
 static ray_op_t* make_cmp(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_op_t* b) {
+    if (!a || !b) return NULL;   /* an input that failed to build */
     int8_t a_type = a->out_type, b_type = b->out_type;
     if (RAY_IS_PARTED(a_type)) a_type = (int8_t)RAY_PARTED_BASETYPE(a_type);
     if (RAY_IS_PARTED(b_type)) b_type = (int8_t)RAY_PARTED_BASETYPE(b_type);
@@ -678,6 +694,7 @@ static ray_op_t* make_cmp(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_op_t
 }
 
 ray_op_t* ray_binop(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_op_t* b) {
+    if (!a || !b) return NULL;   /* an input that failed to build */
     int8_t out;
     switch (opcode) {
     case OP_EQ: case OP_NE: case OP_LT: case OP_LE:
@@ -699,18 +716,19 @@ ray_op_t* ray_binop(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_op_t* b) {
     return make_binary(g, opcode, a, b, out);
 }
 
-ray_op_t* ray_add(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_ADD, a, b, arith_promote(a->out_type, b->out_type)); }
-ray_op_t* ray_sub(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_SUB, a, b, arith_promote(a->out_type, b->out_type)); }
-ray_op_t* ray_mul(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_MUL, a, b, arith_promote(a->out_type, b->out_type)); }
+ray_op_t* ray_add(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return a && b ? make_binary(g, OP_ADD, a, b, arith_promote(a->out_type, b->out_type)) : NULL; }
+ray_op_t* ray_sub(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return a && b ? make_binary(g, OP_SUB, a, b, arith_promote(a->out_type, b->out_type)) : NULL; }
+ray_op_t* ray_mul(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return a && b ? make_binary(g, OP_MUL, a, b, arith_promote(a->out_type, b->out_type)) : NULL; }
 ray_op_t* ray_div(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_DIV, a, b, RAY_F64); }
 /* div takes the promotion table's type over numeric operands (#972);
  * anything else (a temporal the projection hands to the builtin) keeps I64. */
 ray_op_t* ray_idiv(ray_graph_t* g, ray_op_t* a, ray_op_t* b) {
+    if (!a || !b) return NULL;   /* an input that failed to build */
     int8_t out = ray_num_type(a->out_type, b->out_type)
                ? arith_promote(a->out_type, b->out_type) : RAY_I64;
     return make_binary(g, OP_IDIV, a, b, out);
 }
-ray_op_t* ray_mod(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_MOD, a, b, arith_promote(a->out_type, b->out_type)); }
+ray_op_t* ray_mod(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return a && b ? make_binary(g, OP_MOD, a, b, arith_promote(a->out_type, b->out_type)) : NULL; }
 ray_op_t* ray_pow_op(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_POW, a, b, RAY_F64); }
 
 ray_op_t* ray_eq(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_cmp(g, OP_EQ, a, b); }
@@ -721,8 +739,8 @@ ray_op_t* ray_gt(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_cmp(g, 
 ray_op_t* ray_ge(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_cmp(g, OP_GE, a, b); }
 ray_op_t* ray_and(ray_graph_t* g, ray_op_t* a, ray_op_t* b){ return make_binary(g, OP_AND, a, b, RAY_BOOL); }
 ray_op_t* ray_or(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_OR, a, b, RAY_BOOL); }
-ray_op_t* ray_min2(ray_graph_t* g, ray_op_t* a, ray_op_t* b){ return make_binary(g, OP_MIN2, a, b, promote(a->out_type, b->out_type)); }
-ray_op_t* ray_max2(ray_graph_t* g, ray_op_t* a, ray_op_t* b){ return make_binary(g, OP_MAX2, a, b, promote(a->out_type, b->out_type)); }
+ray_op_t* ray_min2(ray_graph_t* g, ray_op_t* a, ray_op_t* b){ return a && b ? make_binary(g, OP_MIN2, a, b, promote(a->out_type, b->out_type)) : NULL; }
+ray_op_t* ray_max2(ray_graph_t* g, ray_op_t* a, ray_op_t* b){ return a && b ? make_binary(g, OP_MAX2, a, b, promote(a->out_type, b->out_type)) : NULL; }
 ray_op_t* ray_in(ray_graph_t* g, ray_op_t* col, ray_op_t* set){ return make_binary(g, OP_IN, col, set, RAY_BOOL); }
 ray_op_t* ray_not_in(ray_graph_t* g, ray_op_t* col, ray_op_t* set){ return make_binary(g, OP_NOT_IN, col, set, RAY_BOOL); }
 
@@ -754,6 +772,7 @@ static bool if_const_str_atom(ray_graph_t* g, uint32_t id) {
 }
 
 ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* else_val) {
+    if (!cond || !then_val || !else_val) return NULL;   /* an input that failed to build */
     /* 3-input node: cond, then, else — needs ext node */
     uint32_t cond_id = cond->id;
     uint32_t then_id = then_val->id;
@@ -856,15 +875,16 @@ ray_op_t* ray_ilike(ray_graph_t* g, ray_op_t* input, ray_op_t* pattern) {
 }
 
 /* String ops */
-ray_op_t* ray_upper(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_UPPER, a, a->out_type == RAY_STR ? RAY_STR : RAY_SYM); }
-ray_op_t* ray_lower(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_LOWER, a, a->out_type == RAY_STR ? RAY_STR : RAY_SYM); }
+ray_op_t* ray_upper(ray_graph_t* g, ray_op_t* a)   { return a ? make_unary(g, OP_UPPER, a, a->out_type == RAY_STR ? RAY_STR : RAY_SYM) : NULL; }
+ray_op_t* ray_lower(ray_graph_t* g, ray_op_t* a)   { return a ? make_unary(g, OP_LOWER, a, a->out_type == RAY_STR ? RAY_STR : RAY_SYM) : NULL; }
 ray_op_t* ray_strlen(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_STRLEN, a, RAY_I64); }
-ray_op_t* ray_trim_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_TRIM, a, a->out_type == RAY_STR ? RAY_STR : RAY_SYM); }
+ray_op_t* ray_trim_op(ray_graph_t* g, ray_op_t* a) { return a ? make_unary(g, OP_TRIM, a, a->out_type == RAY_STR ? RAY_STR : RAY_SYM) : NULL; }
 ray_op_t* ray_str_find_op(ray_graph_t* g, ray_op_t* input, ray_op_t* pattern) {
     return make_binary(g, OP_STR_FIND, input, pattern, RAY_I64);
 }
 
 ray_op_t* ray_substr(ray_graph_t* g, ray_op_t* str, ray_op_t* start, ray_op_t* len) {
+    if (!str || !start || !len) return NULL;   /* an input that failed to build */
     /* 3-input: str=inputs[0], start=inputs[1], len stored via literal field */
     uint32_t s_id = str->id;
     uint32_t st_id = start->id;
@@ -889,6 +909,7 @@ ray_op_t* ray_substr(ray_graph_t* g, ray_op_t* str, ray_op_t* start, ray_op_t* l
 }
 
 ray_op_t* ray_replace(ray_graph_t* g, ray_op_t* str, ray_op_t* from, ray_op_t* to) {
+    if (!str || !from || !to) return NULL;   /* an input that failed to build */
     /* 3-input: str=inputs[0], from=inputs[1], to stored via literal field */
     uint32_t s_id = str->id;
     uint32_t f_id = from->id;
@@ -913,6 +934,7 @@ ray_op_t* ray_replace(ray_graph_t* g, ray_op_t* str, ray_op_t* from, ray_op_t* t
 }
 
 ray_op_t* ray_concat(ray_graph_t* g, ray_op_t** args, int n) {
+    if (!graph_ins_ok(args, (uint32_t)n)) return NULL;
     /* Variadic: first 2 in inputs[], rest in trailing IDs */
     if (!args || n < 2) return NULL;
     /* M4: Guard VLA upper bound */
@@ -955,64 +977,71 @@ ray_op_t* ray_concat(ray_graph_t* g, ray_op_t** args, int n) {
  * -------------------------------------------------------------------------- */
 
 ray_op_t* ray_sum(ray_graph_t* g, ray_op_t* a) {
+    if (!a) return NULL;   /* an input that failed to build */
     int8_t type = a->out_type;
     if (RAY_IS_PARTED(type)) type = (int8_t)RAY_PARTED_BASETYPE(type);
     int8_t out = type == RAY_F64 || type == RAY_F32 ? RAY_F64
                  : type == RAY_TIMESPAN ? RAY_TIMESPAN : RAY_I64;
     return make_unary(g, OP_SUM, a, out);
 }
-ray_op_t* ray_prod(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_PROD, a, (a->out_type == RAY_F64 || a->out_type == RAY_F32) ? RAY_F64 : RAY_I64); }
+ray_op_t* ray_prod(ray_graph_t* g, ray_op_t* a)   { return a ? make_unary(g, OP_PROD, a, (a->out_type == RAY_F64 || a->out_type == RAY_F32) ? RAY_F64 : RAY_I64) : NULL; }
 ray_op_t* ray_all(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_ALL, a, RAY_BOOL); }
 ray_op_t* ray_any(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_ANY, a, RAY_BOOL); }
-ray_op_t* ray_min_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_MIN, a, a->out_type); }
-ray_op_t* ray_max_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_MAX, a, a->out_type); }
+ray_op_t* ray_min_op(ray_graph_t* g, ray_op_t* a) { return a ? make_unary(g, OP_MIN, a, a->out_type) : NULL; }
+ray_op_t* ray_max_op(ray_graph_t* g, ray_op_t* a) { return a ? make_unary(g, OP_MAX, a, a->out_type) : NULL; }
 ray_op_t* ray_count(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_COUNT, a, RAY_I64); }
-ray_op_t* ray_avg(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_AVG, a, mean_out_type(a->out_type)); }
-ray_op_t* ray_first(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_FIRST, a, a->out_type); }
-ray_op_t* ray_last(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_LAST, a, a->out_type); }
+ray_op_t* ray_avg(ray_graph_t* g, ray_op_t* a)    { return a ? make_unary(g, OP_AVG, a, mean_out_type(a->out_type)) : NULL; }
+ray_op_t* ray_first(ray_graph_t* g, ray_op_t* a)  { return a ? make_unary(g, OP_FIRST, a, a->out_type) : NULL; }
+ray_op_t* ray_last(ray_graph_t* g, ray_op_t* a)   { return a ? make_unary(g, OP_LAST, a, a->out_type) : NULL; }
 ray_op_t* ray_count_distinct(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_COUNT_DISTINCT, a, RAY_I64); }
-ray_op_t* ray_distinct_op(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_DISTINCT, a, a->out_type); }
-ray_op_t* ray_asc_op(ray_graph_t* g, ray_op_t* a)       { return make_unary(g, OP_ASC, a, a->out_type); }
-ray_op_t* ray_desc_op(ray_graph_t* g, ray_op_t* a)      { return make_unary(g, OP_DESC, a, a->out_type); }
-ray_op_t* ray_reverse_op(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_REVERSE, a, a->out_type); }
-ray_op_t* ray_lag_op(ray_graph_t* g, ray_op_t* a)       { return make_unary(g, OP_LAG, a, a->out_type); }
-ray_op_t* ray_lead_op(ray_graph_t* g, ray_op_t* a)      { return make_unary(g, OP_LEAD, a, a->out_type); }
+ray_op_t* ray_distinct_op(ray_graph_t* g, ray_op_t* a)   { return a ? make_unary(g, OP_DISTINCT, a, a->out_type) : NULL; }
+ray_op_t* ray_asc_op(ray_graph_t* g, ray_op_t* a)       { return a ? make_unary(g, OP_ASC, a, a->out_type) : NULL; }
+ray_op_t* ray_desc_op(ray_graph_t* g, ray_op_t* a)      { return a ? make_unary(g, OP_DESC, a, a->out_type) : NULL; }
+ray_op_t* ray_reverse_op(ray_graph_t* g, ray_op_t* a)   { return a ? make_unary(g, OP_REVERSE, a, a->out_type) : NULL; }
+ray_op_t* ray_lag_op(ray_graph_t* g, ray_op_t* a)       { return a ? make_unary(g, OP_LAG, a, a->out_type) : NULL; }
+ray_op_t* ray_lead_op(ray_graph_t* g, ray_op_t* a)      { return a ? make_unary(g, OP_LEAD, a, a->out_type) : NULL; }
 ray_op_t* ray_deltas_op(ray_graph_t* g, ray_op_t* a) {
+    if (!a) return NULL;   /* an input that failed to build */
     int8_t t = a->out_type;
     return make_unary(g, OP_DELTAS, a, deltas_out_type(t));
 }
 ray_op_t* ray_ratios_op(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_RATIOS, a, RAY_F64); }
-ray_op_t* ray_fills_op(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_FILLS, a, a->out_type); }
+ray_op_t* ray_fills_op(ray_graph_t* g, ray_op_t* a)     { return a ? make_unary(g, OP_FILLS, a, a->out_type) : NULL; }
 ray_op_t* ray_sums_op(ray_graph_t* g, ray_op_t* a) {
+    if (!a) return NULL;   /* an input that failed to build */
     int8_t t = a->out_type;
     return make_unary(g, OP_SUMS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : scan_int_out_type(t));
 }
-ray_op_t* ray_avgs_op(ray_graph_t* g, ray_op_t* a)      { return make_unary(g, OP_AVGS, a, mean_out_type(a->out_type)); }
+ray_op_t* ray_avgs_op(ray_graph_t* g, ray_op_t* a)      { return a ? make_unary(g, OP_AVGS, a, mean_out_type(a->out_type)) : NULL; }
 ray_op_t* ray_mins_op(ray_graph_t* g, ray_op_t* a) {
+    if (!a) return NULL;   /* an input that failed to build */
     int8_t t = a->out_type;
     return make_unary(g, OP_MINS, a, t);
 }
 ray_op_t* ray_maxs_op(ray_graph_t* g, ray_op_t* a) {
+    if (!a) return NULL;   /* an input that failed to build */
     int8_t t = a->out_type;
     return make_unary(g, OP_MAXS, a, t);
 }
 ray_op_t* ray_prds_op(ray_graph_t* g, ray_op_t* a) {
+    if (!a) return NULL;   /* an input that failed to build */
     int8_t t = a->out_type;
     return make_unary(g, OP_PRDS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64);
 }
 ray_op_t* ray_differ_op(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_DIFFER, a, RAY_BOOL); }
 ray_op_t* ray_msum_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
+    if (!a) return NULL;   /* an input that failed to build */
     int8_t t = a->out_type;
     return make_unary_param(g, OP_MSUM, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : scan_int_out_type(t), window);
 }
-ray_op_t* ray_mavg_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
-    return make_unary_param(g, OP_MAVG, a, mean_out_type(a->out_type), window);
-}
+ray_op_t* ray_mavg_op(ray_graph_t* g, ray_op_t* a, int64_t window) { return a ? make_unary_param(g, OP_MAVG, a, mean_out_type(a->out_type), window) : NULL; }
 ray_op_t* ray_mmin_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
+    if (!a) return NULL;   /* an input that failed to build */
     int8_t t = a->out_type;
     return make_unary_param(g, OP_MMIN, a, t, window);
 }
 ray_op_t* ray_mmax_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
+    if (!a) return NULL;   /* an input that failed to build */
     int8_t t = a->out_type;
     return make_unary_param(g, OP_MMAX, a, t, window);
 }
@@ -1022,11 +1051,9 @@ ray_op_t* ray_mcount_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
 ray_op_t* ray_mvar_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
     return make_unary_param(g, OP_MVAR, a, RAY_F64, window);
 }
-ray_op_t* ray_mdev_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
-    return make_unary_param(g, OP_MDEV, a, mean_out_type(a->out_type), window);
-}
-ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_STDDEV, a, mean_out_type(a->out_type)); }
-ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_STDDEV_POP, a, mean_out_type(a->out_type)); }
+ray_op_t* ray_mdev_op(ray_graph_t* g, ray_op_t* a, int64_t window) { return a ? make_unary_param(g, OP_MDEV, a, mean_out_type(a->out_type), window) : NULL; }
+ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a)     { return a ? make_unary(g, OP_STDDEV, a, mean_out_type(a->out_type)) : NULL; }
+ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a)  { return a ? make_unary(g, OP_STDDEV_POP, a, mean_out_type(a->out_type)) : NULL; }
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a)         { return make_unary(g, OP_VAR, a, RAY_F64); }
 ray_op_t* ray_var_pop(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_VAR_POP, a, RAY_F64); }
 
@@ -1042,6 +1069,7 @@ ray_op_t* ray_median(ray_graph_t* g, ray_op_t* a) {
  * -------------------------------------------------------------------------- */
 
 ray_op_t* ray_filter(ray_graph_t* g, ray_op_t* input, ray_op_t* predicate) {
+    if (!input || !predicate) return NULL;   /* an input that failed to build */
     uint32_t input_id = input->id;
     uint32_t pred_id = predicate->id;
     uint32_t est = input->est_rows / 2;  /* estimate: 50% selectivity */
@@ -1064,11 +1092,13 @@ ray_op_t* ray_filter(ray_graph_t* g, ray_op_t* input, ray_op_t* predicate) {
 ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
                      ray_op_t** keys, uint8_t* descs, uint8_t* nulls_first,
                      uint32_t n_cols) {
+    if (!table_node) return NULL;   /* an input that failed to build */
+    if (!graph_ins_ok(keys, (uint32_t)n_cols)) return NULL;
     uint32_t table_id = table_node->id;
     ray_t* ids_hdr = NULL;
     uint32_t* key_ids = (uint32_t*)scratch_alloc(&ids_hdr,
                             (size_t)(n_cols ? n_cols : 1) * sizeof(uint32_t));
-    if (!key_ids) return NULL;
+    if (!key_ids) { graph_compile_failure(g, NULL); return NULL; }
     for (uint32_t i = 0; i < n_cols; i++) key_ids[i] = keys[i]->id;
 
     size_t keys_sz = (size_t)n_cols * sizeof(ray_op_t*);
@@ -1113,13 +1143,17 @@ ray_op_t* ray_group_build(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                           uint16_t* agg_ops, ray_op_t** agg_ins,
                           ray_op_t** agg_ins2, const int64_t* agg_k,
                           uint32_t n_aggs) {
+    /* An input node that failed to allocate (a NULL scan or expression)
+     * fails the group node too: the caller answers that failure. */
+    for (uint32_t i = 0; i < n_keys; i++) if (!keys[i]) return NULL;
+    for (uint32_t i = 0; i < n_aggs; i++) if (!agg_ins[i]) return NULL;
     /* One carve for all three id arrays (key_ids/agg_ids/agg_ids2 are all
      * uint32_t, so a single flat buffer sliced by offset suffices). */
     ray_t* ids_hdr = NULL;
     size_t ids_elems = (size_t)n_keys + (size_t)n_aggs * 2;
     uint32_t* ids_buf = (uint32_t*)scratch_alloc(&ids_hdr,
                             (ids_elems ? ids_elems : 1) * sizeof(uint32_t));
-    if (!ids_buf) return NULL;
+    if (!ids_buf) { graph_compile_failure(g, NULL); return NULL; }
     uint32_t* key_ids  = ids_buf;
     uint32_t* agg_ids  = ids_buf + n_keys;
     uint32_t* agg_ids2 = ids_buf + n_keys + n_aggs;  /* parallel to agg_ids; 0 when no second input */
@@ -1205,10 +1239,12 @@ ray_op_t* ray_pivot_op(ray_graph_t* g,
                        ray_op_t* pivot_col,
                        ray_op_t* value_col,
                        uint16_t agg_op) {
+    if (!pivot_col || !value_col) return NULL;   /* an input that failed to build */
+    if (!graph_ins_ok(index_cols, (uint32_t)n_index)) return NULL;
     ray_t* idx_hdr = NULL;
     uint32_t* idx_ids = (uint32_t*)scratch_alloc(&idx_hdr,
                             (size_t)(n_index ? n_index : 1) * sizeof(uint32_t));
-    if (!idx_ids) return NULL;
+    if (!idx_ids) { graph_compile_failure(g, NULL); return NULL; }
     for (uint32_t i = 0; i < n_index; i++) idx_ids[i] = index_cols[i]->id;
     uint32_t pcol_id = pivot_col->id;
     uint32_t vcol_id = value_col->id;
@@ -1240,13 +1276,16 @@ ray_op_t* ray_join(ray_graph_t* g,
                   ray_op_t* left_table, ray_op_t** left_keys,
                   ray_op_t* right_table, ray_op_t** right_keys,
                   uint32_t n_keys, uint8_t join_type) {
+    if (!left_table || !right_table) return NULL;   /* an input that failed to build */
+    if (!graph_ins_ok(left_keys, (uint32_t)n_keys)) return NULL;
+    if (!graph_ins_ok(right_keys, (uint32_t)n_keys)) return NULL;
     uint32_t left_table_id = left_table->id;
     uint32_t right_table_id = right_table->id;
     ray_t* keyids_hdr = NULL;
     size_t keyids_elems = (size_t)n_keys * 2;
     uint32_t* keyids_buf = (uint32_t*)scratch_alloc(&keyids_hdr,
                             (keyids_elems ? keyids_elems : 1) * sizeof(uint32_t));
-    if (!keyids_buf) return NULL;
+    if (!keyids_buf) { graph_compile_failure(g, NULL); return NULL; }
     uint32_t* lkey_ids = keyids_buf;
     uint32_t* rkey_ids = keyids_buf + n_keys;
     for (uint32_t i = 0; i < n_keys; i++) {
@@ -1288,13 +1327,16 @@ ray_op_t* ray_antijoin(ray_graph_t* g,
                       ray_op_t* left_table, ray_op_t** left_keys,
                       ray_op_t* right_table, ray_op_t** right_keys,
                       uint32_t n_keys) {
+    if (!left_table || !right_table) return NULL;   /* an input that failed to build */
+    if (!graph_ins_ok(left_keys, (uint32_t)n_keys)) return NULL;
+    if (!graph_ins_ok(right_keys, (uint32_t)n_keys)) return NULL;
     uint32_t left_table_id = left_table->id;
     uint32_t right_table_id = right_table->id;
     ray_t* keyids_hdr = NULL;
     size_t keyids_elems = (size_t)n_keys * 2;
     uint32_t* keyids_buf = (uint32_t*)scratch_alloc(&keyids_hdr,
                             (keyids_elems ? keyids_elems : 1) * sizeof(uint32_t));
-    if (!keyids_buf) return NULL;
+    if (!keyids_buf) { graph_compile_failure(g, NULL); return NULL; }
     uint32_t* lkey_ids = keyids_buf;
     uint32_t* rkey_ids = keyids_buf + n_keys;
     for (uint32_t i = 0; i < n_keys; i++) {
@@ -1336,13 +1378,15 @@ ray_op_t* ray_asof_join(ray_graph_t* g,
                        ray_op_t* time_key,
                        ray_op_t** eq_keys, uint32_t n_eq_keys,
                        uint8_t join_type) {
+    if (!left_table || !right_table || !time_key) return NULL;   /* an input that failed to build */
+    if (!graph_ins_ok(eq_keys, (uint32_t)n_eq_keys)) return NULL;
     uint32_t left_id  = left_table->id;
     uint32_t right_id = right_table->id;
     uint32_t time_id  = time_key->id;
     ray_t* eq_hdr = NULL;
     uint32_t* eq_ids = (uint32_t*)scratch_alloc(&eq_hdr,
                             (size_t)(n_eq_keys ? n_eq_keys : 1) * sizeof(uint32_t));
-    if (!eq_ids) return NULL;
+    if (!eq_ids) { graph_compile_failure(g, NULL); return NULL; }
     for (uint32_t i = 0; i < n_eq_keys; i++) eq_ids[i] = eq_keys[i]->id;
 
     /* Trailing: [eq_keys: n_eq_keys * ptr] */
@@ -1379,12 +1423,16 @@ ray_op_t* ray_window_op(ray_graph_t* g, ray_op_t* table_node,
                        int64_t* func_params, uint32_t n_funcs,
                        uint8_t frame_type, uint8_t frame_start, uint8_t frame_end,
                        int64_t frame_start_n, int64_t frame_end_n) {
+    if (!table_node) return NULL;   /* an input that failed to build */
+    if (!graph_ins_ok(part_keys, (uint32_t)n_part)) return NULL;
+    if (!graph_ins_ok(order_keys, (uint32_t)n_order)) return NULL;
+    if (!graph_ins_ok(func_inputs, (uint32_t)n_funcs)) return NULL;
     /* One carve for all three id arrays (all uint32_t; sliced by offset). */
     ray_t* ids_hdr = NULL;
     size_t ids_elems = (size_t)n_part + (size_t)n_order + (size_t)n_funcs;
     uint32_t* ids_buf = (uint32_t*)scratch_alloc(&ids_hdr,
                             (ids_elems ? ids_elems : 1) * sizeof(uint32_t));
-    if (!ids_buf) return NULL;
+    if (!ids_buf) { graph_compile_failure(g, NULL); return NULL; }
     uint32_t* part_ids  = ids_buf;
     uint32_t* order_ids = ids_buf + n_part;
     uint32_t* func_ids  = ids_buf + n_part + n_order;
@@ -1469,11 +1517,13 @@ ray_op_t* ray_window_op(ray_graph_t* g, ray_op_t* table_node,
 
 ray_op_t* ray_select_op(ray_graph_t* g, ray_op_t* input,
                         ray_op_t** cols, uint32_t n_cols) {
+    if (!input) return NULL;   /* an input that failed to build */
+    if (!graph_ins_ok(cols, (uint32_t)n_cols)) return NULL;
     uint32_t input_id = input->id;
     ray_t* ids_hdr = NULL;
     uint32_t* col_ids = (uint32_t*)scratch_alloc(&ids_hdr,
                             (size_t)(n_cols ? n_cols : 1) * sizeof(uint32_t));
-    if (!col_ids) return NULL;
+    if (!col_ids) { graph_compile_failure(g, NULL); return NULL; }
     for (uint32_t i = 0; i < n_cols; i++) col_ids[i] = cols[i]->id;
 
     size_t cols_sz = (size_t)n_cols * sizeof(ray_op_t*);
@@ -1502,6 +1552,7 @@ ray_op_t* ray_select_op(ray_graph_t* g, ray_op_t* input,
 /* L6: When n (stored as ext->sym) is 0, HEAD produces an empty result
    with the same schema as the input. */
 ray_op_t* ray_head(ray_graph_t* g, ray_op_t* input, int64_t n) {
+    if (!input) return NULL;   /* an input that failed to build */
     uint32_t input_id = input->id;
     ray_op_ext_t* ext = graph_alloc_ext_node(g);
     if (!ext) return NULL;
@@ -1520,6 +1571,7 @@ ray_op_t* ray_head(ray_graph_t* g, ray_op_t* input, int64_t n) {
 }
 
 ray_op_t* ray_tail(ray_graph_t* g, ray_op_t* input, int64_t n) {
+    if (!input) return NULL;   /* an input that failed to build */
     uint32_t input_id = input->id;
     ray_op_ext_t* ext = graph_alloc_ext_node(g);
     if (!ext) return NULL;
@@ -1538,6 +1590,7 @@ ray_op_t* ray_tail(ray_graph_t* g, ray_op_t* input, int64_t n) {
 }
 
 ray_op_t* ray_extract(ray_graph_t* g, ray_op_t* col, int64_t field) {
+    if (!col) return NULL;   /* an input that failed to build */
     uint32_t col_id = col->id;
     uint32_t est = col->est_rows;
 
@@ -1558,6 +1611,7 @@ ray_op_t* ray_extract(ray_graph_t* g, ray_op_t* col, int64_t field) {
 }
 
 ray_op_t* ray_date_trunc(ray_graph_t* g, ray_op_t* col, int64_t field) {
+    if (!col) return NULL;   /* an input that failed to build */
     /* Not a truncation unit (a TIMESTAMP takes every real one): no op. */
     if (!ray_temporal_trunc_type(RAY_TIMESTAMP, (int)field)) return NULL;
     /* The result keeps the column's type.  A pairing the type does not allow
@@ -1641,6 +1695,7 @@ ray_op_t* ray_scan_table(ray_graph_t* g, uint16_t table_id, const char* col_name
 
 ray_op_t* ray_expand(ray_graph_t* g, ray_op_t* src_nodes,
                     ray_rel_t* rel, uint8_t direction) {
+    if (!src_nodes) return NULL;   /* an input that failed to build */
     uint32_t src_id = src_nodes->id;
     uint32_t est = src_nodes->est_rows;
 
@@ -1667,6 +1722,7 @@ ray_op_t* ray_var_expand(ray_graph_t* g, ray_op_t* start_nodes,
                         ray_rel_t* rel, uint8_t direction,
                         uint8_t min_depth, uint8_t max_depth,
                         bool track_path) {
+    if (!start_nodes) return NULL;   /* an input that failed to build */
     uint32_t src_id = start_nodes->id;
     uint32_t est = start_nodes->est_rows;
 
@@ -1691,6 +1747,7 @@ ray_op_t* ray_var_expand(ray_graph_t* g, ray_op_t* start_nodes,
 
 ray_op_t* ray_shortest_path(ray_graph_t* g, ray_op_t* src, ray_op_t* dst,
                            ray_rel_t* rel, uint8_t max_depth) {
+    if (!src || !dst) return NULL;   /* an input that failed to build */
     uint32_t src_id = src->id;
     uint32_t dst_id = dst->id;
 

@@ -26,23 +26,21 @@
 
 ray_t* ray_nfo_create(const char* filename, size_t fname_len,
                       const char* source,   size_t src_len) {
+    /* A part that fails to allocate: no nfo (NULL), the parts made freed.
+     * An error object here would be kept by callers, which take the nfo as
+     * optional and release it (a no-op on an error), and read as a list. */
     ray_t* fname = ray_str(filename, fname_len);
-    if (RAY_IS_ERR(fname)) return fname;
-
-    ray_t* src = ray_str(source, src_len);
-    if (RAY_IS_ERR(src)) { ray_release(fname); return src; }
-
-    ray_t* keys = ray_vec_new(RAY_I64, 0);
-    if (RAY_IS_ERR(keys)) { ray_release(fname); ray_release(src); return keys; }
-
-    ray_t* vals = ray_vec_new(RAY_I64, 0);
-    if (RAY_IS_ERR(vals)) { ray_release(fname); ray_release(src); ray_release(keys); return vals; }
-
-    /* Build the nfo list: alloc 4-slot list, set elements directly. */
-    ray_t* nfo = ray_alloc(4 * sizeof(ray_t*));
+    ray_t* src   = fname && !RAY_IS_ERR(fname) ? ray_str(source, src_len) : NULL;
+    ray_t* keys  = src && !RAY_IS_ERR(src) ? ray_vec_new(RAY_I64, 0) : NULL;
+    ray_t* vals  = keys && !RAY_IS_ERR(keys) ? ray_vec_new(RAY_I64, 0) : NULL;
+    ray_t* nfo   = vals && !RAY_IS_ERR(vals) ? ray_alloc(4 * sizeof(ray_t*)) : NULL;
     if (!nfo || RAY_IS_ERR(nfo)) {
-        ray_release(fname); ray_release(src); ray_release(keys); ray_release(vals);
-        return ray_error("oom", NULL);
+        ray_t* parts[5] = { fname, src, keys, vals, nfo };
+        for (int i = 0; i < 5; i++) {
+            if (parts[i] && RAY_IS_ERR(parts[i])) ray_error_free(parts[i]);
+            else if (parts[i]) ray_release(parts[i]);
+        }
+        return NULL;
     }
     nfo->type = RAY_LIST;
     nfo->len = 4;
@@ -63,15 +61,19 @@ void ray_nfo_insert(ray_t* nfo, ray_t* node, ray_span_t span) {
     ray_t* vals = NFO_VALS(nfo);
     if (!keys || !vals) return;
 
-    ray_t* new_keys = ray_vec_append(keys, &key);
-    ray_t* new_vals = ray_vec_append(vals, &val);
-
     /* If vec_append reallocated, update the nfo list slots directly.
      * ray_vec_append already transferred ownership (the old pointer is
      * invalid), so we just swap the slot pointer; no retain/release needed
-     * since the list already owns one ref from the original append. */
+     * since the list already owns one ref from the original append.  An
+     * append that fails to grow leaves its vector as it was: the span goes
+     * unrecorded, its key taken back if only the value failed, and the
+     * error is freed, never kept in a slot. */
     ray_t** slots = (ray_t**)ray_data(nfo);
+    ray_t* new_keys = ray_vec_append(keys, &key);
+    if (!new_keys || RAY_IS_ERR(new_keys)) { ray_error_free(new_keys); return; }
     if (new_keys != keys) slots[2] = new_keys;
+    ray_t* new_vals = ray_vec_append(vals, &val);
+    if (!new_vals || RAY_IS_ERR(new_vals)) { ray_error_free(new_vals); new_keys->len--; return; }
     if (new_vals != vals) slots[3] = new_vals;
 }
 

@@ -133,6 +133,12 @@ static void nth_element_i64(int64_t* a, int64_t lo, int64_t hi, int64_t k) {
     if (!g) return ray_error("oom", NULL);                  \
     ray_op_t* in = ray_graph_input_vec(g, x);              \
     ray_op_t* op = ctor(g, in);                            \
+    if (!op && g->compile_err) {   /* a node failed: its error */ \
+        ray_t* err_ = g->compile_err;                       \
+        g->compile_err = NULL;                              \
+        ray_graph_free(g);                                  \
+        return err_;                                        \
+    }                                                       \
     return ray_lazy_wrap(g, op);                            \
 } while(0)
 

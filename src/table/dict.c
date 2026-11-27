@@ -528,8 +528,9 @@ ray_t* ray_dict_upsert(ray_t* d, ray_t* key_atom, ray_t* val) {
         ray_t* k0 = ray_dict_slots(d)[0];
         if (k0 && k0->type == RAY_SYM &&
             ray_sym_vec_domain(k0) != ray_sym_runtime_domain()) {
-            d = ray_cow(d);
-            if (!d || RAY_IS_ERR(d)) return d;
+            ray_t* dc = ray_cow(d);   /* a failed copy keeps d: consumed here */
+            if (!dc || RAY_IS_ERR(dc)) { ray_release(d); return dc ? dc : ray_error("oom", NULL); }
+            d = dc;
             ray_t** sl = ray_dict_slots(d);
             ray_t* rk = dict_sym_keys_to_runtime(sl[0]);
             if (!rk || RAY_IS_ERR(rk)) {
@@ -543,9 +544,11 @@ ray_t* ray_dict_upsert(ray_t* d, ray_t* key_atom, ray_t* val) {
 
     int64_t idx = ray_dict_find_idx(d, key_atom);
 
-    /* COW the dict; the slots remain shared until we COW them too. */
-    d = ray_cow(d);
-    if (!d || RAY_IS_ERR(d)) return d;
+    /* COW the dict; the slots remain shared until we COW them too.  A
+     * failed copy keeps d, which this consumes. */
+    ray_t* dc = ray_cow(d);
+    if (!dc || RAY_IS_ERR(dc)) { ray_release(d); return dc ? dc : ray_error("oom", NULL); }
+    d = dc;
 
     ray_t** slots = ray_dict_slots(d);
     ray_t* keys = slots[0];
@@ -658,8 +661,9 @@ ray_t* ray_dict_remove(ray_t* d, ray_t* key_atom) {
     int64_t idx = ray_dict_find_idx(d, key_atom);
     if (idx < 0) return d;
 
-    d = ray_cow(d);
-    if (!d || RAY_IS_ERR(d)) return d;
+    ray_t* dc = ray_cow(d);   /* a failed copy keeps d: consumed here */
+    if (!dc || RAY_IS_ERR(dc)) { ray_release(d); return dc ? dc : ray_error("oom", NULL); }
+    d = dc;
 
     ray_t** slots = ray_dict_slots(d);
     ray_t* keys = slots[0];

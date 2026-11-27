@@ -65,7 +65,7 @@ ray_t* materialize_mapcommon(ray_t* mc) {
     for (int64_t p = 0; p < n_parts; p++) total += counts[p];
 
     ray_t* flat = ray_vec_new(kv_type, total);
-    if (!flat || RAY_IS_ERR(flat)) return ray_error("oom", NULL);
+    if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
     flat->len = total;
     /* SYM keys are raw cell ids of the MAPCOMMON keys carrier — the
      * flat output resolves over ITS dictionary (sym-domain Phase 2;
@@ -109,7 +109,7 @@ ray_t* materialize_mapcommon_head(ray_t* mc, int64_t n) {
     const int64_t* counts = (const int64_t*)ray_data(rc);
 
     ray_t* flat = ray_vec_new(kv_type, n);
-    if (!flat || RAY_IS_ERR(flat)) return ray_error("oom", NULL);
+    if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
     flat->len = n;
     /* raw SYM cell ids — adopt the keys carrier's domain (see above) */
     if (kv_type == RAY_SYM) ray_sym_vec_adopt_domain(flat, kv);
@@ -150,7 +150,7 @@ ray_t* materialize_mapcommon_gather(ray_t* mc, const int64_t* idx, int64_t n) {
     const int64_t* counts = (const int64_t*)ray_data(rc);
 
     ray_t* flat = ray_vec_new(kv_type, n);
-    if (!flat || RAY_IS_ERR(flat)) return ray_error("oom", NULL);
+    if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
     flat->len = n;
     /* raw SYM cell ids — adopt the keys carrier's domain (see above) */
     if (kv_type == RAY_SYM) ray_sym_vec_adopt_domain(flat, kv);
@@ -180,7 +180,7 @@ ray_t* materialize_mapcommon_filter(ray_t* mc, ray_t* pred, int64_t pass_count) 
     const int64_t* counts = (const int64_t*)ray_data(rc);
 
     ray_t* flat = ray_vec_new(kv_type, pass_count);
-    if (!flat || RAY_IS_ERR(flat)) return ray_error("oom", NULL);
+    if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
     flat->len = pass_count;
     /* raw SYM cell ids — adopt the keys carrier's domain (see above) */
     if (kv_type == RAY_SYM) ray_sym_vec_adopt_domain(flat, kv);
@@ -6298,8 +6298,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 int64_t ncols = ray_table_ncols(input);
                 int64_t nrows = ray_table_nrows(input);
                 if (n > nrows) n = nrows;
+                /* a column that fails to build is the answer's failure,
+                 * never a table short of it */
                 ray_t* result = ray_table_new(ncols);
-                for (int64_t c = 0; c < ncols; c++) {
+                if (!result || RAY_IS_ERR(result)) { ray_release(input); return result ? result : ray_error("oom", NULL); }
+                for (int64_t c = 0; c < ncols && !RAY_IS_ERR(result); c++) {
                     ray_t* col = ray_table_col_idx(input, c);
                     int64_t name_id = ray_table_col_name(input, c);
                     if (col && RAY_IS_ERR(col)) {
@@ -6310,10 +6313,12 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     if (!col) continue;
                     if (col->type == RAY_MAPCOMMON) {
                         ray_t* mc_head = materialize_mapcommon_head(col, n);
-                        if (mc_head && !RAY_IS_ERR(mc_head)) {
-                            result = ray_table_add_col(result, name_id, mc_head);
-                            ray_release(mc_head);
+                        if (!mc_head || RAY_IS_ERR(mc_head)) {
+                            ray_release(result); ray_release(input);
+                            return mc_head ? mc_head : ray_error("oom", NULL);
                         }
+                        result = ray_table_add_col(result, name_id, mc_head);
+                        ray_release(mc_head);
                         continue;
                     }
                     if (RAY_IS_PARTED(col->type)) {
@@ -6364,10 +6369,18 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                                              sym_domain_rep(col));
                             }
                         }
+                        if (!head_vec || RAY_IS_ERR(head_vec)) {
+                            ray_release(result); ray_release(input);
+                            return head_vec ? head_vec : ray_error("oom", NULL);
+                        }
                         result = ray_table_add_col(result, name_id, head_vec);
                         ray_release(head_vec);
                     } else if (col->type == RAY_LIST) {
                         ray_t* lcol = list_slice_retain(col, 0, n);
+                        if (!lcol || RAY_IS_ERR(lcol)) {
+                            ray_release(result); ray_release(input);
+                            return lcol ? lcol : ray_error("oom", NULL);
+                        }
                         result = ray_table_add_col(result, name_id, lcol);
                         ray_release(lcol);
                     } else {
@@ -6387,6 +6400,10 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                              * the source's pool by offset (issue #404) */
                             if (col->type == RAY_STR)
                                 col_propagate_str_pool(head_vec, col);
+                        }
+                        if (!head_vec || RAY_IS_ERR(head_vec)) {
+                            ray_release(result); ray_release(input);
+                            return head_vec ? head_vec : ray_error("oom", NULL);
                         }
                         result = ray_table_add_col(result, name_id, head_vec);
                         ray_release(head_vec);
@@ -7122,7 +7139,7 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
             ray_t* flat = ray_vec_new(kv_type, seg_rows);
             if (!flat || RAY_IS_ERR(flat)) {
                 ray_release(seg_tbl);
-                return ray_error("oom", NULL);
+                return flat ? flat : ray_error("oom", NULL);
             }
             flat->len = seg_rows;
             const char* src = (const char*)ray_data(kv) + (size_t)seg_idx * esz;
@@ -7770,7 +7787,16 @@ ray_t* exec_flatten_parted_table(ray_t* tbl) {
 
 static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cancel) {
     ray_enc_note_exec_start();
-    if (!g || !root) return ray_error("nyi", NULL);
+    if (!g || !root) {
+        /* A node that failed to allocate leaves a NULL root and its failure
+         * (oom) in compile_err: answer that, not "not implemented". */
+        if (g && g->compile_err) {
+            ray_t* e = g->compile_err;
+            g->compile_err = NULL;
+            return e;
+        }
+        return ray_error("nyi", NULL);
+    }
 
     /* Lazy-init the global thread pool on first call */
     ray_pool_t* pool = ray_pool_get();
@@ -7992,7 +8018,7 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cance
         int64_t ncols = ray_table_ncols(saved_table);
         ray_t* empty_tbl = ray_table_new(ncols);
         if (empty_tbl && !RAY_IS_ERR(empty_tbl)) {
-            for (int64_t c = 0; c < ncols; c++) {
+            for (int64_t c = 0; c < ncols && empty_tbl && !RAY_IS_ERR(empty_tbl); c++) {
                 int64_t name_id = ray_table_col_name(saved_table, c);
                 ray_col_meta_t m;
                 if (!ray_table_col_meta_idx(saved_table, c, &m)) continue;
@@ -8009,14 +8035,23 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cance
                     /* ray_vec_new rejects RAY_LIST (type 0) and other
                      * non-standard types; fall back to a raw 0-length
                      * block with the correct type tag. */
+                    ray_error_free(ecol);
                     ecol = ray_alloc(0);
-                    if (!ecol || RAY_IS_ERR(ecol)) continue;
+                    if (!ecol || RAY_IS_ERR(ecol)) {   /* never a schema short of it */
+                        ray_release(empty_tbl);
+                        empty_tbl = ecol ? ecol : ray_error("oom", NULL);
+                        break;
+                    }
                     ecol->type = base;
                     ecol->len = 0;
                 }
                 empty_tbl = ray_table_add_col(empty_tbl, name_id, ecol);
                 ray_release(ecol);
             }
+        }
+        if (!empty_tbl || RAY_IS_ERR(empty_tbl)) {
+            result = empty_tbl ? empty_tbl : ray_error("oom", NULL);
+        } else {
             g->table = empty_tbl;
             if (g->selection) ray_release(g->selection);
             g->selection = NULL;
