@@ -150,6 +150,8 @@ void ray_rowsel_release(ray_t* block);
  *     selection", same as g->selection == NULL).
  *   - A fresh rowsel block (rc=1) otherwise, including the
  *     none-pass case (zero-length idx, all flags NONE).
+ *   - An `oom` error when a buffer fails to allocate: never NULL, which
+ *     would keep every row (#1818).
  *
  * The build runs in two parallel passes when nrows is large enough
  * to benefit (>= RAY_PARALLEL_THRESHOLD): pass 1 computes per-segment
@@ -178,7 +180,8 @@ ray_t* ray_rowsel_to_indices(ray_t* sel);
  * g->selection.  Walks `existing`'s surviving rows, tests pred at each,
  * emits a new rowsel containing only the positions that pass both.
  * Returns NULL if the result is all-pass (impossible here unless
- * existing was already all-pass), or a fresh block otherwise.
+ * existing was already all-pass), a fresh block otherwise, or an `oom`
+ * error when a buffer fails to allocate.
  *
  * Does not consume `existing` — caller is responsible for releasing
  * the old selection after replacing it. */
@@ -223,11 +226,15 @@ typedef struct {
     uint32_t  idx_cap;     /* idx[] capacity in uint16_t entries        */
     uint32_t  idx_len;     /* idx[] occupancy in uint16_t entries       */
     int64_t   total_pass;  /* passing rows (ALL + MIX) across segments  */
+    bool      oom;         /* an array failed to allocate: the emits do
+                            * nothing and finish answers NULL           */
 } rowsel_builder_t;
 
 /* Initialize a builder to cover `n_segs` segments.  Allocates
  * seg_flags[n_segs], seg_off[n_segs+1], and a geometrically growable
- * idx[] via the raw allocator.  All counters start at zero. */
+ * idx[] via the raw allocator.  All counters start at zero.  An array
+ * that fails to allocate (here or as idx[] grows) marks the builder oom:
+ * its emits then do nothing, and rowsel_builder_finish answers NULL. */
 void rowsel_builder_init(rowsel_builder_t* b, uint32_t n_segs);
 
 /* Classify one morsel's `n` bools (n <= RAY_MORSEL_ELEMS) into segment
@@ -271,7 +278,7 @@ void rowsel_emit_runs(rowsel_builder_t* b, uint32_t seg, const uint16_t* ends,
  * block with the standard layout: seg_flags, seg_offsets (prefix sum
  * into idx[]), idx[].  Byte-identical to ray_rowsel_from_pred over the
  * same bools.  Frees each builder's scratch arrays before returning.
- * Returns NULL on OOM.
+ * Returns NULL on OOM, a builder's included.
  *
  * INVARIANT: sum(builders[w].n_segs for w in 0..n_workers) must equal
  * ceil(nrows / RAY_MORSEL_ELEMS).  Violated if a partition over-covers

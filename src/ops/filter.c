@@ -221,6 +221,7 @@ static ray_t* exec_filter_seq(ray_t* input, ray_t* pred, int64_t ncols,
                 }
                 sel = ray_rowsel_from_pred(pred);
                 sel_built = true;
+                if (sel && RAY_IS_ERR(sel)) { ray_release(tbl); return sel; }
                 if (!sel && pass_count != pred->len) { ray_release(tbl); return ray_error("oom", NULL); }
             }
             ray_t* gc = NULL;
@@ -1373,7 +1374,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
     if (pass_count == 0) {
         int64_t ncols = ray_table_ncols(tbl);
         ray_t* empty = ray_table_new(ncols);
-        if (!empty || RAY_IS_ERR(empty)) return empty;
+        if (!empty || RAY_IS_ERR(empty)) return empty ? empty : ray_error("oom", NULL);
         for (int64_t c = 0; c < ncols; c++) {
             if (use_keep &&
                 !sel_compact_keep(ray_table_col_name(tbl, c), keep_syms, keep_n))
@@ -1384,9 +1385,10 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                 ray_t* col = ray_table_col_idx(tbl, c);
                 if (!col || RAY_IS_ERR(col)) { ray_release(empty); return col; }
                 ray_t* mc = materialize_mapcommon_head(col, 0);
-                if (!mc || RAY_IS_ERR(mc)) { ray_release(empty); return mc; }
+                if (!mc || RAY_IS_ERR(mc)) { ray_release(empty); return mc ? mc : ray_error("oom", NULL); }
                 empty = ray_table_add_col(empty, ray_table_col_name(tbl, c), mc);
                 ray_release(mc);
+                if (!empty || RAY_IS_ERR(empty)) return empty ? empty : ray_error("oom", NULL);
                 continue;
             }
             int8_t ct = RAY_IS_PARTED(cm.type)
@@ -1397,12 +1399,11 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
             /* Even an empty partial can supply the symbol dictionary for a merge. */
             ray_t* nc = ct == RAY_SYM ? ray_tbl_col_empty(tbl, ray_table_col_name(tbl, c))
                       : ct == RAY_LIST ? ray_list_new(0) : ray_vec_new(ct, 0);
-            if (!nc || RAY_IS_ERR(nc)) { ray_release(empty); return nc; }
-            if (nc && !RAY_IS_ERR(nc)) {
-                nc->len = 0;
-                empty = ray_table_add_col(empty, ray_table_col_name(tbl, c), nc);
-                ray_release(nc);
-            }
+            if (!nc || RAY_IS_ERR(nc)) { ray_release(empty); return nc ? nc : ray_error("oom", NULL); }
+            nc->len = 0;
+            empty = ray_table_add_col(empty, ray_table_col_name(tbl, c), nc);
+            ray_release(nc);
+            if (!empty || RAY_IS_ERR(empty)) return empty ? empty : ray_error("oom", NULL);
         }
         return empty;
     }
@@ -1431,13 +1432,14 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
     if (!try_runs) {
         ray_t* fail = sel_compact_idx(sel, nrows, pass_count, NULL, &match_idx, &idx_hdr);
         if (fail) return fail;
-        if (!match_idx) { ray_retain(tbl); return tbl; }
+        /* never the table as it is: that would be every row (#1818) */
+        if (!match_idx) return ray_error("oom", NULL);
     }
 
     /* Parallel multi-column gather (same pattern as exec_filter) */
     ray_pool_t* pool = ray_pool_get();
     ray_t* out = ray_table_new(ncols);
-    if (!out || RAY_IS_ERR(out)) { scratch_free(idx_hdr); return out; }
+    if (!out || RAY_IS_ERR(out)) { scratch_free(idx_hdr); return out ? out : ray_error("oom", NULL); }
 
     /* VLA guard: 256 cols max for stack arrays */
     if (ncols > 256) { scratch_free(idx_hdr); ray_release(out); return ray_error("limit", "table exceeds 256 columns"); }
@@ -1451,6 +1453,11 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
     bool any_runs = false;    /* a column gathers by runs */
     bool has_mapc = false;    /* a MAPCOMMON column */
     int64_t max_segs = 0;
+    /* A failure from here on is the answer (sc_fail), never a table short
+     * of a column or the rows unselected (#1818). */
+    memset(new_cols, 0, sizeof new_cols);
+    ray_t* plan_hdr = NULL;
+    ray_t* sc_err = NULL;
 
 
     for (int64_t c = 0; c < ncols; c++) {
@@ -1511,7 +1518,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         ray_t* nc = (ct == RAY_LIST)
                   ? ray_list_new(pass_count)
                   : typed_vec_new(ct, ca, pass_count);
-        if (!nc || RAY_IS_ERR(nc)) { new_cols[c] = NULL; continue; }
+        if (!nc || RAY_IS_ERR(nc)) { sc_err = nc ? nc : ray_error("oom", NULL); goto sc_fail; }
         nc->len = pass_count;
         new_cols[c] = nc;
     }
@@ -1540,7 +1547,6 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
 
     /* The selection's morsels: each one's first output cell, for the
      * columns gathered by runs.  Without the buffers they read match_idx. */
-    ray_t* plan_hdr = NULL;
     sel_runs_plan_t plan = {
         .flags = flags, .offsets = offsets, .idx = sidx, .nrows = nrows,
         .n_morsels = n_segs, .count = pass_count,
@@ -1561,16 +1567,9 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
     /* match_idx for the columns that read it, when not built up front */
     if (need_idx && !match_idx) {
         ray_t* fail = sel_compact_idx(sel, nrows, pass_count, plan.mdst, &match_idx, &idx_hdr);
-        if (fail || !match_idx) {
-            /* no index: the table as it is (the caller gathers it another
-             * way); a cancel: the cancel */
-            for (int64_t c = 0; c < ncols; c++)
-                if (new_cols[c]) ray_release(new_cols[c]);
-            ray_release(out);
-            scratch_free(plan_hdr);
-            if (fail) return fail;
-            ray_retain(tbl);
-            return tbl;
+        if (fail || !match_idx) {   /* a cancel, or no index: oom */
+            sc_err = fail ? fail : ray_error("oom", NULL);
+            goto sc_fail;
         }
     }
 
@@ -1588,7 +1587,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         const char* kdata = (const char*)ray_data(kv);
         const int64_t* counts = (const int64_t*)ray_data(rc);
         ray_t* flat = ray_vec_new(kv_type, pass_count);
-        if (!flat || RAY_IS_ERR(flat)) continue;
+        if (!flat || RAY_IS_ERR(flat)) { sc_err = flat ? flat : ray_error("oom", NULL); goto sc_fail; }
         flat->len = pass_count;
         char* out_mc = (char*)ray_data(flat);
         for (int64_t i = 0; i < pass_count; i++) {
@@ -1620,9 +1619,10 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
             new_cols[c] = parted_gather_list_rows_c((ray_t**)ray_data(col),
                                                   col->len, match_idx,
                                                   pass_count, cnt, ncnt);
-            if (new_cols[c] && RAY_IS_ERR(new_cols[c])) {
-                ray_error_free(new_cols[c]);
+            if (!new_cols[c] || RAY_IS_ERR(new_cols[c])) {
+                sc_err = new_cols[c] ? new_cols[c] : ray_error("oom", NULL);
                 new_cols[c] = NULL;
+                goto sc_fail;
             }
             continue;
         }
@@ -1664,6 +1664,11 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                     new_cols[c] = parted_gather_str_rows_c(psegs, col->len,
                                                            match_idx, pass_count,
                                                            cnt, ncnt);
+                    if (!new_cols[c] || RAY_IS_ERR(new_cols[c])) {
+                        sc_err = new_cols[c] ? new_cols[c] : ray_error("oom", NULL);
+                        new_cols[c] = NULL;
+                        goto sc_fail;
+                    }
                 } else {
                     cancelled = !sel_parted_gather(pool, &plan, col, any_runs && by_runs[c], match_idx,
                                                    new_cols[c], cnt, ncnt);
@@ -1748,9 +1753,18 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
             ray_sym_vec_adopt_domain(new_cols[c], sym_domain_rep(scol));
         out = ray_table_add_col(out, col_names[c], new_cols[c]);
         ray_release(new_cols[c]);
+        new_cols[c] = NULL;
     }
 
     scratch_free(idx_hdr);
     scratch_free(plan_hdr);
     return out;
+
+sc_fail:
+    for (int64_t c = 0; c < ncols; c++)
+        if (new_cols[c]) ray_release(new_cols[c]);
+    if (out) ray_release(out);
+    scratch_free(idx_hdr);
+    scratch_free(plan_hdr);
+    return sc_err;
 }

@@ -1752,7 +1752,9 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
 
     /* Build temporary DAG on the materialized result */
     ray_graph_t* g = ray_graph_new(result);
-    if (!g) return result;
+    /* a failed graph is the failure: never the rows unsorted or untaken.
+     * result is consumed here, as on every other exit */
+    if (!g) { ray_release(result); return ray_error("oom", NULL); }
     ray_op_t* root = ray_const_table(g, result);
 
     /* Sort */
@@ -18881,14 +18883,15 @@ static ray_t* count_select_on(ray_t* tbl, ray_t* where_expr, int* handled) {
         if (handled) *handled = 1;
         int64_t nrows = ray_table_nrows(tbl);
         ray_t* sel = ray_rowsel_from_pred(pred_vec);
+        ray_release(pred_vec);
+        ray_graph_free(g);
+        ray_release(tbl);
+        if (sel && RAY_IS_ERR(sel)) return sel;   /* never every row's count */
         if (sel) {
             ray_rowsel_t* sm = ray_rowsel_meta(sel);
             nrows = sm ? sm->total_pass : 0;
             ray_release(sel);
         }
-        ray_release(pred_vec);
-        ray_graph_free(g);
-        ray_release(tbl);
         return ray_i64(nrows);
     }
     int has_scan = 0;
@@ -18964,14 +18967,15 @@ static ray_t* count_select_on(ray_t* tbl, ray_t* where_expr, int* handled) {
     if (handled) *handled = 1;
     int64_t nrows = tbl_nrows;
     ray_t* sel = ray_rowsel_from_pred(pred_vec);
+    ray_release(pred_vec);
+    ray_graph_free(g);
+    ray_release(tbl);
+    if (sel && RAY_IS_ERR(sel)) return sel;   /* never every row's count */
     if (sel) {
         ray_rowsel_t* sm = ray_rowsel_meta(sel);
         nrows = sm ? sm->total_pass : 0;
         ray_release(sel);
     }
-    ray_release(pred_vec);
-    ray_graph_free(g);
-    ray_release(tbl);
     return ray_i64(nrows);
 }
 
@@ -26956,6 +26960,7 @@ static ray_t* parted_rows_open(parted_rows_t* pr, ray_t* tbl, const int64_t* rv,
     if (nsel != nrows) {
         pr->sel = ray_rowsel_from_pred(mask);
         if (!pr->sel) err = ray_error("oom", NULL);
+        else if (RAY_IS_ERR(pr->sel)) { err = pr->sel; pr->sel = NULL; }
     }
     if (!err && !ascending) {
         pr->perm = (int64_t*)scratch_alloc(&pr->perm_hdr, (size_t)n * sizeof(int64_t));
@@ -27118,8 +27123,12 @@ static ray_t* select_parted_first_rows(ray_t* dict, ray_t* tbl, unsigned plan) {
     ray_t* engine = dict;
     ray_retain(engine);
     ray_t* k_from = ray_sym(ray_sym_intern("from", 4));
-    if (k_from && !RAY_IS_ERR(k_from)) engine = ray_dict_upsert(engine, k_from, narrow);
-    if (k_from) ray_release(k_from);
+    if (!k_from || RAY_IS_ERR(k_from)) {   /* never the select over the parted table */
+        ray_release(engine); ray_release(narrow); scratch_free(buf_hdr);
+        return k_from ? k_from : ray_error("oom", NULL);
+    }
+    engine = ray_dict_upsert(engine, k_from, narrow);
+    ray_release(k_from);
     ray_release(narrow);
     if (!engine || RAY_IS_ERR(engine)) { scratch_free(buf_hdr); return engine ? engine : ray_error("oom", NULL); }
     ray_t* res = ray_select_impl(&engine, 1, plan);
@@ -35871,7 +35880,11 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
     ray_t* out = NULL;
     ray_t* cerr = NULL;
     bool if_refused = false;
-    ray_graph_t* g = dag_declined && *dag_declined ? NULL : ray_graph_new(sub);
+    bool declined = dag_declined && *dag_declined;
+    ray_graph_t* g = declined ? NULL : ray_graph_new(sub);
+    /* A graph that failed to allocate is the failure, not the planner
+     * declining: the interpreter below reads every row, not the where: rows */
+    if (!g && !declined) return ray_error("oom", NULL);
     if (g) {
         ray_op_t* op = compile_expr_dag(g, expr);
         if (op) {
@@ -35883,10 +35896,14 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
             if (mask)
                 for (uint32_t i = 0; i < g->node_count; i++)
                     if (g->nodes[i].flags & OP_FLAG_XBAR) { rows = ray_rowsel_from_pred(mask); break; }
-            g->xbar_rows = rows;          /* the rows where: updates */
-            out = ray_execute(g, op);
-            g->xbar_rows = NULL;
-            if (rows) ray_rowsel_release(rows);
+            if (rows && RAY_IS_ERR(rows)) {   /* never every row */
+                out = rows;
+            } else {
+                g->xbar_rows = rows;          /* the rows where: updates */
+                out = ray_execute(g, op);
+                g->xbar_rows = NULL;
+                if (rows) ray_rowsel_release(rows);
+            }
         } else {
             cerr = graph_take_compile_err(g);
             if (dag_declined) *dag_declined = true;

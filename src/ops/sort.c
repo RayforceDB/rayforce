@@ -4291,7 +4291,8 @@ ray_t* exec_sort_head_sel(ray_graph_t* g, ray_op_t* op, ray_t* tbl, ray_t* sel, 
     if (!pr || !rows || !perm || RAY_IS_ERR(perm)) {
         if (ph) scratch_free(ph);
         if (rh) scratch_free(rh);
-        if (perm && !RAY_IS_ERR(perm)) ray_release(perm);
+        if (perm && RAY_IS_ERR(perm)) ray_error_free(perm);   /* errors are not refcounted */
+        else if (perm) ray_release(perm);
         ray_release(idx);
         return ray_error("oom", NULL);
     }
