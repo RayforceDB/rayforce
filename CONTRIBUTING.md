@@ -46,11 +46,12 @@ merge queue batches landings, so there are no roll-up pull requests.
    (`feat:`, `fix:`, `perf:`, `docs:`, `refactor:`, `test:`, `chore:`) — the
    release notes are generated from these prefixes, so they matter. A change
    that removes or renames something users call, or changes an answer they
-   rely on, ends its description with a `BREAKING CHANGE:` trailer naming what
-   changed and what to use instead (`BREAKING CHANGE: stddev_pop is removed;
-   use dev_pop.`). It goes in the last paragraph, after a blank line, on one
-   line or continued on indented lines. The release notes list it under
-   **Breaking changes** ([RELEASE.md](RELEASE.md#release-notes)).
+   rely on, ends its **commit message** with a `BREAKING CHANGE:` trailer
+   naming what changed and what to use instead (`BREAKING CHANGE: stddev_pop
+   is removed; use dev_pop.`). It goes in the message's last paragraph, after a
+   blank line, on one line or continued on indented lines, with the other
+   trailers (`Fixes #n`). The release notes list it under **Breaking changes**
+   ([RELEASE.md](RELEASE.md#release-notes)).
 3. Make sure the build is clean and tests pass locally:
 
    ```sh
@@ -83,9 +84,15 @@ merge queue batches landings, so there are no roll-up pull requests.
 2. The branch does **not** need to be up to date with `dev`: do not merge
    `dev` into it or rebase it only to catch up. The queue tests it against the
    `dev` it will land on.
-3. **Before queueing**, make the pull request's title and description final:
-   the queue squash-merges with them, so the title must be a conventional
-   commit (`fix(scope): ...`) and the description the commit body.
+3. **Before queueing**, make the commit message final. With one commit, the
+   queue squash-merges with that commit's subject and message (the repository's
+   settings are `COMMIT_OR_PR_TITLE` and `COMMIT_MESSAGES`), not the pull
+   request's title or description. With more than one, it takes the pull
+   request's title and joins the commits' messages. So the subject must be a
+   conventional commit (`fix(scope): ...`) and match the pull request's title.
+   Everything that must reach `dev` goes in the commit message: the
+   explanation, and the trailers in its last paragraph (`Fixes #n`,
+   `BREAKING CHANGE: ...`). The description mirrors the commit message.
 4. **Queue it** once `rayforce-audit` and `ci-success` are green:
    `gh pr merge <n> --squash`, or the **Merge when ready** button.
 5. The queue builds it on top of the pull requests ahead of it and runs the

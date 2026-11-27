@@ -108,9 +108,11 @@ Only the trailer block is read: the message's last paragraph, by git's trailer
 rules (`git interpret-trailers`). A line starting with whitespace continues the
 trailer above it, and the next `Key: value` line or any other line ends it.
 The words `BREAKING CHANGE:` in an earlier paragraph, or in a code block, are
-prose and are not listed. A pull request's description becomes its squash
-commit's body, so the trailer goes in the description's last paragraph, after
-a blank line:
+prose and are not listed. The closing lines (`Fixes #n`, `Refs #n`,
+`Closes #n`, `Part of #n`) may share that paragraph. The queue squash-merges
+with the commit's message, not the pull request's description, so the
+trailer goes in the commit message's last paragraph, after a blank line (the
+description mirrors it):
 
 ```
 BREAKING CHANGE: stddev_pop is removed; use dev_pop.
