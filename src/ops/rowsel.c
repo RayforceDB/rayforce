@@ -144,7 +144,7 @@ ray_t* ray_rowsel_from_pred(ray_t* pred) {
     /* Temporary popcount[seg] buffer.  ray_alloc returns a ray_t*
      * whose data area is the byte buffer we need. */
     ray_t* pop_block = ray_alloc((size_t)n_segs * sizeof(uint32_t));
-    if (!pop_block) return NULL;
+    if (!pop_block) return ray_error("oom", NULL);   /* NULL is every row */
     uint32_t* popcount = (uint32_t*)ray_data(pop_block);
 
     /* Pass 1 — parallel popcount per segment. */
@@ -187,7 +187,7 @@ ray_t* ray_rowsel_from_pred(ray_t* pred) {
     ray_t* block = ray_rowsel_new(nrows, total_pass, idx_count);
     if (!block) {
         ray_release(pop_block);
-        return NULL;
+        return ray_error("oom", NULL);
     }
 
     /* Fill seg_flags + seg_offsets in a second sequential walk over
@@ -263,17 +263,25 @@ void rowsel_builder_init(rowsel_builder_t* b, uint32_t n_segs) {
     b->idx        = (uint16_t*)ray_alloc_raw((size_t)b->idx_cap * sizeof(uint16_t));
     b->idx_len    = 0;
     b->total_pass = 0;
-    /* All three allocs must succeed — raw allocator is fatal-by-contract
-     * (no recovery path in Rayforce; same as ray_alloc failure callers).
-     * Checked explicitly: an assert would compile away under -DNDEBUG and
-     * leave the NULL for the next line to dereference (#652). */
-    if (!b->seg_flags || !b->seg_off || !b->idx) {
-        fprintf(stderr, "rayforce: rowsel_builder_init: out of memory "
-                        "(%u segments)\n", (unsigned)n_segs);
-        abort();
-    }
+    /* An array that failed to allocate marks the builder oom: the emits do
+     * nothing and finish answers NULL, which its callers take as oom (an
+     * assert would compile away under -DNDEBUG, #652). */
+    b->oom = !b->seg_flags || !b->seg_off || !b->idx;
+    if (b->oom) return;
     /* seg_off[0] is already 0 from ray_calloc_raw; kept explicit for clarity. */
     b->seg_off[0] = 0;
+}
+
+/* idx[] room for `need` entries; false (the builder oom) when it cannot grow */
+static bool rowsel_builder_reserve(rowsel_builder_t* b, uint32_t need) {
+    if (need <= b->idx_cap) return true;
+    uint32_t newcap = b->idx_cap ? b->idx_cap : 8u;
+    while (newcap < need) newcap *= 2u;
+    uint16_t* grown = (uint16_t*)ray_realloc_raw(b->idx, (size_t)newcap * sizeof(uint16_t));
+    if (!grown) { b->oom = true; return false; }   /* b->idx stays, finish frees it */
+    b->idx = grown;
+    b->idx_cap = newcap;
+    return true;
 }
 
 void rowsel_emit_segment(rowsel_builder_t* b, uint32_t seg,
@@ -281,6 +289,7 @@ void rowsel_emit_segment(rowsel_builder_t* b, uint32_t seg,
     /* seg is a BUILDER-LOCAL index — must be in [0, b->n_segs).
      * Passing a global segment id here would index past the allocated
      * seg_flags[]/seg_off[] arrays and silently corrupt the heap. */
+    if (b->oom) return;
     assert(seg < b->n_segs && "rowsel_emit_segment: seg is not builder-local");
 
     /* Mark this segment's start offset into the local idx[]. */
@@ -300,12 +309,7 @@ void rowsel_emit_segment(rowsel_builder_t* b, uint32_t seg,
     } else {
         b->seg_flags[seg] = RAY_SEL_MIX;
         /* Grow idx[] geometrically to fit this segment's pc indices. */
-        if (b->idx_len + pc > b->idx_cap) {
-            uint32_t newcap = b->idx_cap ? b->idx_cap : 8u;
-            while (newcap < b->idx_len + pc) newcap *= 2u;
-            b->idx = (uint16_t*)ray_realloc_raw(b->idx, (size_t)newcap * sizeof(uint16_t));
-            b->idx_cap = newcap;
-        }
+        if (!rowsel_builder_reserve(b, b->idx_len + pc)) return;
         for (int64_t i = 0; i < n; i++)
             if (morsel_bool[i]) b->idx[b->idx_len++] = (uint16_t)i;
     }
@@ -314,6 +318,7 @@ void rowsel_emit_segment(rowsel_builder_t* b, uint32_t seg,
 }
 
 void rowsel_emit_uniform(rowsel_builder_t* b, uint32_t seg, uint8_t d, int64_t n) {
+    if (b->oom) return;
     assert(seg < b->n_segs && "rowsel_emit_uniform: seg is not builder-local");
     b->seg_off[seg] = b->idx_len;
     /* rowsel_emit_segment's classification of n equal bools */
@@ -324,6 +329,7 @@ void rowsel_emit_uniform(rowsel_builder_t* b, uint32_t seg, uint8_t d, int64_t n
 
 void rowsel_emit_runs(rowsel_builder_t* b, uint32_t seg, const uint16_t* ends,
                       const uint8_t* pass, uint32_t n_runs, int64_t n) {
+    if (b->oom) return;
     assert(seg < b->n_segs && "rowsel_emit_runs: seg is not builder-local");
     b->seg_off[seg] = b->idx_len;
     uint32_t pc = 0, s0 = 0;
@@ -340,12 +346,7 @@ void rowsel_emit_runs(rowsel_builder_t* b, uint32_t seg, const uint16_t* ends,
     } else {
         b->seg_flags[seg] = RAY_SEL_MIX;
         /* room for pc indices plus one 16-index store past them (below) */
-        if (b->idx_len + pc + 16 > b->idx_cap) {
-            uint32_t newcap = b->idx_cap ? b->idx_cap : 8u;
-            while (newcap < b->idx_len + pc + 16) newcap *= 2u;
-            b->idx = (uint16_t*)ray_realloc_raw(b->idx, (size_t)newcap * sizeof(uint16_t));
-            b->idx_cap = newcap;
-        }
+        if (!rowsel_builder_reserve(b, b->idx_len + pc + 16)) return;
         /* a passing run's indices in fixed 16-index stores: the indices a
          * store writes past the run are overwritten by the next passing
          * run's (out advances by the run's length only), and the last
@@ -375,12 +376,14 @@ ray_t* rowsel_builder_finish(rowsel_builder_t* builders, uint32_t n_workers,
                              int64_t nrows) {
     int64_t total_pass = 0;
     int64_t idx_count  = 0;
+    bool oom = false;
     for (uint32_t w = 0; w < n_workers; w++) {
         total_pass += builders[w].total_pass;
         idx_count  += builders[w].idx_len;
+        oom |= builders[w].oom;
     }
 
-    ray_t* block = ray_rowsel_new(nrows, total_pass, idx_count);
+    ray_t* block = oom ? NULL : ray_rowsel_new(nrows, total_pass, idx_count);
     if (block) {
         uint8_t*  seg_flags   = ray_rowsel_flags(block);
         uint32_t* seg_offsets = ray_rowsel_offsets(block);
@@ -549,7 +552,7 @@ ray_t* ray_rowsel_refine(ray_t* existing, ray_t* pred) {
 
     /* Pass 1 — count survivors per segment. */
     ray_t* pop_block = ray_alloc((size_t)n_segs * sizeof(uint32_t));
-    if (!pop_block) return NULL;
+    if (!pop_block) return ray_error("oom", NULL);
     uint32_t* popcount = (uint32_t*)ray_data(pop_block);
     memset(popcount, 0, (size_t)n_segs * sizeof(uint32_t));
 
@@ -593,7 +596,7 @@ ray_t* ray_rowsel_refine(ray_t* existing, ray_t* pred) {
     ray_t* block = ray_rowsel_new(nrows, total_pass, idx_count);
     if (!block) {
         ray_release(pop_block);
-        return NULL;
+        return ray_error("oom", NULL);
     }
     uint8_t*  seg_flags   = ray_rowsel_flags(block);
     uint32_t* seg_offsets = ray_rowsel_offsets(block);

@@ -4551,7 +4551,7 @@ static void expr_refine_task(expr_refine_ctx_t* c, uint32_t t) {
     const int64_t end = s1 * RAY_MORSEL_ELEMS < c->nrows ? s1 * RAY_MORSEL_ELEMS : c->nrows;
     rowsel_builder_t* sb = &c->sel_builders[t];
     const uint32_t base_seg = (uint32_t)s0;
-    if (s0 >= s1) return;
+    if (s0 >= s1 || sb->oom) return;   /* oom: finish answers NULL */
     if (ray_scan_fail_skip(c->fail, start)) {
         for (int64_t seg = s0; seg < s1; seg++) {      /* the builder still covers its segments */
             const uint32_t ls = (uint32_t)(seg - s0);

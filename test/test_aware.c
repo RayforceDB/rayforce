@@ -3883,12 +3883,14 @@ static test_result_t test_group_build_alloc_fail(void) {
         "(select {a: (avg w) d: (dev w) from: P})",
         "(inner-join [j] (select {j: j v: v from: P}) R2)",
         "(sum (at (insert P 2024.01.03 (list 3 99 1.5)) 'v))",   /* a scalar append to a parted segment */
+        "(select {from: P desc: w take: 6})",
+        "(select {from: P asc: [j v] take: 4})",
     };
     aw_eval_ok("(set R2 (table [j b] (list (til 7) (* 10 (til 7)))))");
     /* a per-partition failure the route cannot answer sends the group to
      * the flattened table, which sums in another order (#1819) */
     const char* bcmp[sizeof bq / sizeof *bq] = {0};
-    bcmp[sizeof bq / sizeof *bq - 3] =
+    bcmp[sizeof bq / sizeof *bq - 5] =
         "(and (all (< (abs (- (at Q 'a) (at R0 'a))) 1e-9)) (all (< (abs (- (at Q 'd) (at R0 'd))) 1e-9)))";
     int failed = aw_sweep_eval(bq, bcmp, sizeof bq / sizeof *bq);
     TEST_ASSERT_FMT(failed >= 0, "a failed allocation while building the select answered other than oom keeping nothing");
@@ -7217,22 +7219,25 @@ static ray_t* aw_eval_parsed(ray_t* parsed) {
 
 /* Sweep each query in qs: the nth allocation of its evaluation fails,
  * every n it reaches: of the parsed query on the calling thread's own
- * code, then on its pool tasks too, then of the text, parse included.
+ * code, then on its pool tasks too, then of the text, parse included (on
+ * the calling thread).
  * Each run answers R0 (by `cmp` when given, else byte for byte) or `oom`
  * keeping nothing; the error's trace, which the next request clears, is
- * cleared first.  Returns the oom count, or -1 after a failure (reported). */
+ * cleared first, and a run that keeps memory runs again: a cache a route
+ * builds once stays once, a leak keeps it again.  Returns the oom count, or -1 after a failure (reported). */
 static int aw_sweep_eval(const char* const* qs, const char* const* cmps, size_t nq) {
     int failed = 0;
     aw_eval_ok("(set Q 0)");   /* bound before the trace: an answer rebinds it */
     for (int skip = 2; skip >= 0; skip--) {
-        ray_alloc_fail_skip_tasks_for_test(skip == 1);
+        ray_alloc_fail_skip_tasks_for_test(skip != 0);   /* parse included: on the calling thread */
         for (size_t q = 0; q < nq; q++) {
             char setq[600];
             snprintf(setq, sizeof setq, "(set R0 %s)", qs[q]);
             aw_eval_ok(setq);
             ray_t* parsed = ray_parse(qs[q]);
             if (!parsed || RAY_IS_ERR(parsed)) { fprintf(stderr, "  %s: does not parse\n", qs[q]); return -1; }
-            for (int64_t n = 1; n <= 40000; n++) {
+            bool again = false;   /* this n once more: memory a path caches stays once */
+            for (int64_t n = 1; n <= 40000; n += again ? 0 : 1) {
                 ray_heap_gc();
                 bool traced = ray_mem_trace_begin();
                 ray_alloc_fail_set_for_test(n, 1);
@@ -7269,6 +7274,9 @@ static int aw_sweep_eval(const char* const* qs, const char* const* cmps, size_t 
                     if (!same) what = "an answer, not the reference";
                     else if (tr.net_bytes > 0) { snprintf(msg, sizeof msg, "an answer, %lld bytes kept", (long long)tr.net_bytes); what = msg; }
                 }
+                bool kept = what && strstr(what, "bytes kept");
+                if (kept && !again) { again = true; continue; }   /* a leak keeps it again */
+                again = false;
                 if (what) {
                     fprintf(stderr, "  %s (%s), allocation %lld fails: %s\n", qs[q], skip == 2 ? "parse included" : skip ? "tasks skipped" : "tasks too", (long long)n, what);
                     ray_release(parsed);
@@ -7308,6 +7316,7 @@ static test_result_t test_plan_alloc_fail(void) {
         "(select {s: (sum ((at D 'f) v)) from: C})",
         "(select {c: (pearson_corr v (* 2.0 w)) from: F by: j})",   /* a second argument that compiles a literal */
         "(update {v: (+ (sum v) 0) from: C})",   /* a one-element scalar broadcast as its atom */
+        "(select {r: (if (> v 5) 1 (if (> v 2) 2 0)) from: C})",   /* a nested if: its branches compacted (#1818) */
     };
     static const char* const pcmp[] = {
         "(all (== (ser (select {from: Q asc: k})) (ser (select {from: R0 asc: k}))))",
@@ -7316,7 +7325,7 @@ static test_result_t test_plan_alloc_fail(void) {
         "(all (== (ser (select {from: Q asc: k})) (ser (select {from: R0 asc: k}))))",
         NULL, NULL,
         "(all (== (ser (select {from: Q asc: j})) (ser (select {from: R0 asc: j}))))",
-        NULL,
+        NULL, NULL,
     };
     aw_eval_ok("(set D (dict ['f] (list neg)))");   /* a computed call head: rewritten to its name */
     aw_eval_ok("(set C (table [v] (list (til 2000))))");
@@ -7324,6 +7333,75 @@ static test_result_t test_plan_alloc_fail(void) {
     TEST_ASSERT_FMT(failed >= 0, "a failed allocation while planning answered other than oom keeping nothing");
     TEST_ASSERT_FMT(failed > 0, "no allocation failure answered oom");
     aw_eval_ok("(set F 0)"); aw_eval_ok("(set L 0)"); aw_eval_ok("(set R 0)"); aw_eval_ok("(set D 0)"); aw_eval_ok("(set C 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set Q 0)");
+    PASS();
+}
+
+/* The where: path under a failure: the filter, its selection and every
+ * gather of the kept rows, over an in-memory table, a splayed one, a
+ * compressed splayed one and a parted one, swept as aw_sweep_eval does.
+ * Never the rows the where: drops, a column short, a crash or an abort
+ * (#1818). */
+static test_result_t test_filter_alloc_fail(void) {
+    aw_eval_ok("(set T (table [k v f s t d] (list (% (til 100000) 7) (til 100000) (as 'F64 (% (til 100000) 13)) "
+               "(as 'SYM (at ['aa 'bb 'cc 'dd] (% (til 100000) 4))) (at (as 'STR (til 50)) (% (til 100000) 50)) "
+               "(+ 2024.01.01 (% (til 100000) 30)))))");
+    char q[700];
+    snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/fs/\" T {compress: false})");
+    aw_eval_ok(q);
+    snprintf(q, sizeof q, "(set S (.db.splayed.get \"" AW_TMP "/fs/\"))");
+    aw_eval_ok(q);
+    snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/fz/\" T {compress: true})");
+    aw_eval_ok(q);
+    snprintf(q, sizeof q, "(set Z (.db.splayed.get \"" AW_TMP "/fz/\"))");
+    aw_eval_ok(q);
+    for (int p = 0; p < 3; p++) {
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/fp/2024.01.0%d/t/\" "
+                 "(table [k v f s t] (list (%% (til 40000) 7) (+ (til 40000) %d) (as 'F64 (%% (til 40000) 13)) "
+                 "(as 'SYM (at ['aa 'bb 'cc 'dd] (%% (til 40000) 4))) (at (as 'STR (til 50)) (%% (til 40000) 50)))) {compress: false})",
+                 p + 1, p * 40000);
+        aw_eval_ok(q);
+    }
+    snprintf(q, sizeof q, "(set P (.db.parted.get \"" AW_TMP "/fp\" 't))");
+    aw_eval_ok(q);
+    static const char* const tabs[] = { "T", "S", "Z", "P" };
+    /* a grouped answer compares in its key's order: the fallback of a
+     * failed dense route answers its groups first seen (#1819) */
+    static const struct { const char* q; const char* key; } shapes[] = {
+        { "(select {from: %s where: (> v 5000)})", NULL },
+        { "(select {from: %s where: (and (== k 3) (< f 7.0))})", NULL },
+        { "(select {from: %s where: (and (> v 50) (< f 7.0))})", NULL },
+        { "(select {from: %s where: (in s ['aa 'cc])})", NULL },
+        { "(select {v: v t: t from: %s where: (== k 2)})", NULL },
+        { "(count (select {from: %s where: (< v 77777)}))", NULL },
+        { "(select {c: (sum v) n: (count f) from: %s where: (> v 5) by: k})", "k" },
+        { "(select {from: %s where: (> v 5) by: s})", "s" },
+        { "(select {from: %s where: (== s 'bb) asc: f take: 20})", NULL },
+        { "(select {m: (max v) from: %s where: (!= k 1)})", NULL },
+        { "(select {r: (sums v) from: %s where: (< v 3000)})", NULL },
+        { "(select {from: %s by: s})", NULL },
+        { "(update {b: (xbar 10 v) from: %s where: (> v 5000)})", NULL },   /* xbar over the where: rows */
+        { "(select {c: (sum v) from: %s where: (> v 5) by: k desc: c take: 3})", NULL },   /* sorted after the group */
+    };
+    enum { NT = sizeof tabs / sizeof *tabs, NS = sizeof shapes / sizeof *shapes };
+    static char qbuf[NT * NS][200], cbuf[NT * NS][200];
+    const char* qs[NT * NS];
+    const char* cs[NT * NS];
+    for (size_t t = 0; t < NT; t++)
+        for (size_t h = 0; h < NS; h++) {
+            size_t i = t * NS + h;
+            snprintf(qbuf[i], sizeof qbuf[i], shapes[h].q, tabs[t]);
+            qs[i] = qbuf[i];
+            cs[i] = NULL;
+            if (shapes[h].key) {
+                snprintf(cbuf[i], sizeof cbuf[i], "(all (== (ser (select {from: Q asc: %s})) (ser (select {from: R0 asc: %s}))))",
+                         shapes[h].key, shapes[h].key);
+                cs[i] = cbuf[i];
+            }
+        }
+    int failed = aw_sweep_eval(qs, cs, NT * NS);
+    TEST_ASSERT_FMT(failed >= 0, "a failed allocation on the where: path answered other than oom keeping nothing");
+    TEST_ASSERT_FMT(failed > 0, "no allocation failure answered oom");
+    aw_eval_ok("(set T 0)"); aw_eval_ok("(set S 0)"); aw_eval_ok("(set Z 0)"); aw_eval_ok("(set P 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set Q 0)");
     PASS();
 }
 
@@ -7444,5 +7522,6 @@ const test_entry_t aware_entries[] = {
     { "aware/firstn_where_deferred", test_firstn_where_deferred, aw_setup, aw_teardown },
     { "aware/grouped_grade_routes", test_grouped_grade_routes, aw_setup, aw_teardown },
     { "aware/plan_alloc_fail", test_plan_alloc_fail, aw_setup, aw_teardown },
+    { "aware/filter_alloc_fail", test_filter_alloc_fail, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

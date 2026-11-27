@@ -4524,6 +4524,7 @@ static __attribute__((noinline)) ray_t* exec_filter_xbar_chain(ray_graph_t* g, r
         ray_t* ns = sel ? ray_rowsel_refine(sel, pv) : ray_rowsel_from_pred(pv);
         ray_release(pv);
         if (sel) ray_rowsel_release(sel);
+        if (ns && RAY_IS_ERR(ns)) { ray_release(input); return ns; }
         sel = ns;                            /* NULL: every row passes so far */
     }
     g->selection = sel;
@@ -5819,6 +5820,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             ray_graph_unbind_table(g, sub);
                             ray_release(sub);
                             if (done_refine) return input;
+                        } else if (sub && RAY_IS_ERR(sub)) {
+                            ray_error_free(sub);   /* the refine below runs */
                         } else if (sub && sub != input) {
                             ray_release(sub);
                         } else if (sub == input) {
@@ -5884,10 +5887,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_t* merged = ray_rowsel_refine(g->selection, pred);
                     ray_release(pred);
                     ray_release(g->selection);
+                    g->selection = NULL;
+                    if (merged && RAY_IS_ERR(merged)) { ray_release(input); return merged; }
                     g->selection = merged;  /* may be NULL if all-pass */
                 } else {
                     ray_t* new_sel = ray_rowsel_from_pred(pred);
                     ray_release(pred);
+                    if (new_sel && RAY_IS_ERR(new_sel)) { ray_release(input); return new_sel; }
                     g->selection = new_sel;  /* may be NULL if all-pass */
                 }
                 return input;  /* original table, not compacted */
