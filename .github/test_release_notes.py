@@ -56,6 +56,13 @@ class GraphTests(unittest.TestCase):
         self.git('commit', '-q', '-m', subject)
         return self.git('rev-parse', 'HEAD')
 
+    def add_body(self, subject, body):
+        path = Path('data')
+        path.write_text((path.read_text() if path.exists() else '') + subject + '\n')
+        self.git('add', 'data')
+        self.git('commit', '-q', '-m', subject, '-m', body)
+        return self.git('rev-parse', 'HEAD')
+
     def generate(self, version, sha, pin=None):
         return notes.generate(version, sha, pin, api=self.api)
 
@@ -80,6 +87,69 @@ class GraphTests(unittest.TestCase):
         artifact = self.git('rev-parse', 'HEAD')
         self.api.release('v3.0.1', artifact, source)
         return old, old_source, artifact, source
+
+    def test_breaking_changes_section(self):
+        self.git('tag', 'v2.9.0')
+        self.add('feat: plain feature')
+        self.add_body('fix(query): median is no aggregate spelling (#1825)',
+                      'The planner aggregated median by spelling.\n\n'
+                      'BREAKING CHANGE: median is no longer an aggregate spelling in a select;\n'
+                      '  it was never a builtin. Use med.\n'
+                      'Fixes #1814')
+        self.add_body('refactor: drop read-csv', 'BREAKING-CHANGE: read-csv is removed; use .csv.read.')
+        self.add('feat!: a new calling convention')
+        target = self.add('docs: guide')
+        body = self.generate('2.10.0', target)
+        self.assertIn('### ⚠️ Breaking changes', body)
+        self.assertLess(body.index('Breaking changes'), body.index('Features'))
+        self.assertIn('- median is no longer an aggregate spelling in a select; it was never a builtin. Use med. (#1825)', body)
+        self.assertNotIn('Fixes #1814', body)
+        self.assertIn('- read-csv is removed; use .csv.read.', body)
+        breaking = body[body.index('Breaking changes'):body.index('Features')]
+        self.assertIn('- a new calling convention', breaking)
+        self.assertNotIn('plain feature', breaking)
+        self.assertIn('- median is no aggregate spelling (#1825)', body)   # still under its type
+
+    def test_breaking_reads_the_trailer_block_only(self):
+        self.git('tag', 'v2.9.0')
+        self.add_body('docs: how to mark one',
+                      'Write the footer like this:\n\n```\nBREAKING CHANGE: an example in a code block\n```\n\n'
+                      'Nothing here is breaking.')
+        self.add_body('fix: middle paragraph',
+                      'First paragraph.\n\nBREAKING CHANGE: a mid-body paragraph\n\nThe last paragraph is prose.')
+        self.add_body('fix: footer then prose',
+                      'Text.\n\nBREAKING CHANGE: followed by a blank line and prose\n\nMore prose after it.')
+        self.add_body('fix: only trailer (#11)', 'Text.\n\nBREAKING CHANGE: the only trailer')
+        target = self.add_body('fix: footer then fixes (#12)',
+                               'Text.\n\nBREAKING CHANGE: ends at the next line\nFixes #1814\nRefs: #1826')
+        body = self.generate('2.10.0', target)
+        breaking = body[body.index('Breaking changes'):body.index('Bug fixes')]
+        self.assertIn('- the only trailer (#11)', breaking)
+        self.assertIn('- ends at the next line (#12)', breaking)
+        for absent in ['an example in a code block', 'a mid-body paragraph',
+                       'followed by a blank line', 'Fixes #1814', '#1826']:
+            self.assertNotIn(absent, breaking)
+
+    def test_breaking_never_reads_inside_a_fence(self):
+        self.git('tag', 'v2.9.0')
+        self.add_body('docs: fence last', 'Shows:\n\n```\nBREAKING CHANGE: stddev_pop is removed.\n```')
+        self.add_body('docs: tilde fence with a tag', 'Shows:\n\n  ~~~text\n  BREAKING CHANGE: inside tildes\n  ~~~')
+        self.add_body('docs: unterminated fence', 'Shows:\n\n```lisp\nBREAKING CHANGE: never closed\nFixes #1')
+        target = self.add_body('fix: after a fence (#13)',
+                               '```\nBREAKING CHANGE: fenced\n```\n\nBREAKING CHANGE: the real trailer')
+        body = self.generate('2.10.0', target)
+        breaking = body[body.index('Breaking changes'):body.index('Bug fixes')]
+        self.assertIn('- the real trailer (#13)', breaking)
+        for absent in ['stddev_pop is removed', 'inside tildes', 'never closed', 'fenced']:
+            self.assertNotIn(absent, breaking)
+        self.assertEqual(breaking.count('\n- '), 1)
+
+    def test_no_breaking_section_without_markers(self):
+        self.git('tag', 'v2.9.0')
+        self.add('feat: plain feature')
+        target = self.add_body('fix: plain fix', 'A body that mentions a breaking change in prose.')
+        body = self.generate('2.10.0', target)
+        self.assertNotIn('Breaking changes', body)
 
     def test_linear_numeric_future_and_unrelated(self):
         self.git('tag', 'v2.9.0')
