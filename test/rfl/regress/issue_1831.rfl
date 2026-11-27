@@ -1,0 +1,32 @@
+;; #1831: under a keyless where:, med inside an expression -- (+ 0 (med s)),
+;; or a helper whose body is (med x), which the planner inlines -- raised
+;; nyi: the expression's OP_MEDIAN refused to read the rows the where:
+;; keeps.  It now takes the median of those rows, as the bare aggregate
+;; does.  The rows are the selection's indices, total_pass of them (the
+;; index block's own len is not the count: a gather by it read no row and
+;; gave 0Nf).
+;; @requires: posix
+(.sys.exec "rm -rf /tmp/rf_issue_1831 && mkdir -p /tmp/rf_issue_1831") -- 0
+(set C (table [s i g] (list (as 'F64 [0 8 16 24]) [5 1 9 3] ['a 'b 'a 'b])))
+(set h (fn [x ignored] (med x)))
+(.db.splayed.set "/tmp/rf_issue_1831/spl/t/" C "/tmp/rf_issue_1831/spl/.sym")
+(set S (.db.splayed.get "/tmp/rf_issue_1831/spl/t/" "/tmp/rf_issue_1831/spl/.sym"))
+(map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1831/par/%/t" (+ 2024.01.01 p)) C "/tmp/rf_issue_1831/par/.sym")) (til 2))
+(set P (.db.parted.get "/tmp/rf_issue_1831/par/" 't))
+;; the bare aggregate, and the expression without where:, as before
+(at (select {q: (med s) from: C where: (> s 1)}) 'q) -- [16.0]
+(at (select {q: (+ 0 (med s)) from: C}) 'q) -- [12.0]
+((fn [f] (at (select {q: (f s 0.25) from: C where: (> s 1)}) 'q)) h) -- [16.0]
+;; the issue's lines: the median of the kept rows
+(at (select {q: (+ 0 (med s)) from: C where: (> s 1)}) 'q) -- [16.0]
+(at (select {q: (h s 0.25) from: C where: (> s 1)}) 'q) -- [16.0]
+(at (select {q: ((fn [x ignored] (med x)) s 0.25) from: C where: (> s 1)}) 'q) -- [16.0]
+(at (select {q: (- (med s) (avg s)) from: C where: (> s 1)}) 'q) -- [0.0]
+(at (select {q: (+ (med i) (med s)) from: C where: (== g 'a)}) 'q) -- [15.0]
+(at (select {q: (+ 0 (med i)) from: C where: (> i 2)}) 'q) -- [5.0]
+(at (select {q: (+ 0 (med s)) from: C where: (== i 9)}) 'q) -- [16.0]
+(at (select {q: (+ 0 (med s)) from: C where: (> i 99)}) 'q) -- [0Nf]
+(at (select {q: (+ 0 (med s)) from: S where: (> s 1)}) 'q) -- [16.0]
+(at (select {q: (+ 0 (med s)) from: P where: (> s 1)}) 'q) -- [16.0]
+(at (select {q: (h s 0.25) from: P where: (== g 'b)}) 'q) -- [16.0]
+(.sys.exec "rm -rf /tmp/rf_issue_1831") -- 0
