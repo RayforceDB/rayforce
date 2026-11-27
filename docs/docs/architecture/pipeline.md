@@ -235,6 +235,11 @@ Grouped aggregates run on the parallel aggregation engine, which picks a strateg
 
 Without an explicit ordering clause, full grouped results can follow the selected
 strategy's group order. Use `asc:` or `desc:` when result positions matter.
+A strategy that cannot allocate its tables falls back to another one (the
+dense routes to the hash route, a per-partition group to the flattened
+table), so a failed allocation can change the order of the groups and, by
+summing in another order, the last bits of a float aggregate; the groups and
+their values are otherwise the same.
 After a sort, groups that tie on the sort keys are meant to come in
 first-seen order. For integer, temporal and symbol group keys that is not
 guaranteed yet: the engine may emit such groups in key order
