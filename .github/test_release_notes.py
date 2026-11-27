@@ -144,6 +144,15 @@ class GraphTests(unittest.TestCase):
             self.assertNotIn(absent, breaking)
         self.assertEqual(breaking.count('\n- '), 1)
 
+    def test_breaking_with_many_closing_lines(self):
+        self.git('tag', 'v2.9.0')
+        target = self.add_body('fix: many closing lines (#14)',
+                               'Text.\n\nBREAKING CHANGE: listed beside closing lines\n'
+                               'Fixes #1\nFixes #2\nRefs #3\nCloses #4\nPart of #5')
+        body = self.generate('2.10.0', target)
+        self.assertIn('- listed beside closing lines (#14)', body)
+        self.assertNotIn('Fixes #1', body[body.index('Breaking changes'):body.index('Bug fixes')])
+
     def test_no_breaking_section_without_markers(self):
         self.git('tag', 'v2.9.0')
         self.add('feat: plain feature')
