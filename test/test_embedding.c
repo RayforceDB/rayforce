@@ -2124,6 +2124,85 @@ static test_result_t test_knn_heap_patterns(void) {
 
 /* ============ Suite table ============ */
 
+#ifdef DEBUG
+#include "lang/parse.h"
+/* One query under an allocation failure: the nth allocation of its
+ * evaluation fails, for every n it reaches; of the text, parse included,
+ * when `text` (a lambda literal compiles into the parsed tree it is in, so
+ * a tree kept across runs keeps its first compile).  Each run answers the unfailed
+ * answer or `oom`, keeping nothing either way.  The oom count, or -1. */
+static int leftover_sweep_one(const char* q, bool text) {
+    ray_t* ref = ray_eval_str(q);
+    if (!ref || RAY_IS_ERR(ref)) { fprintf(stderr, "  %s: no reference\n", q); return -1; }
+    ray_t* rf = ray_fmt(ref, 1);
+    ray_release(ref);
+    ray_t* parsed = ray_parse(q);
+    if (!rf || RAY_IS_ERR(rf) || !parsed || RAY_IS_ERR(parsed)) return -1;
+    int ooms = 0;
+    for (int64_t n = 1; n <= 20000; n++) {
+        ray_heap_gc();
+        bool traced = ray_mem_trace_begin();
+        ray_clear_error_trace();
+        ray_raise_clear();
+        ray_alloc_fail_set_for_test(n, 1);
+        ray_t* got = text ? ray_eval_str(q) : ray_eval(parsed);
+        if (!text) ray_eval_request_end();
+        if (got && !RAY_IS_ERR(got) && ray_is_lazy(got)) got = ray_lazy_materialize(got);
+        bool fired = ray_alloc_fail_armed_for_test() == 0;
+        ray_alloc_fail_set_for_test(0, 0);
+        ray_clear_error_trace();
+        bool ok;
+        if (got && RAY_IS_ERR(got)) {
+            ok = strcmp(ray_err_code(got), "oom") == 0;
+            if (!ok) fprintf(stderr, "  %s, allocation %lld fails: %s, not oom\n", q, (long long)n, ray_err_code(got));
+            ray_error_free(got);
+            ooms++;
+        } else {
+            ray_t* gf = got ? ray_fmt(got, 1) : NULL;
+            ok = gf && !RAY_IS_ERR(gf) && ray_str_len(gf) == ray_str_len(rf) &&
+                 memcmp(ray_str_ptr(gf), ray_str_ptr(rf), ray_str_len(rf)) == 0;
+            if (!ok) fprintf(stderr, "  %s, allocation %lld fails: an answer, not the reference\n", q, (long long)n);
+            if (gf && RAY_IS_ERR(gf)) ray_error_free(gf); else if (gf) ray_release(gf);
+            if (got) ray_release(got);
+        }
+        ray_heap_gc();
+        ray_mem_trace_t tr = {0};
+        if (traced) ray_mem_trace_end(&tr);
+        if (ok && tr.net_bytes != 0) {
+            fprintf(stderr, "  %s, allocation %lld fails: %lld bytes kept\n", q, (long long)n, (long long)tr.net_bytes);
+            ok = false;
+        }
+        if (!ok) { ray_release(rf); ray_release(parsed); return -1; }
+        if (!fired) break;
+    }
+    ray_release(rf);
+    ray_release(parsed);
+    return ooms;
+}
+
+/* Allocation failures the tree-wide grep of #1854 found outside its two
+ * groups (#1865): loading a model (whose limits dict held a failed atom, read
+ * as `domain`), compiling a lambda (whose symbol walk kept its failed
+ * vector's error) and a select by a computed key (whose clause keys were
+ * dropped or kept as errors).  Each answers the answer or `oom`, keeping
+ * nothing. */
+static test_result_t test_leftover_alloc_fail(void) {
+    ray_t* t = ray_eval_str("(set T64 (table [k v] (list (% (til 60) 7) (% (til 60) 11))))");
+    TEST_ASSERT(t && !RAY_IS_ERR(t), "setup");
+    ray_release(t);
+    static const struct { const char* q; bool text; } qs[] = {
+        { "(.emb.model.info (.emb.model.get \"test/data/emb/tiny\"))", false },
+        { "(fold-while (fn [a] (< a 10)) + 0 [1 2 3 4 5])", true },
+        { "(select {c: (count (distinct v)) from: T64 by: (% k 3)})", false },
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof *qs; i++)
+        TEST_ASSERT_FMT(leftover_sweep_one(qs[i].q, qs[i].text) > 0, "%s: an allocation failure answered other than the answer or oom keeping nothing", qs[i].q);
+    ray_t* z = ray_eval_str("(set T64 0)");
+    if (z && !RAY_IS_ERR(z)) ray_release(z);
+    PASS();
+}
+#endif
+
 const test_entry_t embedding_entries[] = {
     { "embedding/cos_dist_scalar", test_cos_dist_scalar, emb_setup, emb_teardown },
     { "embedding/l2_dist_scalar", test_l2_dist_scalar, emb_setup, emb_teardown },
@@ -2216,6 +2295,9 @@ const test_entry_t embedding_entries[] = {
     { "embedding/ann_efs_out_of_range", test_ann_efs_out_of_range, emb_setup, emb_teardown },
     { "embedding/hnsw_info_all_metrics", test_hnsw_info_all_metrics, emb_setup, emb_teardown },
     { "embedding/knn_heap_patterns", test_knn_heap_patterns, emb_setup, emb_teardown },
+#ifdef DEBUG
+    { "embedding/leftover_alloc_fail", test_leftover_alloc_fail, emb_setup, emb_teardown },
+#endif
 
     { NULL, NULL, NULL, NULL },
 };

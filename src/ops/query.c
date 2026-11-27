@@ -24192,20 +24192,41 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
     }
     if (!by_val || RAY_IS_ERR(by_val)) { if (keyed) ray_release(keyed); return by_val ? by_val : ray_error("oom", NULL); }
 
+    /* Each clause key is a symbol atom; one that fails to allocate is the
+     * failure, never a plan short of its by:, its from: or the removal of
+     * its where: (and its error, owned here, is freed: ray_release leaves
+     * an error object). */
     ray_t* engine = dict;
     ray_retain(engine);
     ray_t* k_by = ray_sym(rid[2]);
-    engine = k_by && !RAY_IS_ERR(k_by) ? ray_dict_upsert(engine, k_by, by_val) : engine;
-    if (k_by) ray_release(k_by);
+    if (!k_by || RAY_IS_ERR(k_by)) {
+        ray_error_free(k_by);
+        ray_release(by_val); ray_release(engine);   /* both owned here */
+        if (keyed) ray_release(keyed);
+        return ray_error("oom", NULL);
+    }
+    engine = ray_dict_upsert(engine, k_by, by_val);   /* consumes engine */
+    ray_release(k_by);
     ray_release(by_val);
-    ray_t* k_from = ray_sym(rid[0]);
-    if (engine && !RAY_IS_ERR(engine) && k_from && !RAY_IS_ERR(k_from))
-        engine = ray_dict_upsert(engine, k_from, keyed ? keyed : tbl);
+    ray_t* k_from = engine && !RAY_IS_ERR(engine) ? ray_sym(rid[0]) : NULL;
+    if (engine && !RAY_IS_ERR(engine) && (!k_from || RAY_IS_ERR(k_from))) {
+        ray_error_free(k_from);
+        ray_release(engine);
+        if (keyed) ray_release(keyed);
+        return ray_error("oom", NULL);
+    }
+    if (k_from) engine = ray_dict_upsert(engine, k_from, keyed ? keyed : tbl);
     if (k_from) ray_release(k_from);
     if (keyed) ray_release(keyed);
     if (where_applied && engine && !RAY_IS_ERR(engine)) {
         ray_t* k_where = ray_sym(rid[1]);
-        if (k_where && !RAY_IS_ERR(k_where)) { engine = ray_dict_remove(engine, k_where); ray_release(k_where); }
+        if (!k_where || RAY_IS_ERR(k_where)) {
+            ray_error_free(k_where);
+            ray_release(engine);
+            return ray_error("oom", NULL);
+        }
+        engine = ray_dict_remove(engine, k_where);
+        ray_release(k_where);
     }
     /* asc:/desc: name result columns: the derived key is the hidden one */
     for (int r = 4; r <= 5 && engine && !RAY_IS_ERR(engine); r++) {
@@ -29278,6 +29299,8 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
             ray_t* new_tbl = ray_table_add_col(tbl, k->i64, col_vec);
             ray_release(col_vec);
             if (!new_tbl || RAY_IS_ERR(new_tbl)) {
+                /* add_col consumed tbl: never released again below (#1865) */
+                tbl = NULL;
                 fail_err = new_tbl ? new_tbl : ray_error("oom", NULL);
                 failed = true; break;
             }
@@ -34004,6 +34027,12 @@ by_dict_done:
                     }
                     ray_release(result);
                     result = rebuilt;
+                } else {
+                    /* never the answer with its count column still in it
+                     * (#1865): result is ours, the table's error freed */
+                    ray_error_free(rebuilt);
+                    ray_release(result);
+                    result = ray_error("oom", NULL);
                 }
             }
         }

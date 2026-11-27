@@ -852,12 +852,31 @@ ray_t* ray_emb_model_info_fn(ray_t* h) {
         { "inner",     make_i64(in.inner) },
         { "tokens",    make_i64(in.max_tokens) },
     };
+    /* keys, vals and each row's value are owned here; the 8 slots hold
+     * every row, so the appends do not grow.  A value that failed to
+     * allocate is the failure, never a dict holding an error (#1865). */
+    bool failed = false;
     for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
+        ray_t* v = rows[i].val;
+        if (failed || !v || RAY_IS_ERR(v)) {
+            failed = true;
+            if (v && RAY_IS_ERR(v)) ray_error_free(v); else ray_release(v);
+            continue;
+        }
         int64_t s = sym_intern_safe(rows[i].name, strlen(rows[i].name));
-        keys = ray_vec_append(keys, &s);
-        vals = ray_list_append(vals, rows[i].val);
-        ray_release(rows[i].val);
+        ray_t* nk = s >= 0 ? ray_vec_append(keys, &s) : NULL;
+        ray_t* nl = nk && !RAY_IS_ERR(nk) ? ray_list_append(vals, v) : NULL;
+        ray_release(v);
+        if (!nk || RAY_IS_ERR(nk) || !nl || RAY_IS_ERR(nl)) {
+            /* a failed append leaves its input (#1857); the error is freed */
+            ray_error_free(nk); ray_error_free(nl);
+            if (nk && !RAY_IS_ERR(nk)) keys = nk;
+            failed = true;
+            continue;
+        }
+        keys = nk; vals = nl;
     }
+    if (failed) { ray_release(keys); ray_release(vals); return ray_error("oom", NULL); }
     return ray_dict_new(keys, vals);
 }
 

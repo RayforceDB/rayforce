@@ -4722,7 +4722,7 @@ static ray_t* sort_stamp_part_col_owned(ray_t* col, int64_t order_sym) {
     ray_t* w = col;
     ray_t* r = ray_index_attach_part(&w);
     if (!r || RAY_IS_ERR(r)) {
-        if (r && RAY_IS_ERR(r)) ray_release(r);
+        ray_error_free(r);   /* owned here; ray_release leaves an error (#1854) */
         return NULL;
     }
     sort_note_part_order(w, order_sym);
@@ -4750,7 +4750,7 @@ static ray_t* sort_stamp_ordered_table(ray_t* tbl, int64_t key_id,
     ray_retain(stamped);
     ray_t* r = ray_index_attach_part(&stamped);
     if (!r || RAY_IS_ERR(r)) {
-        if (r && RAY_IS_ERR(r)) ray_release(r);
+        ray_error_free(r);   /* owned here; ray_release leaves an error (#1854) */
         ray_release(stamped);
         ray_retain(tbl);
         return tbl;

@@ -110,14 +110,24 @@ static void compiler_destroy(compiler_t *c) {
 }
 
 /* ── Debug info helpers ── */
+/* Debug spans are optional: one that fails to allocate drops them all (the
+ * vector, the compiler's, released; the error freed), never an error object
+ * kept as the spans (#1865).  A failed append leaves its input (#1857). */
 static void dbg_append(compiler_t* c, int32_t offset, int64_t span_id) {
     if (!c->dbg_obj) {
-        c->dbg_obj = ray_vec_new(RAY_I64, 0);
-        if (!c->dbg_obj) return;
+        ray_t* v = ray_vec_new(RAY_I64, 0);
+        if (!v || RAY_IS_ERR(v)) { ray_error_free(v); return; }
+        c->dbg_obj = v;
     }
-    int64_t off64 = (int64_t)offset;
-    c->dbg_obj = ray_vec_append(c->dbg_obj, &off64);
-    c->dbg_obj = ray_vec_append(c->dbg_obj, &span_id);
+    int64_t pair[2] = { (int64_t)offset, span_id };
+    ray_t* nv = ray_vec_append_raw(c->dbg_obj, pair, 2);
+    if (!nv || RAY_IS_ERR(nv)) {
+        ray_error_free(nv);
+        ray_release(c->dbg_obj);
+        c->dbg_obj = NULL;
+        return;
+    }
+    c->dbg_obj = nv;
 }
 
 #define EMIT_DBG(c, ast) do { \
@@ -437,7 +447,7 @@ static void compile_if_chain(compiler_t *c, ray_t *ast, ray_t **args, int64_t na
     }
     if (!c->if_sites) {
         c->if_sites = ray_list_new(8);
-        if (!c->if_sites || RAY_IS_ERR(c->if_sites)) { c->if_sites = NULL; c->error = true; return; }
+        if (!c->if_sites || RAY_IS_ERR(c->if_sites)) { ray_error_free(c->if_sites); c->if_sites = NULL; c->error = true; return; }   /* its error, ours (#1865) */
     }
     ray_t *grown = ray_list_append(c->if_sites, ast);
     if (grown && !RAY_IS_ERR(grown)) { c->if_sites = grown; grown = ray_list_append(c->if_sites, syms); }
@@ -794,8 +804,11 @@ static ray_t *call_head_fn(compiler_t *c, ray_t *head) {
         bool builtin = fn && (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY);
         int64_t pair[2] = { head->i64, builtin ? (int64_t)(uintptr_t)fn : 0 };
         for (int k = 0; k < 2 && !c->error; k++) {
-            c->deps = ray_vec_append(c->deps, &pair[k]);
-            if (!c->deps || RAY_IS_ERR(c->deps)) { c->deps = NULL; c->error = true; }
+            /* a failed append leaves c->deps, released with the compiler
+             * (#1857); its error is freed (#1865) */
+            ray_t* nd = ray_vec_append(c->deps, &pair[k]);
+            if (!nd || RAY_IS_ERR(nd)) { ray_error_free(nd); c->error = true; }
+            else c->deps = nd;
         }
     }
     return fn;
@@ -1352,7 +1365,7 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
     bool own_params = false;
     if (params->len == 0 && params->type != RAY_SYM && params->type > 0) {
         ray_t *pv = ray_sym_vec_new(RAY_SYM_W64, 1);
-        if (!pv || RAY_IS_ERR(pv)) return false;
+        if (!pv || RAY_IS_ERR(pv)) { ray_error_free(pv); return false; }   /* its error, ours (#1865) */
         pv->len = 0;
         params = pv;
         own_params = true;
@@ -1361,7 +1374,7 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
         for (int64_t i = 0; i < params->len; i++)
             if (!pe[i] || pe[i]->type != -RAY_SYM) return false;
         ray_t *pv = ray_sym_vec_new(RAY_SYM_W64, params->len > 0 ? params->len : 1);
-        if (!pv || RAY_IS_ERR(pv)) return false;
+        if (!pv || RAY_IS_ERR(pv)) { ray_error_free(pv); return false; }   /* its error, ours (#1865) */
         for (int64_t i = 0; i < params->len; i++) ((int64_t*)ray_data(pv))[i] = pe[i]->i64;
         pv->len = params->len;
         params = pv;
@@ -1453,7 +1466,7 @@ ray_t *ray_closure_capture_names(ray_t *lambda) { bool failed; return closure_ca
 ray_t *ray_closure_mentioned_syms(ray_t *body, bool *dynamic, int64_t *weight) {
     init_sf_syms();
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
-    if (!mentioned || RAY_IS_ERR(mentioned)) return NULL;
+    if (!mentioned || RAY_IS_ERR(mentioned)) { ray_error_free(mentioned); return NULL; }   /* NULL is the failure; its error is ours */
     *dynamic = false;
     *weight = 0;
     if (!ast_collect_syms_at(body, &mentioned, dynamic, 0, weight, true, NULL)) { if (mentioned) ray_release(mentioned); return NULL; }
@@ -1535,7 +1548,7 @@ static bool compile_lambda_deps(ray_t *lambda, ray_t *capnames, bool dynamic_glo
     c.dynamic_globals = dynamic_globals;
     if (deps) {
         c.deps = ray_vec_new(RAY_I64, 16);
-        if (!c.deps || RAY_IS_ERR(c.deps)) { c.deps = NULL; compiler_destroy(&c); return false; }
+        if (!c.deps || RAY_IS_ERR(c.deps)) { ray_error_free(c.deps); c.deps = NULL; compiler_destroy(&c); return false; }   /* its error, ours (#1865) */
     }
 
     /* Register params as locals */
@@ -1606,14 +1619,23 @@ static bool compile_lambda_deps(ray_t *lambda, ray_t *capnames, bool dynamic_glo
 
     /* Build bytecode vector */
     ray_t *bc = ray_alloc(c.code_len);
-    if (!bc) { compiler_destroy(&c); return false; }
+    if (!bc || RAY_IS_ERR(bc)) {   /* the spans are the compiler's until the lambda takes them (#1865) */
+        ray_error_free(bc);
+        if (c.dbg_obj) ray_release(c.dbg_obj);
+        compiler_destroy(&c); return false;
+    }
     bc->type = RAY_U8;
     bc->len = c.code_len;
     memcpy(ray_data(bc), c.code, c.code_len);
 
     /* Build constants list */
     ray_t *consts = ray_alloc(c.n_consts * sizeof(ray_t *));
-    if (!consts) { ray_release(bc); compiler_destroy(&c); return false; }
+    if (!consts || RAY_IS_ERR(consts)) {
+        ray_error_free(consts);
+        ray_release(bc);
+        if (c.dbg_obj) ray_release(c.dbg_obj);   /* the compiler's, as above */
+        compiler_destroy(&c); return false;
+    }
     consts->type = RAY_LIST;
     consts->len = c.n_consts;
     ray_t **cpool = (ray_t **)ray_data(consts);
