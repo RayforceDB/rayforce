@@ -1,0 +1,26 @@
+;; @requires: posix  (the server is spawned and stopped through test/serve.sh)
+;; map over a lambda, and in over two long I64 vectors, never polled for a
+;; cancel: one that landed during them was seen only by what ran after, so
+;; (count (map f V)) and (count (in I I2)), where nothing after polls,
+;; answered `ok` after running to the end (#1782).  Five requests of each
+;; get a client deadline of a quarter of the whole run; the query log gives
+;; their statuses.  The server is its own process, with its own port
+;; (test/serve.sh), stopped by its own pid only.
+(.sys.exec "rm -rf /tmp/rf_mapcut")
+(.sys.exec "test/serve.sh /tmp/rf_mapcut -Q 1") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rf_mapcut/port"))))
+(set h (.ipc.open addr))
+(.ipc.send h "(do (set V (til 1000000)) (set I (til 4194304)) (set I2 (reverse I)) 0)") -- 0
+(set cut (fn [q] (do (set c (.ipc.open addr)) (try (.ipc.send c q dl) (fn [e] e)) (try (.ipc.close c) (fn [e] e)) 0)))
+(set statuses (fn [q] (do (set t0 (.time.now)) (.ipc.send h q) (set dl (max 2 (div (- (.time.now) t0) 4))) (set n0 (at (.ipc.send h "(.sys.querylog.stats)") 'next)) (map (fn [i] (cut q)) (til 5)) (.ipc.send h "1") (.ipc.send h (format "(at (select {from: (.sys.querylog %) where: (== query \"%\")}) 'status)" n0 q)))))
+(set qm "(count (map (fn [x] (+ x 1)) V))")
+(.ipc.send h qm) -- 1000000
+(set sm (statuses qm))
+(set qi "(count (in I I2))")
+(.ipc.send h qi) -- 4194304
+(set si (statuses qi))
+(.sys.exec "test/serve.sh --stop /tmp/rf_mapcut") -- 0
+(count sm) -- 5
+(count (where (== sm 'cancel))) -- 5
+(count si) -- 5
+(count (where (== si 'cancel))) -- 5
