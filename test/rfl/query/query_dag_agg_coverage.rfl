@@ -157,10 +157,9 @@
 ;; OP_VAR (line 1260): (+ (var v) 0) → 10.0
 (at (at (select {r: (+ (var v) 0) from: Tagg_arith}) 'r) 0) -- 10.0
 
-;; OP_MEDIAN (line 1262): (+ (med v) 0) → compile succeeds, but OP_MEDIAN
-;; is holistic (post-radix pass) and fails at DAG execution with "nyi".
-;; The compile path through line 1262 is still exercised.
-(select {r: (+ (med v) 0) from: Tagg_arith}) !- nyi
+;; OP_MEDIAN: (+ (med v) 0) compiles to a median inside the expression, which
+;; the DAG now executes over the whole column (#1814; it was nyi).
+(at (at (select {r: (+ (med v) 0) from: Tagg_arith}) 'r) 0) -- 6.0
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; No-agg multi-key by-group with WHERE (lines 6265-6275)

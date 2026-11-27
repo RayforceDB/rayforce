@@ -6978,6 +6978,22 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             return result;
         }
 
+        /* The median of a value, as a reduction inside an expression:
+         * `(+ 0 (med s))`, or a helper whose body is `(med x)` inlined into
+         * a keyless select.  The group path computes it per group; here the
+         * whole input, as the builtin does (#1814). */
+        case OP_MEDIAN: {
+            /* under a where: the rows it keeps would have to be read, as
+             * exec_reduction reads them for the other reductions: not done
+             * here, so that stays a refusal (#1814) */
+            if (g->selection) return ray_error("nyi", NULL);
+            ray_t* in = exec_node(g, op_child(g, op, 0));
+            if (!in || RAY_IS_ERR(in)) return in;
+            ray_t* r = ray_med_fn(in);
+            ray_release(in);
+            return r;
+        }
+
         default:
             return ray_error("nyi", NULL);
     }

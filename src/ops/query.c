@@ -1074,46 +1074,33 @@ static bool agg_kernel_selects(uint16_t op) {
     return op == OP_FIRST || op == OP_LAST || op == OP_TOP_N || op == OP_BOT_N;
 }
 
-/* Map Rayfall aggregation name to DAG opcode */
+/* The function a call's head names, as the evaluator resolves it for the
+ * planner: a lexical local (a parameter or let), else the global.  The
+ * query's own frame, which binds the columns, is passed by: a column named
+ * like a builtin (count, max, first) never hid it from the planner, and
+ * does not now (#1814). */
+static ray_t* agg_head_fn(int64_t sym_id) {
+    ray_t* v = ray_env_get_lexical_local(sym_id);
+    return v ? v : ray_env_get_global(sym_id);
+}
+
+/* The aggregate kernel of the function the name `sym_id` holds (#1814): an
+ * aggregate is recognised by the RAY_FN_AGGR builtin a name holds, not by
+ * its spelling.  An alias, a parameter or a let holding sum is sum; a name
+ * rebound to another function is that function; a lambda is none. */
 static uint16_t resolve_agg_opcode(int64_t sym_id) {
-    ray_t* s = ray_sym_str(sym_id);
-    if (!s) return 0;
-    const char* name = ray_str_ptr(s);
-    size_t len = ray_str_len(s);
-    if (len == 3 && memcmp(name, "sum",   3) == 0) return OP_SUM;
-    if (len == 3 && memcmp(name, "avg",   3) == 0) return OP_AVG;
-    if (len == 3 && memcmp(name, "min",   3) == 0) return OP_MIN;
-    if (len == 3 && memcmp(name, "max",   3) == 0) return OP_MAX;
-    if (len == 3 && memcmp(name, "dev",   3) == 0) return OP_STDDEV_POP;
-    if (len == 3 && memcmp(name, "var",   3) == 0) return OP_VAR;
-    if (len == 3 && memcmp(name, "all",   3) == 0) return OP_ALL;
-    if (len == 3 && memcmp(name, "any",   3) == 0) return OP_ANY;
-    if (len == 3 && memcmp(name, "cov",   3) == 0) return OP_COV;
-    if (len == 4 && memcmp(name, "prod",  4) == 0) return OP_PROD;
-    if (len == 4 && memcmp(name, "last",  4) == 0) return OP_LAST;
-    if (len == 4 && memcmp(name, "scov",  4) == 0) return OP_SCOV;
-    if (len == 4 && memcmp(name, "wsum",  4) == 0) return OP_WSUM;
-    if (len == 4 && memcmp(name, "wavg",  4) == 0) return OP_WAVG;
-    if (len == 5 && memcmp(name, "count", 5) == 0) return OP_COUNT;
-    if (len == 5 && memcmp(name, "first", 5) == 0) return OP_FIRST;
-    if (len == 6 && memcmp(name, "stddev",6) == 0) return OP_STDDEV;
-    if (len == 7 && memcmp(name, "dev_pop",      7) == 0) return OP_STDDEV_POP;
-    if (len == 7 && memcmp(name, "var_pop",      7) == 0) return OP_VAR_POP;
-    if (len == 10 && memcmp(name, "stddev_pop", 10) == 0) return OP_STDDEV_POP;
-    if (len == 12 && memcmp(name, "pearson_corr", 12) == 0) return OP_PEARSON_CORR;
-    /* Holistic — DAG path skips accumulator slot, fills via post-radix
-     * pass over row_gid+grp_cnt (see exec_group + ray_median_per_group_buf). */
-    if (len == 3 && memcmp(name, "med",    3) == 0) return OP_MEDIAN;
-    /* Holistic, binary-shape (col + K literal).  K compiled-time literal,
-     * not a DAG input — extracted from the dict expr at planner time and
-     * stored in agg_k[].  See ray_topk_per_group_buf for the per-group
-     * bounded-heap kernel. */
-    if (len == 3 && memcmp(name, "top",    3) == 0) return OP_TOP_N;
-    if (len == 3 && memcmp(name, "bot",    3) == 0) return OP_BOT_N;
-    if (len == 4 && memcmp(name, "mode",   4) == 0) return OP_MODE;
-    if (len == 8 && memcmp(name, "quantile", 8) == 0) return OP_QUANTILE;
-    if (len == 10 && memcmp(name, "percentile", 10) == 0) return OP_QUANTILE;
-    return 0;
+    /* Planning asks about one head many times (is_agg_expr and its ~40
+     * callers): the answer is cached per name for as long as the frames and
+     * the globals it was read from have not moved, as ray_env_resolve_compiled
+     * caches a resolution, so a repeated question is a few compares. */
+    enum { AGG_CACHE_BITS = 6 };
+    static _Thread_local struct { int64_t sym; uint64_t fe, ge; uint16_t op; } cache[1 << AGG_CACHE_BITS];
+    uint32_t h = (uint32_t)(((uint64_t)sym_id * UINT64_C(0x9E3779B97F4A7C15)) >> (64 - AGG_CACHE_BITS));
+    uint64_t ge = atomic_load_explicit(&g_global_epoch, memory_order_relaxed);
+    if (cache[h].sym == sym_id && cache[h].fe == g_frame_epoch && cache[h].ge == ge) return cache[h].op;
+    uint16_t op = agg_kernel_of_fn(agg_head_fn(sym_id));
+    cache[h].sym = sym_id; cache[h].fe = g_frame_epoch; cache[h].ge = ge; cache[h].op = op;
+    return op;
 }
 
 /* Column presence by name, from metadata: an encoded column stays encoded. */
@@ -1394,10 +1381,12 @@ static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t 
     return res;
 }
 
+/* Does the name hold percentile (0..100), not quantile (0..1)?  Both are
+ * OP_QUANTILE; the function decides (#1814). */
 static bool agg_name_is_percentile(int64_t sym_id) {
-    ray_t* s = ray_sym_str(sym_id);
-    return s && ray_str_len(s) == 10 &&
-           memcmp(ray_str_ptr(s), "percentile", 10) == 0;
+    ray_t* fn = agg_head_fn(sym_id);
+    return fn && fn->type == RAY_BINARY && (fn->attrs & RAY_FN_AGGR) &&
+           (const void*)(uintptr_t)fn->i64 == (const void*)ray_percentile_fn;
 }
 
 static int64_t encode_agg_f64_param(double v) {
@@ -5731,19 +5720,10 @@ static ray_t* query_lambda_form(ray_t* lam) {
 }
 
 /* Is `fn` an aggregate the planner reads as one (resolve_agg_opcode): the
- * function object a name of that set holds, judged by the object, so a
- * rebinding of the name or another name for it reads as it is. */
+ * function object a name holds, judged by the object (agg_kernel_of_fn), so
+ * a rebinding of the name or another name for it reads as it is. */
 static bool fn_is_planner_agg(const ray_t* fn) {
-    static const char* const names[] = {
-        "sum", "avg", "min", "max", "dev", "var", "all", "any", "cov", "prod", "last", "scov",
-        "wsum", "wavg", "count", "first", "stddev", "dev_pop", "var_pop", "stddev_pop",
-        "pearson_corr", "med", "median", "top", "bot", "mode", "quantile", "percentile" };
-    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return false;
-    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
-        ray_t* a = ray_env_get_global(ray_sym_intern(names[i], strlen(names[i])));
-        if (a && a->type == fn->type && a->i64 == fn->i64) return true;
-    }
-    return false;
+    return agg_kernel_of_fn(fn) != 0;
 }
 
 /* `e` with each computed call head that gives a function
@@ -6059,8 +6039,9 @@ static uint16_t resolve_agg_call_opcode(int64_t sym_id, int64_t nargs);
  * alias of sum is sum and a name rebound to another function is that
  * function (#1810 review). */
 static bool wv_head_is_own_agg(ray_t* e, ray_t* fn) {
-    int64_t own = ray_env_builtin_own_sym(fn);
-    return own >= 0 && resolve_agg_call_opcode(own, e->len - 1) != 0;
+    uint16_t op = agg_kernel_of_fn(fn);
+    if ((op == OP_MIN || op == OP_MAX) && e->len - 1 != 1) return false;   /* (min a b) maps */
+    return op != 0;
 }
 
 /* `agg`: find, instead of a whole-column verb, an aggregate applied in a
@@ -17808,10 +17789,7 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
             goto emit;
         }
 
-        ray_t* fn_obj = ray_env_get(agg_elems[0]->i64);
-        /* `median` is the planner's name for med; it has no builtin */
-        if (!fn_obj && resolve_agg_opcode(agg_elems[0]->i64) == OP_MEDIAN)
-            fn_obj = ray_env_get(ray_sym_intern("med", 3));
+        ray_t* fn_obj = agg_head_fn(agg_elems[0]->i64);
         if (!fn_obj || fn_obj->type != RAY_UNARY) {
             ray_release(result);
             return ray_error("type", "select: aggregate must be a unary function, got %s",
@@ -17975,27 +17953,22 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
     return ray_select(args, n);
 }
 
-/* Map a window function name (C string of given length) to a RAY_WIN_* kind.
- * Only the 7 spec-exposed names are reachable: min/max/sum/avg/count/first/last.
- * Returns 255 on no match. */
-static uint8_t win_kind_from_name(const char* s, size_t len) {
-    switch (len) {
-    case 3:
-        if (memcmp(s, "sum", 3) == 0) return RAY_WIN_SUM;
-        if (memcmp(s, "avg", 3) == 0) return RAY_WIN_AVG;
-        if (memcmp(s, "min", 3) == 0) return RAY_WIN_MIN;
-        if (memcmp(s, "max", 3) == 0) return RAY_WIN_MAX;
-        break;
-    case 4:
-        if (memcmp(s, "last", 4) == 0) return RAY_WIN_LAST_VALUE;
-        break;
-    case 5:
-        if (memcmp(s, "count", 5) == 0) return RAY_WIN_COUNT;
-        if (memcmp(s, "first", 5) == 0) return RAY_WIN_FIRST_VALUE;
-        break;
-    default: break;
+/* The RAY_WIN_* kind of the function a window's `(fn col)` names: by the
+ * aggregate the name holds (agg_kernel_of_fn), as a select's aggregates are
+ * judged (#1814), so an alias of sum windows as sum and a name rebound to
+ * another function does not.  Only the 7 spec-exposed kernels are reachable:
+ * min/max/sum/avg/count/first/last.  255 when it holds none of them. */
+static uint8_t win_kind_from_fn(int64_t sym_id) {
+    switch (resolve_agg_opcode(sym_id)) {
+    case OP_SUM:   return RAY_WIN_SUM;
+    case OP_AVG:   return RAY_WIN_AVG;
+    case OP_MIN:   return RAY_WIN_MIN;
+    case OP_MAX:   return RAY_WIN_MAX;
+    case OP_LAST:  return RAY_WIN_LAST_VALUE;
+    case OP_COUNT: return RAY_WIN_COUNT;
+    case OP_FIRST: return RAY_WIN_FIRST_VALUE;
+    default:       return 255;
     }
-    return 255;
 }
 
 /*
@@ -18206,7 +18179,7 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
             ray_graph_free(g); ray_release(tbl);
             return ray_error("domain", "window: unknown function");
         }
-        uint8_t kind = win_kind_from_name(ray_str_ptr(fn_s), ray_str_len(fn_s));
+        uint8_t kind = win_kind_from_fn(fn_expr->i64);
         if (kind == 255) {
             DICT_VIEW_CLOSE(fv); scratch_free(outname_hdr); scratch_free(funcs_hdr); scratch_free(order_hdr); scratch_free(part_hdr);
             ray_graph_free(g); ray_release(tbl);
@@ -26281,14 +26254,13 @@ static bool prune_output_ok(ray_t* e, ray_t* tbl, bool grouped) {
     ray_t* fn = prune_head_fn(el[0], tbl);
     if (!fn) return false;
     bool first_last = grouped && ray_len(e) == 2 && fn->type == RAY_UNARY &&
-        ((prune_head_named(el[0], "first") && (ray_unary_fn)(uintptr_t)fn->i64 == ray_first_fn) ||
-         (prune_head_named(el[0], "last") && (ray_unary_fn)(uintptr_t)fn->i64 == ray_last_fn));
+        ((ray_unary_fn)(uintptr_t)fn->i64 == ray_first_fn || (ray_unary_fn)(uintptr_t)fn->i64 == ray_last_fn);
     if (!(fn->attrs & RAY_FN_AGGR) && !first_last) return false;
     if (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY) return false;
     /* COUNT(DISTINCT source-column) is local to the post-WHERE/group
      * domain; DISTINCT itself is not an elementwise WHERE/BY operand. */
     if (!(e->attrs & ATTR_QUOTED) && ray_len(e) == 2 && fn->type == RAY_UNARY &&
-        (ray_unary_fn)(uintptr_t)fn->i64 == ray_count_fn && prune_head_named(el[0], "count")) {
+        (ray_unary_fn)(uintptr_t)fn->i64 == ray_count_fn) {
         ray_t* d = el[1];
         if (d && d->type == RAY_LIST && !(d->attrs & ATTR_QUOTED) && ray_len(d) == 2) {
             ray_t** dl = (ray_t**)ray_data(d);
@@ -26442,8 +26414,7 @@ static bool prune_group_sum_if(ray_t* e, ray_t* tbl, prune_group_proof_t* p) {
     ray_t* fn = prune_head_fn(a[0], tbl);
     if (!fn || fn->type != RAY_UNARY || !(fn->attrs & RAY_FN_AGGR) ||
         (fn->attrs & RAY_FN_SPECIAL_FORM) ||
-        (ray_unary_fn)(uintptr_t)fn->i64 != ray_sum_fn ||
-        !prune_head_named(a[0], "sum")) return false;
+        (ray_unary_fn)(uintptr_t)fn->i64 != ray_sum_fn) return false;
     e = a[1];
     if (--p->budget < 0 || !e || e->type != RAY_LIST ||
         (e->attrs & ATTR_QUOTED) || ray_len(e) != 4) return false;
@@ -28850,7 +28821,6 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
          * — narrowing costs the projection without saving the gather. */
         bool prefilter_multi_key_where = false;
         if (prefilter_top_n_match && !has_computed_by_val && nk >= 2) {
-            int64_t count_sym = ray_sym_intern("count", 5);
             for (int64_t i = 0; i + 1 < dict_n &&
                                 !prefilter_multi_key_where; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
@@ -28861,7 +28831,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 if (!is_group_dag_agg_expr(val, tbl)) continue;
                 ray_t** ae = (ray_t**)ray_data(val);
                 if (!ae[0] || ae[0]->type != -RAY_SYM) continue;
-                if (ae[0]->i64 == count_sym) continue;
+                if (resolve_agg_opcode(ae[0]->i64) == OP_COUNT) continue;
                 prefilter_multi_key_where = true;  /* sum/min/max/avg */
             }
         }
@@ -35820,21 +35790,9 @@ static bool update_do_prefix_inert(ray_t* f, ray_t* tbl) {
     ray_t* h = fs[0];
     if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
     if (tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return false;
-    bool total = h->i64 == ray_sym_intern("count", 5) || h->i64 == ray_sym_intern("first", 5) ||
-                 h->i64 == ray_sym_intern("last", 4);
-    if (!total) return false;
-    ray_t* fn = ray_env_get(h->i64);
-    /* that builtin itself, not another one a program bound to the name: the
-     * name a builtin carries is its own (ray_env_builtin_sym returns the
-     * first name bound to the object, which after `(set first raise)` can
-     * be `first` itself) */
-    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return false;
-    ray_t* hn = ray_sym_str(h->i64);
-    const char* own = ray_fn_name(fn);
-    size_t hl = hn ? ray_str_len(hn) : 0;
-    size_t ol = 0;
-    while (ol < 14 && own[ol]) ol++;                     /* aux holds at most 13 */
-    if (!hn || ol != hl || memcmp(own, ray_str_ptr(hn), hl) != 0) return false;
+    /* count, first or last by the function the name holds (#1814) */
+    uint16_t op = resolve_agg_opcode(h->i64);
+    if (op != OP_COUNT && op != OP_FIRST && op != OP_LAST) return false;
     ray_t* a = fs[1];
     return a && a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED) && tbl_has_col(tbl, a->i64);
 }
