@@ -45,6 +45,10 @@
 ;; ---- --help still lists -Q, beside its sibling -t ----
 (.sys.exec "./rayforce --help 2>&1 | grep -q -- '-Q, --querylog'") -- 0
 
+;; ---- --help says what the default pool size is (#1491) ----
+(.sys.exec "./rayforce --help 2>&1 | grep -q -- '0 or no -c: one per CPU this process may use'") -- 0
+(.sys.exec "./rayforce --help 2>&1 | grep -q -- 'unless RAYFORCE_CORES is set'") -- 0
+
 (.sys.exec "rm -f /tmp/rfl_cfv.rfl /tmp/rfl_cfv.out /tmp/rfl_cfv2.out; true")
 
 ;; ---- --log-posts N sets the journal's posts switch (#1608) ----

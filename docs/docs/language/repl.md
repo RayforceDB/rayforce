@@ -20,9 +20,30 @@ generate_script | ./rayforce -
 echo '(+ 1 2)' | ./rayforce
 ```
 
-Interactive mode is detected automatically when stdin is a terminal. On startup the REPL prints a banner with the version, CPU, memory, logical CPU count, and worker count, then shows the `‣` prompt. By default the pool includes every logical CPU the process may run on (all online CPUs, unless `taskset` or a cpuset narrowed them), including SMT threads. Use `-c N` to choose a total worker count explicitly: N must contain decimal digits only; `0` selects the automatic size, and `1..1023` sets the total count, including the main thread. Values outside this range are rejected before the pool starts. Individual operations may use fewer tasks when their workload or memory budget requires it. Use `-m SIZE` (`--mem`; a byte count or a `K`/`M`/`G`/`T` suffix) to set the RAM budget: anonymous memory past it spills to disk instead of risking the OOM killer. `(.sys.mem)` reports the effective value as [`anon-watermark`](../namespaces/sys.md#sys-mem).
+Interactive mode is detected automatically when stdin is a terminal. On startup the REPL prints a banner with the version, CPU, memory, logical CPU count, and worker count, then shows the `‣` prompt. By default the pool has one thread per logical CPU the process may use (see [Pool Size](#pool-size)). Use `-c N` to choose a total worker count explicitly: N must contain decimal digits only; `0` selects the automatic size, and `1..1023` sets the total count, including the main thread. Values outside this range are rejected before the pool starts. Individual operations may use fewer tasks when their workload or memory budget requires it. Use `-m SIZE` (`--mem`; a byte count or a `K`/`M`/`G`/`T` suffix) to set the RAM budget: anonymous memory past it spills to disk instead of risking the OOM killer. `(.sys.mem)` reports the effective value as [`anon-watermark`](../namespaces/sys.md#sys-mem).
 
 Under a cgroup CPU quota (`docker --cpus`, systemd `CPUQuota=`) the default pool has one thread per CPU of the quota, rounded up. A `-c` larger than the allowed CPUs prints a warning. See [Running Several Instances](../guides/instances.md) for choosing CPUs per instance.
+
+### Pool Size
+
+With no `-c`, or `-c 0`, and no `RAYFORCE_CORES` in the environment, the pool has one thread for every logical CPU the process may use, the main thread included. On Linux that is the CPUs of its affinity mask (every online CPU unless `taskset`, a cpuset or `docker --cpuset-cpus` narrowed it), and no more than its cgroup CPU quota, rounded up; elsewhere it is every online CPU. Both hardware threads of an SMT core count. A non-empty `RAYFORCE_CORES` (see [Environment Variables](#environment-variables)) replaces this size, with or without `-c 0`; only a positive `-c N` overrides it. The default suits large scans, grouping, sorts and joins, which keep every thread busy. It costs CPU time in two cases:
+
+- **SMT machines.** The second thread of a core shares that core's load and store units, so it adds little wall time and a lot of CPU time. On a 4-core, 8-thread desktop a join probe took 0.70 s at the default and 0.67 s at `-c 4`, for twice the CPU time (5.17 s against 2.59 s). On an 8-core, 16-thread laptop it took 0.16 s at both `-c 8` and the default, which spent 1.7 times the cycles ([#599](https://github.com/RayforceDB/rayforce/issues/599)). Large analytic queries can still gain from the extra threads: over a 43-query benchmark on that desktop the per-query times were 2.7% shorter at the default than at `-c 4`.
+- **Small or mostly single-threaded services.** A service whose work fits one thread gains nothing from the extra threads, and they still cost CPU time when its queries reach the pool. On an 8-core, 16-thread laptop one such service used 8% of a core at the default and 6% at `-c 1` or `-c 2`, for the same rows ([#1491](https://github.com/RayforceDB/rayforce/issues/1491)).
+
+Without SMT the default costs little: on a 14-core laptop (10 performance and 4 efficiency cores) the default was never slower than `-c 10` beyond noise and was 5 to 9% faster on joins, partitioned scans and grouping 50M rows by 5M keys, for 14 to 31% more CPU time per query ([#1491](https://github.com/RayforceDB/rayforce/issues/1491)).
+
+Set `-c N` for a service that is not bound by scans: the number of physical cores (`lscpu`: `Core(s) per socket` × `Socket(s)`) on an SMT machine, or 1 or 2 for a service that is mostly single-threaded and does not need its queries to finish sooner. `(.sys.info)` reports the pool as `workers`, the main thread included, and the CPUs the process may run on as `cores` (under a CPU quota `cores` still counts every allowed CPU):
+
+```bash
+rayforce -c 8 -p 5001
+```
+
+```lisp
+(get (.sys.info) 'workers)   ; 8
+```
+
+To keep a large job fast while small joins stay on one thread, raise [`.sys.join.par.min`](../namespaces/sys.md#sys-join-par-min) instead of lowering `-c` (see [Parallel probe floor](../queries/joins.md#parallel-probe-floor)).
 
 ### Environment Variables
 
@@ -30,7 +51,7 @@ The thread pool reads these once, when it is created (process start, or the firs
 
 | Variable | Default | Description |
 |---|---|---|
-| `RAYFORCE_CORES` | unset | Number of background worker threads when no `-c` is given (the main thread is one more). Unset keeps the default of every online logical CPU; the test harness sets it to keep spawned processes small. An explicit `-c N` overrides it. |
+| `RAYFORCE_CORES` | unset | Number of background worker threads when no `-c` is given (the main thread is one more). Unset or empty keeps the [default size](#pool-size); `0`, or a value that does not start with a positive number, gives the main thread alone. It also applies under `-c 0`. The test harness sets it to keep spawned processes small. Only a positive `-c N` overrides it. |
 | `RAY_POOL_STEAL` | `1` | How workers claim tasks. `1`: each worker owns a contiguous slice of the table and steals halves of other workers' remaining slices once its own is done — sequential access and a stable row-to-worker mapping. `0`: every worker claims the next task from one shared cursor. Results are identical; set `0` only to A/B the two schedulers. |
 | `RAY_POOL_TRACE` | unset | `1` prints a per-worker histogram to stderr when the pool is destroyed (at exit): tasks each worker ran from its own slice versus stolen ones, and the number of steals. Use it to see how evenly work splits across workers on a given machine. |
 
