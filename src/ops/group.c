@@ -6063,6 +6063,19 @@ static bool group_ht_wire_wide(group_ht_t* ht, uint32_t nk) {
     return true;
 }
 
+#ifdef DEBUG
+/* Test seam (ray_group_test_ht_rows_fail): the nth partition-table init of
+ * the v2 radix route's phase 2 from now, on any thread, fails as a failed
+ * rows allocation does (slots allocated, rows NULL); with cancel, it also
+ * raises the cancel.  t_ht_seam_site marks the inits it counts. */
+static _Atomic int64_t g_ht_rows_fail_for_test;
+static _Atomic bool    g_ht_rows_fail_cancel_for_test;
+static _Thread_local bool t_ht_seam_site;
+void ray_group_test_ht_rows_fail(int64_t nth, bool cancel) {
+    atomic_store(&g_ht_rows_fail_cancel_for_test, cancel);
+    atomic_store(&g_ht_rows_fail_for_test, nth);
+}
+#endif
 static bool group_ht_init_sized(group_ht_t* ht, uint32_t cap,
                                  const ght_layout_t* ly, uint32_t init_grp_cap) {
     ht->ht_cap = cap;
@@ -6082,6 +6095,13 @@ static bool group_ht_init_sized(group_ht_t* ht, uint32_t cap,
     memset(ht->slots, 0xFF, (size_t)cap * sizeof(uint32_t)); /* HT_EMPTY = all-1s */
     ht->grp_cap = init_grp_cap;
     ht->grp_count = 0;
+#ifdef DEBUG
+    if (RAY_UNLIKELY(atomic_load_explicit(&g_ht_rows_fail_for_test, memory_order_relaxed)) && t_ht_seam_site &&
+        atomic_fetch_sub_explicit(&g_ht_rows_fail_for_test, 1, memory_order_relaxed) == 1) {
+        if (g_ht_rows_fail_cancel_for_test) ray_request_interrupt();
+        return false;                      /* slots allocated, rows NULL */
+    }
+#endif
     ht->rows = (char*)scratch_alloc(&ht->_h_rows,
         (size_t)init_grp_cap * ly->row_stride);
     if (!ht->rows) return false;
@@ -9164,8 +9184,14 @@ static void radix_v2_phase2_fn(void* ctx, uint32_t worker_id,
         uint32_t merge_cap = 2;
         while (merge_cap < total_grps && merge_cap < (1u << 30)) merge_cap <<= 1;
         uint32_t merge_blk = total_grps < 256 ? total_grps : 256;
-        if (!group_ht_init_sized(&c->part_hts[p], merge_cap, &c->layout,
-                                 merge_blk)) {
+#ifdef DEBUG
+        t_ht_seam_site = true;
+#endif
+        bool inited = group_ht_init_sized(&c->part_hts[p], merge_cap, &c->layout, merge_blk);
+#ifdef DEBUG
+        t_ht_seam_site = false;
+#endif
+        if (!inited) {
             atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
             return;
         }
@@ -21393,7 +21419,16 @@ ht_path:;
                 result = v2_ferr;
                 goto cleanup;
             }
-            CHECK_CANCEL_GOTO(pool, cleanup);
+            /* A cancel frees the worker HTs and both partition-table
+             * blocks, which are local here (cleanup frees part_hts only) */
+            if (pool_cancelled(pool)) {
+                for (size_t i = 0; i < v2_n_w; i++)
+                    group_ht_free(&wpart_hts[i]);
+                scratch_free(wpart_hdr);
+                scratch_free(v2_part_hdr);
+                result = ray_error("cancel", NULL);
+                goto cleanup;
+            }
             if (atomic_load_explicit(&v2p1.oom, memory_order_relaxed)) {
                 for (size_t i = 0; i < v2_n_w; i++)
                     group_ht_free(&wpart_hts[i]);
@@ -21434,11 +21469,21 @@ ht_path:;
             ray_pool_dispatch_n(pool, radix_v2_phase2_fn, &v2p2,
                                 radix_n_parts);
             scratch_free(v2p2_kp_hdr);
-            CHECK_CANCEL_GOTO(pool, cleanup);
-            /* Worker HTs are no longer needed once the merge is done. */
+            /* Worker HTs are no longer needed once the merge is done (or
+             * cancelled). */
             for (size_t i = 0; i < v2_n_w; i++)
                 group_ht_free(&wpart_hts[i]);
             scratch_free(wpart_hdr);
+            if (pool_cancelled(pool)) {
+                /* every partition, as the OOM exit below: one whose init
+                 * failed has its slots but no rows, which cleanup's
+                 * rows-only free would keep */
+                for (uint32_t p = 0; p < radix_n_parts; p++)
+                    group_ht_free(&v2_part_hts[p]);
+                scratch_free(v2_part_hdr);
+                result = ray_error("cancel", NULL);
+                goto cleanup;
+            }
             if (atomic_load_explicit(&v2p2.oom, memory_order_relaxed)) {
                 for (uint32_t p = 0; p < radix_n_parts; p++)
                     group_ht_free(&v2_part_hts[p]);

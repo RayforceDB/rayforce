@@ -3603,6 +3603,86 @@ static test_result_t test_holistic_oom(void) {
     PASS();
 }
 
+/* A cancelled group by one F64 key over the v2 radix route keeps nothing:
+ * the worker hash tables and the partition tables of radix_v2 are local to
+ * the route, and its two cancel checks (after phase 1 and after phase 2)
+ * jumped to the shared cleanup, which frees neither, so every cancel at
+ * the second dispatch kept about 21 MB of committed memory.  The query is
+ * cancelled at each of its dispatches, ten rounds after one to warm the
+ * heaps; the process's committed memory (sys-current, every heap) must not
+ * grow, and each run answers `cancel` or the full answer.  Then a table
+ * init failure and a cancel in the same dispatch (#1806 review). */
+static int64_t aw_sys_current(void) {
+    ray_t* r = ray_eval_str("(at (.sys.mem) 'sys-current)");
+    int64_t v = r && !RAY_IS_ERR(r) ? r->i64 : -1;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return v;
+}
+static test_result_t test_radix_cancel_keeps_nothing(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    aw_eval_ok("(set F (table [k v] (list (as 'F64 (% (* (til 262144) 7919) 100003)) (til 262144))))");
+    const char* q = "(select {from: F by: k})";
+    aw_eval_ok("(set R0 (count (select {from: F by: k})))");
+    int last = 0;
+    for (int k = 1; k <= 40 && !last; k++) {
+        ray_pool_test_cancel_at((uint32_t)k, false);
+        ray_t* r = aw_eval(q);
+        ray_pool_test_cancel_at(0, false);
+        ray_clear_interrupt();
+        bool err = r && RAY_IS_ERR(r);
+        bool is_cancel = err && strcmp(ray_err_code(r), "cancel") == 0;
+        if (err) ray_error_free(r); else if (r) ray_release(r);
+        TEST_ASSERT_FMT(!err || is_cancel, "cancel before dispatch %d: an error other than cancel", k);
+        if (!err) last = k - 1;
+    }
+    TEST_ASSERT_FMT(last >= 2, "only %d dispatches cancelled", last);
+    int64_t c0 = 0;
+    for (int round = 0; round <= 10; round++) {
+        if (round == 1) { ray_heap_gc(); c0 = aw_sys_current(); }
+        for (int k = 1; k <= last; k++) {
+            ray_pool_test_cancel_at((uint32_t)k, false);
+            ray_t* r = aw_eval(q);
+            ray_pool_test_cancel_at(0, false);
+            ray_clear_interrupt();
+            bool is_cancel = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "cancel") == 0;
+            if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+            TEST_ASSERT_FMT(is_cancel, "round %d, cancel before dispatch %d: no cancel", round, k);
+        }
+    }
+    ray_heap_gc();
+    int64_t grown = aw_sys_current() - c0;
+    TEST_ASSERT_FMT(grown < ((int64_t)1 << 20), "ten rounds of %d cancels: committed memory grew by %lld bytes",
+                    last, (long long)grown);
+    /* a partition-table init of phase 2 that fails (slots allocated, rows
+     * NULL) in the same dispatch as a cancel, at the nth partition from 1
+     * to 24: every run answers `cancel` and keeps nothing (the process's
+     * allocation trace) */
+    for (int64_t n = 1; n <= 24; n++) {
+        ray_heap_gc();
+        bool traced = ray_mem_trace_begin();
+        ray_group_test_ht_rows_fail(n, true);
+        ray_t* r = aw_eval(q);
+        ray_group_test_ht_rows_fail(0, false);
+        ray_clear_interrupt();
+        char code[32] = "ok";
+        if (r && RAY_IS_ERR(r)) { snprintf(code, sizeof code, "%s", ray_err_code(r)); ray_error_free(r); }
+        else if (r) ray_release(r);
+        ray_heap_gc();
+        ray_mem_trace_t tr = {0};
+        if (traced) ray_mem_trace_end(&tr);
+        TEST_ASSERT_TRUE(traced);
+        TEST_ASSERT_FMT(strcmp(code, "cancel") == 0, "init %lld fails, with a cancel: %s, not cancel", (long long)n, code);
+        TEST_ASSERT_FMT(tr.net_bytes <= 0, "init %lld fails, with a cancel: %lld bytes kept", (long long)n, (long long)tr.net_bytes);
+    }
+    ray_t* v = ray_eval_str("(== R0 (count (select {from: F by: k})))");
+    bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+    if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+    TEST_ASSERT_FMT(ok, "the uncancelled query after the cancels: not its answer");
+    aw_eval_ok("(set F 0)"); aw_eval_ok("(set R0 0)");
+    PASS();
+}
+
 /* #1780: a cancel that lands while a group runs answers `cancel`, never
  * `oom` and never an answer it did not finish.  For each query, the nth
  * pool dispatch finds the query cancelled (mode 0: a cancel request; mode
@@ -6722,6 +6802,7 @@ const test_entry_t aware_entries[] = {
     { "aware/topk_cancel_at_dispatch", test_topk_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/group_cancel_status", test_group_cancel_status, aw_setup, aw_teardown },
     { "aware/holistic_oom", test_holistic_oom, aw_setup, aw_teardown },
+    { "aware/radix_cancel_keeps_nothing", test_radix_cancel_keeps_nothing, aw_setup, aw_teardown },
     { "aware/sel_compact_cancel_at_dispatch", test_sel_compact_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/distinct_str_cancel", test_distinct_str_cancel, aw_setup, aw_teardown },
     { "aware/group_keys_only_cancel", test_group_keys_only_cancel, aw_setup, aw_teardown },
