@@ -5041,6 +5041,99 @@ static int expr_helper_arg_reads_column(ray_t* expr, ray_t* tbl, int depth) {
     return 0;
 }
 
+/* Could `e` read a column other than row by row (expr_reads_rows_whole)?
+ * Not a call whose arguments are all columns of `tbl` (a compare with its
+ * schema) or literal atoms, as `(+ a c)`: that call is row-wise or reads
+ * no column whole, so such an output pays no lookup. */
+static bool expr_may_read_rows_whole(ray_t* e, ray_t* tbl) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1) return false;
+    ray_t* schema = ray_table_schema(tbl);
+    if (!schema || schema->type != RAY_I64) return true;
+    const int64_t* cols = (const int64_t*)ray_data(schema);
+    ray_t** el = (ray_t**)ray_data(e);
+    if (!el[0] || el[0]->type != -RAY_SYM) return true;
+    for (int64_t i = 1; i < e->len; i++) {
+        ray_t* a = el[i];
+        if (!a) continue;
+        if (a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED)) {
+            int64_t c = 0;
+            while (c < schema->len && cols[c] != a->i64) c++;
+            if (c == schema->len) return true;
+        } else if (a->type >= 0) {
+            return true;   /* a call, a vector, a list */
+        }
+    }
+    return false;
+}
+
+/* Is a column of `tbl` read in `e` where its value is not the row's own
+ * (#1832): through an argument of a builtin that does not map that
+ * argument element by element (ray_fn_row_arg), as the collection of
+ * `map` or an element of `list` is, or in the body of a helper or lambda
+ * literal given as a value?  `row` says whether `e` itself stands for the
+ * row.  Then a whole-table value as long as the table is no column of the
+ * rows -- `(map f [1 2 3 4])` over four rows gives one element per value,
+ * not per row -- and it is evaluated per group instead.  A direct call of
+ * a helper reads its body as the call is read; `do` and `let` pass the
+ * reading through.  A column name is taken as the column, a local of its
+ * name too: per group then, which is right whatever the output does. */
+static int expr_reads_rows_whole(ray_t* e, ray_t* tbl, bool row, bool in_body, int depth) {
+    if (!e || depth > 16) return 0;
+    if (e->type == -RAY_SYM) {
+        if ((e->attrs & ATTR_QUOTED) || row) return 0;   /* read row by row, whatever it is */
+        /* a column read whole inside a helper's or a literal's body (a
+         * local of its name too: per group then, which reads a local as it
+         * reads it anywhere); in the output's own text a builtin's whole
+         * read of a column is as dev reads it -- at's lookup by row
+         * position, a running function over the table (#1492) */
+        if (tbl_has_col(tbl, e->i64)) return in_body;
+        if (ray_sym_is_dotted(e->i64)) return 0;
+        /* a helper given as a value: called by the builtin over its values */
+        return expr_helper_arg_reads_column(e, tbl, depth + 1);
+    }
+    /* (an output with an aggregate went per group before its value was
+     * taken; an aggregate's argument is no row position below either) */
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1) return 0;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* h = el[0];
+    if (h && h->type == RAY_LIST && !(h->attrs & ATTR_QUOTED) && h->len >= 3) {
+        /* a lambda literal called in place: as a helper's direct call */
+        ray_t* h0 = ((ray_t**)ray_data(h))[0];
+        ray_t* f0 = h0 && h0->type == -RAY_SYM && !(h0->attrs & ATTR_QUOTED) ? ray_env_get(h0->i64) : NULL;
+        if (!(f0 && f0->type == RAY_VARY && (void*)(uintptr_t)f0->i64 == (void*)ray_fn)) return 0;
+        for (int64_t i = 1; i < e->len; i++)
+            if (expr_reads_rows_whole(el[i], tbl, row, in_body, depth + 1)) return 1;
+        for (int64_t i = 2; i < h->len; i++)
+            if (expr_reads_rows_whole(((ray_t**)ray_data(h))[i], tbl, row, true, depth + 1)) return 1;
+        return 0;
+    }
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return 0;   /* a computed head: as before */
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn) return 0;
+    void* fp = (void*)(uintptr_t)fn->i64;
+    if (fn->type == RAY_VARY && fp == (void*)ray_quote_fn) return 0;
+    if (fn->type == RAY_VARY && fp == (void*)ray_fn)               /* a lambda literal as a value */
+        return !row && (expr_refs_row_column(e, tbl) || expr_helper_arg_reads_column(e, tbl, depth + 1));
+    if (fn->type == RAY_LAMBDA) {
+        /* a direct call: its arguments and its body, read as the call is */
+        for (int64_t i = 1; i < e->len; i++)
+            if (expr_reads_rows_whole(el[i], tbl, row, in_body, depth + 1)) return 1;
+        if (LAMBDA_CLOSURE(fn)) return 0;
+        ray_t* body = LAMBDA_BODY(fn);
+        for (int64_t i = 0; body && body->type == RAY_LIST && i < body->len; i++)
+            if (expr_reads_rows_whole(((ray_t**)ray_data(body))[i], tbl, row, true, depth + 1)) return 1;
+        return 0;
+    }
+    if (fn->type < RAY_UNARY || fn->type > RAY_VARY) return 0;
+    bool pass = (fn->type == RAY_VARY && fp == (void*)ray_do_fn) ||
+                (fn->type == RAY_BINARY && fp == (void*)ray_let_fn);
+    for (int64_t i = 1; i < e->len; i++) {
+        bool r = row && (pass || ray_fn_row_arg(fn, e->len - 1, i));
+        if (expr_reads_rows_whole(el[i], tbl, r, in_body, depth + 1)) return 1;
+    }
+    return 0;
+}
+
 /* min/max overload on arity: only their unary calls reduce rows.  Keep
  * the name-only resolver for aggregate specifications and other signatures. */
 static uint16_t resolve_agg_call_opcode(int64_t sym_id, int64_t nargs) {
@@ -31388,6 +31481,12 @@ by_dict_done:
                      * body written there would (#1772) */
                     if (!refs_column && !full_is_row_aligned)
                         refs_column = expr_helper_arg_reads_column(val_expr_item, eval_tbl, 0);
+                    /* a value as long as the table that is no column of the
+                     * rows: per group (#1832) */
+                    if (full_is_row_aligned && expr_may_read_rows_whole(val_expr_item, eval_tbl) && expr_reads_rows_whole(val_expr_item, eval_tbl, true, false, 0)) {
+                        full_is_row_aligned = 0;
+                        refs_column = 1;
+                    }
 
                     if (refs_column && !full_is_row_aligned) {
                         /* Non-streaming aggregation fallback: the full-table
@@ -34961,6 +35060,12 @@ by_dict_done:
                      * body written there would (#1772) */
                     if (!refs_column && !full_is_row_aligned)
                         refs_column = expr_helper_arg_reads_column(nonagg_exprs[ni], tbl, 0);
+                    /* a value as long as the table that is no column of the
+                     * rows: per group (#1832) */
+                    if (full_is_row_aligned && expr_may_read_rows_whole(nonagg_exprs[ni], tbl) && expr_reads_rows_whole(nonagg_exprs[ni], tbl, true, false, 0)) {
+                        full_is_row_aligned = 0;
+                        refs_column = 1;
+                    }
 
                     if (refs_column && !full_is_row_aligned) {
                         /* Non-streaming fallback: the expression didn't
