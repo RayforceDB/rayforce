@@ -290,7 +290,7 @@
 (nil? (var (as 'I64 (list)))) -- true
 (nil? (dev (as 'F64 (list)))) -- true
 (nil? (stddev (as 'I64 (list)))) -- true
-(nil? (stddev_pop (as 'I64 (list)))) -- true
+(nil? (dev_pop (as 'I64 (list)))) -- true
 (nil? (var_pop (as 'I64 (list)))) -- true
 
 ;; ════════════════════════════════════════════════════════════════════

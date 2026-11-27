@@ -83,9 +83,6 @@
 (nil? .ipc.post) -- false
 (nil? .csv.read) -- false
 (nil? .csv.write) -- false
-;; Python compatibility aliases resolve to the same CSV builtins.
-(nil? read-csv) -- false
-(nil? write-csv) -- false
 ;; Old names must NOT resolve — we committed to no backward compat.
 gc !- name
 getenv !- name
@@ -158,3 +155,7 @@ myns.x -- 1
 ;; `.ipc.handle` outside any hook reads -1 — the thread-local default.
 (.ipc.handle) -- -1
 (.ipc.handle 0) -- -1
+;; the compatibility aliases read-csv and write-csv are removed: .csv.read
+;; and .csv.write are the names (#1826)
+read-csv !- name
+write-csv !- name

@@ -1,4 +1,4 @@
-;; var, var_pop, stddev, dev, dev_pop and stddev_pop give the same, accurate
+;; var, var_pop, stddev, dev and dev_pop give the same, accurate
 ;; value on every route (#1666).  The routes summed the raw values and
 ;; their squares, which cancel once the values are large next to their
 ;; spread: 1e8 + [0 1 2 3] repeated came out 0 from 4,000 rows and 18927.75
@@ -49,17 +49,17 @@
 (ok (keyless T) 1250000000000000000.0) -- true
 
 ;; the aliases: var and stddev are the sample forms, var_pop, dev, dev_pop
-;; and stddev_pop the population ones, on a keyless and a grouped route
+;; and dev_pop the population ones, on a keyless and a grouped route
 (set T (mk 4000 100000000 1))
 (ok (at (select {from: T q: (var v)}) 'q) (/ (* 1.25 4000) 3999)) -- true
 (ok (at (select {from: T q: (stddev v)}) 'q) (sqrt (/ (* 1.25 4000) 3999))) -- true
 (ok (at (select {from: T q: (dev v)}) 'q) (sqrt 1.25)) -- true
 (ok (at (select {from: T q: (dev_pop v)}) 'q) (sqrt 1.25)) -- true
-(ok (at (select {from: T q: (stddev_pop v)}) 'q) (sqrt 1.25)) -- true
+(ok (at (select {from: T q: (dev_pop v)}) 'q) (sqrt 1.25)) -- true
 (ok (at (select {from: T by: s q: (var v)}) 'q) (/ (* 1.25 800) 799)) -- true
 (ok (at (select {from: T by: s q: (stddev v)}) 'q) (sqrt (/ (* 1.25 800) 799))) -- true
 (ok (at (select {from: T by: s q: (dev v)}) 'q) (sqrt 1.25)) -- true
-(ok (at (select {from: T by: s q: (stddev_pop v)}) 'q) (sqrt 1.25)) -- true
+(ok (at (select {from: T by: s q: (dev_pop v)}) 'q) (sqrt 1.25)) -- true
 (ok (var (at T 'v)) (/ (* 1.25 4000) 3999)) -- true
 (ok (dev (at T 'v)) (sqrt 1.25)) -- true
 

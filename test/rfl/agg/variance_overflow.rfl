@@ -25,7 +25,7 @@
 
 ;; grouped: right or 0Nf, never 0
 (fine (at (select {from: T by: g q: (var_pop v)}) 'q) vp) -- true
-(fine (at (select {from: T by: s q: (stddev_pop v)}) 'q) (sqrt vp)) -- true
+(fine (at (select {from: T by: s q: (dev_pop v)}) 'q) (sqrt vp)) -- true
 (fine (at (select {from: T by: f q: (var_pop v)}) 'q) vp) -- true
 (fine (at (select {from: T by: k q: (var v)}) 'q) (/ (* vp 500000) 499999)) -- true
 (fine (at (update {q: (var_pop v) by: g from: T}) 'q) vp) -- true

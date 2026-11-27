@@ -56,7 +56,7 @@
 ;; stddev/var (n_keys=0 path via exec_reduction)
 ;; [2,4,4,4,5,5,7,9]: mean=5, pop_var=4, sample_var=4*(8/7)=32/7≈4.571, sample_stddev≈2.138
 (< (abs (- (var_pop (as 'F64 [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0])) 4.0)) 0.001) -- true
-(< (abs (- (stddev_pop (as 'F64 [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0])) 2.0)) 0.001) -- true
+(< (abs (- (dev_pop (as 'F64 [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0])) 2.0)) 0.001) -- true
 ;; Sample variance = pop_var * n/(n-1) = 4 * 8/7 ≈ 4.571
 (< (abs (- (var (as 'F64 [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0])) 4.571)) 0.01) -- true
 ;; Sample stddev ≈ sqrt(4.571) ≈ 2.138

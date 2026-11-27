@@ -331,7 +331,7 @@ static inline bool ray_has_timespan(const ray_t* x) {
  *   prod : numeric only
  *   all / any : numeric only, result BOOL
  *   cov / scov / wsum / wavg / pearson_corr : numeric only, result F64
- *   avg / var / var_pop / stddev / stddev_pop / med / quantile
+ *   avg / var / var_pop / stddev / dev_pop / med / quantile
  *        : numeric + temporal (result F64)
  *   min / max / first / last / count and everything else : any type
  * `t` is the positive element/column type.  DATE/TIMESTAMP are absolute points

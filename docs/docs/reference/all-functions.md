@@ -101,7 +101,7 @@ Every builtin registered in `src/` in this checkout, by arity, with its one-line
 | `deltas` | Adjacent differences, of the type `-` gives: TIMESTAMP → TIMESPAN, TIME → TIMESPAN, DATE → I32 (days), TIMESPAN → TIMESPAN, other integers → I64, floats → F64; first row is null |
 | `desc` | Sort descending |
 | `dev` | Population standard deviation; a vector of another type than numbers and temporals is a type error, empty or not |
-| `dev_pop` | Population standard deviation (alias) |
+| `dev_pop` | Population standard deviation |
 | `differ` | Boolean change flag versus previous row; first row is true |
 | `distinct` | Remove duplicates, keeping each value at its first occurrence |
 | `diverse` | Check if all elements are unique (no duplicates) |
@@ -165,7 +165,6 @@ Every builtin registered in `src/` in this checkout, by arity, with its one-line
 | `sqrt` | Square root (returns f64) |
 | `ss` | Second (0 to 59) of a time or timestamp |
 | `stddev` | Sample standard deviation (Bessel-corrected; not an alias of `dev`); a vector of another type than numbers and temporals is a type error, empty or not |
-| `stddev_pop` | Population standard deviation |
 | `strlen` | Length of each string. `""` is the STR/SYM null: `strlen` maps it to a null length, `sum` and `avg` skip it, and the `avg` of an all-empty group is null |
 | `sum` | Sum of all elements |
 | `sums` | Running sum; nulls are skipped |
@@ -400,7 +399,6 @@ Every builtin registered in `src/` in this checkout, by arity, with its one-line
 | `pull` | Entity-centric retrieval — returns all attributes as dict |
 | `query` | Compile and execute a Datalog query against EAV store |
 | `quote` | Return argument unevaluated; a bare name yields a literal symbol (`(quote x)` ≡ `'x`) |
-| `read-csv` | Load CSV file into table (mmap, parallel parse) |
 | `read-limits` | The default limits of `read-value`, as a dict |
 | `read-value` | Reads one value from data text without evaluating anything; an optional dict overrides the limits |
 | `replace` | Replace all occurrences of a string/symbol atom. An empty `to` deletes each match; an empty `from` matches nothing and returns the input |
@@ -425,7 +423,6 @@ Every builtin registered in `src/` in this checkout, by arity, with its one-line
 | `window` | Partitioned window query |
 | `window-join` | Window join — `[eq-keys... time-key]`, intervals, left, right, agg dict |
 | `window-join1` | Window join variant (strict window, no prevailing quote) |
-| `write-csv` | Write table to CSV file |
 
 ## Arithmetic
 
@@ -534,8 +531,7 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | `mode` | unary | aggr | Most frequent non-null value; ties keep the first encountered value | `(mode [1 2 2 3])` → `2` |
 | `dev` | unary | aggr | Population standard deviation; a vector of another type than numbers and temporals is a type error, empty or not | `(dev [2 4 4 4 5 5 7 9])` → `2.0` |
 | `stddev` | unary | aggr | Sample standard deviation (Bessel-corrected; not an alias of `dev`); a vector of another type than numbers and temporals is a type error, empty or not | `(stddev [1 2 3])` → `1.0` |
-| `stddev_pop` | unary | aggr | Population standard deviation | `(stddev_pop [1 2 3])` |
-| `dev_pop` | unary | aggr | Population standard deviation (alias) | `(dev_pop [1 2 3])` |
+| `dev_pop` | unary | aggr | Population standard deviation | `(dev_pop [1 2 3])` |
 | `var` | unary | aggr | Sample variance; a vector of another type than numbers and temporals is a type error, empty or not | `(var [1 2 3])` → `1.0` |
 | `var_pop` | unary | aggr | Population variance ([accuracy](../language/math.md#variance-and-standard-deviation-accuracy)) | `(var_pop [1 2 3])` |
 | `pearson_corr` | binary | aggr | Pearson correlation over paired non-null numeric inputs | `(pearson_corr [1 2 3] [2 4 6])` → `1.0` |

@@ -1118,7 +1118,7 @@ static int64_t build_row_offsets_serial(const char* buf, size_t buf_size,
     const char* end = buf + buf_size;
 
     /* Do NOT skip leading blank lines: empty lines in the data section
-     * are null rows (they were written out by write-csv for null-valued
+     * are null rows (they were written out by .csv.write for null-valued
      * single-column tables). Header-level whitespace is consumed by the
      * header parser before we reach data_offset. */
     if (p >= end) { *offsets_out = NULL; *hdr_out = NULL; return 0; }
@@ -4364,7 +4364,7 @@ ray_t* ray_read_csv(const char* path) {
  * ============================================================================ */
 
 /* -----------------------------------------------------------------------------
- * write-csv writer state
+ * .csv.write writer state
  *
  * Wraps FILE* with a sticky error flag so the dispatch loop can stay flat
  * and still report the first I/O error.  On any write failure subsequent
@@ -4538,7 +4538,7 @@ static void csv_col_info_init(csv_col_info_t* ci, ray_t* col) {
 
 static void csv_write_cell(csv_writer_t* w, const csv_col_info_t* ci, int64_t r) {
     if (!ci->col) return;
-    /* Null cell -> empty field (consistent with read-csv). */
+    /* Null cell -> empty field (consistent with .csv.read). */
     if (ci->has_nulls && ray_vec_is_null(ci->col, r)) return;
 
     int64_t dr = ci->base_row + r;

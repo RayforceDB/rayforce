@@ -25179,7 +25179,7 @@ batch_fail:
                 /* STDDEV/VAR from the merged state (pp_var_fold): the
                  * population variance and the non-null count
                  *   var_samp = var_pop * N/(N-1)
-                 *   stddev_pop = sqrt(var_pop), stddev_samp = sqrt(var_samp) */
+                 *   dev_pop = sqrt(var_pop), stddev_samp = sqrt(var_samp) */
                 int64_t vp_ci  = (int64_t)n_keys + std_vp_slot[std_i];
                 int64_t cnt_ci = (int64_t)n_keys + std_cnt_slot[std_i];
                 ray_t* vp_col  = (vp_ci < rncols) ? ray_table_col_idx(result, vp_ci) : NULL;

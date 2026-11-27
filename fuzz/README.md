@@ -22,7 +22,7 @@ hardens journal replay's decode step.
 
 `fuzz_eval` runs untrusted programs in-process, so the escape hatches that would
 compromise the fuzzer — shell (`.sys.exec`/`.sys.cmd`), `exit`/`quit`, network
-`listen`/`.ipc.open`, and file writes (`write-csv`, `.log.open`) — are compiled
+`listen`/`.ipc.open`, and file writes (`.csv.write`, `.log.open`) — are compiled
 out under `-DRAY_FUZZING` (guards in `syscmd.c` / `system.c` / `builtins.c` /
 `journal.c`). `fuzz_csv` and `fuzz_journal` expose their input as an anonymous
 in-memory file (`memfd` → `/proc/self/fd`), so there is no disk I/O.

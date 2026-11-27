@@ -6,10 +6,10 @@
 ;; scalar: the type, and the value against the F64 computation on the counts
 (type (dev S)) -- 'timespan
 (type (stddev S)) -- 'timespan
-(type (stddev_pop S)) -- 'timespan
+(type (dev_pop S)) -- 'timespan
 (<= (abs (- (as 'I64 (dev S)) (as 'I64 (dev N)))) 1) -- true
 (<= (abs (- (as 'I64 (stddev S)) (as 'I64 (stddev N)))) 1) -- true
-(== (as 'I64 (dev S)) (as 'I64 (stddev_pop S))) -- true
+(== (as 'I64 (dev S)) (as 'I64 (dev_pop S))) -- true
 (type (var S)) -- 'f64
 (type (dev N)) -- 'f64
 
@@ -45,14 +45,14 @@
 (at (as 'I64 (at (update {r: (stddev sp) from: A}) 'r)) 0) -- (at (as 'I64 (at (select {r: (stddev sp) from: A}) 'r)) 0)
 (type (at (update {r: (stddev sp) from: A}) 'r)) -- 'TIMESPAN
 (as 'I64 (at (update {r: (dev sp) from: A}) 'r)) -- [3600000000000 3600000000000]
-(as 'I64 (at (update {r: (stddev_pop sp) from: A}) 'r)) -- [3600000000000 3600000000000]
+(as 'I64 (at (update {r: (dev_pop sp) from: A}) 'r)) -- [3600000000000 3600000000000]
 
 ;; update by key: a group with one value, or none, has a null sample deviation
 ;; and a zero population deviation, and every group answers a duration
 (set U (table [g sp] (list [1 1 2 2 3] (enlist 0D01:00:00 0Nn 0D03:00:00 0D00:00:01 0Nn))))
 (type (at (update {r: (stddev sp) by: g from: U}) 'r)) -- 'TIMESPAN
 (type (at (update {r: (dev sp) by: g from: U}) 'r)) -- 'TIMESPAN
-(type (at (update {r: (stddev_pop sp) by: g from: U}) 'r)) -- 'TIMESPAN
+(type (at (update {r: (dev_pop sp) by: g from: U}) 'r)) -- 'TIMESPAN
 (nil? (at (at (update {r: (stddev sp) by: g from: U}) 'r) 0)) -- true
 (nil? (at (at (update {r: (stddev sp) by: g from: U}) 'r) 4)) -- true
 (as 'I64 (at (at (update {r: (dev sp) by: g from: U}) 'r) 0)) -- 0
@@ -64,7 +64,7 @@
 (set K (table [sp] (list (enlist 0D05:00:00 0D05:00:00 0D05:00:00))))
 (as 'I64 (at (select {r: (stddev sp) from: K}) 'r)) -- [0]
 (as 'I64 (at (select {r: (dev sp) from: K}) 'r)) -- [0]
-(as 'I64 (at (select {r: (stddev_pop sp) from: K}) 'r)) -- [0]
+(as 'I64 (at (select {r: (dev_pop sp) from: K}) 'r)) -- [0]
 (set J (table [sp] (list (as 'TIMESPAN (+ 3600000000000 (til 11))))))
 (as 'I64 (at (select {r: (stddev sp) from: J}) 'r)) -- (enlist (as 'I64 (stddev (at J 'sp))))
 (as 'I64 (at (select {r: (dev sp) from: J}) 'r)) -- (enlist (as 'I64 (dev (at J 'sp))))

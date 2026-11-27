@@ -34,16 +34,16 @@
 ;; ────────────── 2. Stat aggs on cnt==1 groups (degenerate) ──────────────
 ;; Sample variance/stddev require cnt > 1 (group.c:1286/3534). With
 ;; one row per group, the result column must carry nulls.
-;; var_pop / stddev_pop (population) only require cnt > 0 → defined.
+;; var_pop / dev_pop (population) only require cnt > 0 → defined.
 (set Tone (table [g v] (list [10 20 30 40] [1.0 2.0 3.0 4.0])))
 (count (select {v: (var v) from: Tone by: g})) -- 4
 (count (select {v: (var_pop v) from: Tone by: g})) -- 4
 (count (select {s: (stddev v) from: Tone by: g})) -- 4
-(count (select {s: (stddev_pop v) from: Tone by: g})) -- 4
+(count (select {s: (dev_pop v) from: Tone by: g})) -- 4
 ;; var_pop on a single value is 0; sum across 4 groups is 0
 (sum (at (select {v: (var_pop v) from: Tone by: g}) 'v)) -- 0.0
-;; stddev_pop on single values also 0.
-(sum (at (select {s: (stddev_pop v) from: Tone by: g}) 's)) -- 0.0
+;; dev_pop on single values also 0.
+(sum (at (select {s: (dev_pop v) from: Tone by: g}) 's)) -- 0.0
 
 ;; ────────────── 3. F64 key — forces HT path (DA rejects F64) ──────────────
 ;; group.c:2621 lists DA-eligible types; RAY_F64 is not in it, so float
@@ -196,7 +196,7 @@
 (sum (at (select {s: (sum v) c: (count v) from: Tsm by: k}) 's)) -- 2449965000
 (sum (at (select {s: (sum v) c: (count v) from: Tsm by: k}) 'c)) -- 70000
 ;; multi-agg with min/max/stddev exercises radix_phase3 null fixup
-(count (select {mn: (min v) mx: (max v) sd: (stddev v) sp: (stddev_pop v) from: Tsm by: k})) -- 10
+(count (select {mn: (min v) mx: (max v) sd: (stddev v) sp: (dev_pop v) from: Tsm by: k})) -- 10
 
 ;; ────────────── 16. Group-by then access expression (chained) ──────────────
 ;; Tests the full select pipeline including projection/at after group.
@@ -215,7 +215,7 @@
 (set Teq (table [g v] (list (take 'g 100) (take 42 100))))
 (at (at (select {v: (var_pop v) from: Teq by: g}) 'v) 0) -- 0.0
 (at (at (select {v: (var v) from: Teq by: g}) 'v) 0) -- 0.0
-(at (at (select {s: (stddev_pop v) from: Teq by: g}) 's) 0) -- 0.0
+(at (at (select {s: (dev_pop v) from: Teq by: g}) 's) 0) -- 0.0
 
 ;; ────────────── 18. Scalar VAR/STDDEV via select (parallel, ≥64K rows) ──────────────
 ;; (select {... from: T}) routes through exec_group's scalar fast path
@@ -227,7 +227,7 @@
 ;; var_pop of 0..N-1 = (N²-1)/12 = (100000²-1)/12 ≈ 833333333.25
 (>= vF1 833333000.0) -- true
 (<= vF1 833334000.0) -- true
-(>= (at (at (select {sp: (stddev_pop f) from: TvF}) 'sp) 0) 28867.0) -- true
+(>= (at (at (select {sp: (dev_pop f) from: TvF}) 'sp) 0) 28867.0) -- true
 (>= (at (at (select {v: (var f) from: TvF}) 'v) 0) 833333000.0) -- true
 (>= (at (at (select {sd: (stddev f) from: TvF}) 'sd) 0) 28867.0) -- true
 
@@ -236,13 +236,13 @@
 ;; (denominator n-1 = 0).  exec_reduction returns the typed-null atom
 ;; (0Nf), and broadcast_scalar (exec.c) propagates the null bit into
 ;; the 1-row result column so (at result 0) reports 0Nf.
-;; Population variants (var_pop / stddev_pop) divide by n and are
+;; Population variants (var_pop / dev_pop) divide by n and are
 ;; well-defined for n=1, returning 0.0.
 (set Ttiny (table [v f] (list [42] (as 'F64 [3.14]))))
 (at (at (select {v: (var v) from: Ttiny}) 'v) 0) -- 0Nf
 (at (at (select {sd: (stddev v) from: Ttiny}) 'sd) 0) -- 0Nf
 (at (at (select {vp: (var_pop v) from: Ttiny}) 'vp) 0) -- 0.0
-(at (at (select {sp: (stddev_pop v) from: Ttiny}) 'sp) 0) -- 0.0
+(at (at (select {sp: (dev_pop v) from: Ttiny}) 'sp) 0) -- 0.0
 ;; F64 cnt==1 case
 (at (at (select {v: (var f) from: Ttiny}) 'v) 0) -- 0Nf
 (at (at (select {vp: (var_pop f) from: Ttiny}) 'vp) 0) -- 0.0
@@ -260,7 +260,7 @@
 (sum (at (select {mx: (max f) from: Tfg by: k}) 'mx)) -- 110.0
 ;; var_pop per group (1.5: 10,30,50; mean=30; var_pop=((20)²+0+(20)²)/3 = 800/3)
 ;; var per group (2.5: 20,40,60; mean=40; var=400)
-(count (select {v: (var f) vp: (var_pop f) sd: (stddev f) sp: (stddev_pop f) from: Tfg by: k})) -- 2
+(count (select {v: (var f) vp: (var_pop f) sd: (stddev f) sp: (dev_pop f) from: Tfg by: k})) -- 2
 
 ;; ────────────── 22. DA path with FIRST+LAST+stat (parallel, ≥64K rows) ──────────────
 ;; Triggers has_first_last=true branch (group.c:2945-3001) with VAR/STDDEV
@@ -413,21 +413,21 @@
 (at (at (select {mn: (min f) mx: (max f) from: Taf where: (>= f 2.0)}) 'mn) 0) -- 2.0
 
 ;; ────────────── 43. Scalar agg with all-stat-aggs combination ──────────────
-;; Multi-agg pack of var, var_pop, stddev, stddev_pop, sum, count, avg
+;; Multi-agg pack of var, var_pop, stddev, dev_pop, sum, count, avg
 ;; in scalar mode (no by) — exercises full need_flags=SUM+SUMSQ+COUNT.
 ;; A scalar reduction collapses to ONE row (count v == nrows is the
 ;; row-count *value*, not the row count of the result table).
 (set Tall (table [v] (list (til 200))))
-(count (select {s: (sum v) c: (count v) av: (avg v) v: (var v) vp: (var_pop v) sd: (stddev v) sp: (stddev_pop v) from: Tall})) -- 1
-(at (at (select {s: (sum v) c: (count v) av: (avg v) v: (var v) vp: (var_pop v) sd: (stddev v) sp: (stddev_pop v) from: Tall}) 's) 0) -- 19900
-(at (at (select {s: (sum v) c: (count v) av: (avg v) v: (var v) vp: (var_pop v) sd: (stddev v) sp: (stddev_pop v) from: Tall}) 'c) 0) -- 200
+(count (select {s: (sum v) c: (count v) av: (avg v) v: (var v) vp: (var_pop v) sd: (stddev v) sp: (dev_pop v) from: Tall})) -- 1
+(at (at (select {s: (sum v) c: (count v) av: (avg v) v: (var v) vp: (var_pop v) sd: (stddev v) sp: (dev_pop v) from: Tall}) 's) 0) -- 19900
+(at (at (select {s: (sum v) c: (count v) av: (avg v) v: (var v) vp: (var_pop v) sd: (stddev v) sp: (dev_pop v) from: Tall}) 'c) 0) -- 200
 (at (at (select {c: (count v) v: (var v) sd: (stddev v) from: Tall}) 'c) 0) -- 200
 
 ;; ────────────── 44. Group var/stddev with mixed enough/insufficient ──────────────
 ;; HT path (radix or sequential) finalize loop over var/stddev (group.c:3409-3426)
 ;; and emit_agg_columns insuf branch (1332-1333) — set null bit on cnt<=1.
 (set Tmv (table [g v] (list ['x 'y 'z 'x 'x 'y] [10 20 30 40 50 60])))
-(count (select {v: (var v) vp: (var_pop v) sd: (stddev v) sp: (stddev_pop v) from: Tmv by: g})) -- 3
+(count (select {v: (var v) vp: (var_pop v) sd: (stddev v) sp: (dev_pop v) from: Tmv by: g})) -- 3
 
 ;; ────────────── 45. Group result chained: count of (group result) ──────────────
 ;; Verify table operations after group still work (column access pattern).
@@ -460,7 +460,7 @@
 ;; F64 agg input + i64 key with cardinality > DA limit (e.g. dense range
 ;; pushed past DA budget).  Use a key range that fits DA but with F64 agg.
 (set Tflarge (table [g f] (list (% (til 1200) 30) (as 'F64 (til 1200)))))
-(count (select {s: (sum f) v: (var f) sd: (stddev f) vp: (var_pop f) sp: (stddev_pop f) from: Tflarge by: g})) -- 30
+(count (select {s: (sum f) v: (var f) sd: (stddev f) vp: (var_pop f) sp: (dev_pop f) from: Tflarge by: g})) -- 30
 
 ;; ────────────── 51. Group with sym key, count + stat (no DA — sym still DA-eligible if range fits) ──────────────
 ;; SYM keys with low cardinality go through DA (group.c:2681 lists RAY_SYM).
@@ -806,15 +806,15 @@
 (set vi64 (as 'I64 (til Nprod)))
 (>= (var vi64) 0.0) -- true
 (>= (stddev vi64) 0.0) -- true
-(>= (stddev_pop vi64) 28867.0) -- true
+(>= (dev_pop vi64) 28867.0) -- true
 
-;; ────────────── 72. radix HT naming: stddev_pop + var_pop in parallel path ──────────────
+;; ────────────── 72. radix HT naming: dev_pop + var_pop in parallel path ──────────────
 ;; group.c:3594 (OP_STDDEV_POP) and 3596 (OP_VAR_POP) in the radix parallel HT
 ;; naming loop require a SYM-key (HT path), N >= 65536 (parallel), and those ops.
 ;; Tsm is already defined (70K rows, SYM key 's0..'s9, I64 value).
-(set R72sp (select {sp: (stddev_pop v) vp: (var_pop v) from: Tsm by: k}))
+(set R72sp (select {sp: (dev_pop v) vp: (var_pop v) from: Tsm by: k}))
 (count R72sp) -- 10
-;; stddev_pop of each group (7000 values each): >= 0
+;; dev_pop of each group (7000 values each): >= 0
 (>= (sum (at R72sp 'sp)) 0.0) -- true
 (>= (sum (at R72sp 'vp)) 0.0) -- true
 
@@ -848,8 +848,8 @@
 ;; stddev of (v*1) (group.c:3829)
 (set R73sd (select {sd: (stddev (* v 1.0)) from: T73 by: g}))
 (count R73sd) -- 3
-;; stddev_pop of (v*1) (group.c:3830)
-(set R73sp2 (select {sp: (stddev_pop (* v 1.0)) from: T73 by: g}))
+;; dev_pop of (v*1) (group.c:3830)
+(set R73sp2 (select {sp: (dev_pop (* v 1.0)) from: T73 by: g}))
 (count R73sp2) -- 3
 ;; var of (v*1) (group.c:3831)
 (set R73v (select {vv: (var (* v 1.0)) from: T73 by: g}))
@@ -888,8 +888,8 @@
 ;; stddev(v*1): L3829 case OP_STDDEV
 (set Rhtf_sd (select {sd: (stddev (* v 1.0)) from: Thtf by: g}))
 (count Rhtf_sd) -- 3
-;; stddev_pop(v*1): L3830 case OP_STDDEV_POP
-(set Rhtf_sp (select {sp: (stddev_pop (* v 1.0)) from: Thtf by: g}))
+;; dev_pop(v*1): L3830 case OP_STDDEV_POP
+(set Rhtf_sp (select {sp: (dev_pop (* v 1.0)) from: Thtf by: g}))
 (count Rhtf_sp) -- 3
 ;; var(v*1): L3831 case OP_VAR
 (set Rhtf_v (select {vv: (var (* v 1.0)) from: Thtf by: g}))

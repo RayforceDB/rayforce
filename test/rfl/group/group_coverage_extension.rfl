@@ -36,11 +36,11 @@
 ;; Population stddev of 0..N-1:
 ;;   var_pop = (N² - 1) / 12
 ;;   For N=70000: var_pop = (70000² - 1) / 12 = 4899999999 / 12 ≈ 408333333.25
-;;   stddev_pop ≈ sqrt(408333333.25) ≈ 20207.26
+;;   dev_pop ≈ sqrt(408333333.25) ≈ 20207.26
 ;; ════════════════════════════════════════════════════════════════════════
 (set Vbig_i64 (as 'I64 (til 70000)))
-(set Sp_result (stddev_pop Vbig_i64))
-;; stddev_pop of 0..69999 ≈ 20207.26; verify within 0.1
+(set Sp_result (dev_pop Vbig_i64))
+;; dev_pop of 0..69999 ≈ 20207.26; verify within 0.1
 (< (abs (- Sp_result 20207.26)) 0.1) -- true
 
 ;; var_pop parallel (OP_VAR_POP case, line 1930)
@@ -189,9 +189,9 @@
 ;; All groups have same stddev (each is a scaled arithmetic progression).
 ;; ════════════════════════════════════════════════════════════════════════
 (set Tdastd (table [k v] (list (as 'I64 (% (til N_dafl) 10)) (as 'I64 (til N_dafl)))))
-(set Rdastd (select {s: (stddev_pop v) by: k from: Tdastd}))
+(set Rdastd (select {s: (dev_pop v) by: k from: Tdastd}))
 (count Rdastd) -- 10
-;; Group k=0 has values 0,10,20,...,69990 (n=7000, d=10): stddev_pop = 10*sqrt((7000²-1)/12) ≈ 20207.26
+;; Group k=0 has values 0,10,20,...,69990 (n=7000, d=10): dev_pop = 10*sqrt((7000²-1)/12) ≈ 20207.26
 (< (abs (- (at (at Rdastd 's) 0) 20207.26)) 1.0) -- true
 
 ;; ════════════════════════════════════════════════════════════════════════

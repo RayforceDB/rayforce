@@ -50,11 +50,11 @@
 (at (at (select {x: (var      v) from: T by: g where: (== g 3)}) 'x) 0)  -- 87500.0
 (at (at (select {x: (var_pop  v) from: T by: g where: (== g 3)}) 'x) 0)  -- 83125.0
 (at (at (select {x: (stddev   v) from: T by: g where: (== g 3)}) 'x) 0)  -- 295.8039891549808
-(at (at (select {x: (stddev_pop v) from: T by: g where: (== g 3)}) 'x) 0) -- 288.31405222988875
+(at (at (select {x: (dev_pop v) from: T by: g where: (== g 3)}) 'x) 0) -- 288.31405222988875
 
 ;; dev_pop and var_pop variants (population vs sample)
 (count (select {d: (dev_pop v) v: (var_pop v) from: T by: g}))  -- 50
-(count (select {d: (stddev_pop v) from: T by: g}))              -- 50
+(count (select {d: (dev_pop v) from: T by: g}))              -- 50
 
 ;; ────────────── median ──────────────
 ;; (med v) is RAY_FN_AGGR but not in the planner's streaming-agg whitelist;

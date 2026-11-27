@@ -1,0 +1,13 @@
+;; Invariants for `dev_pop` (population std-dev).
+
+(dev_pop [5 5 5 5 5]) -- 0.0
+
+;; non-negative
+(set V (rand 100 1000))
+1 -- (as 'I64 (>= (dev_pop V) 0.0))
+
+;; dev == dev_pop  (both use population divisor)
+1 -- (as 'I64 (< (abs (- (dev V) (dev_pop V))) 0.0001))
+;; stddev_pop is removed: dev_pop is the name (#1826)
+(stddev_pop [1.0 2.0 3.0]) !- name
+(select {from: (table [v] (list [1.0 2.0])) r: (stddev_pop v)}) !- name

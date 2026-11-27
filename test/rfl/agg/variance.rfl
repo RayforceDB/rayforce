@@ -5,8 +5,8 @@
 ;;   var        -> sample=1, take_sqrt=0
 ;;   var_pop    -> sample=0, take_sqrt=0
 ;;   stddev     -> sample=1, take_sqrt=1
-;;   stddev_pop -> sample=0, take_sqrt=1
-;;   dev        -> sample=0, take_sqrt=1 (alias of stddev_pop)
+;;   dev_pop -> sample=0, take_sqrt=1
+;;   dev        -> sample=0, take_sqrt=1 (alias of dev_pop)
 ;;
 ;; Canonical Wikipedia fixture: [2 4 4 4 5 5 7 9]
 ;;   mean         = 5
@@ -18,7 +18,7 @@
 
 ;; ─── canonical fixture: exact integer answers ─────────────────────
 (var_pop    [2 4 4 4 5 5 7 9]) -- 4.0
-(stddev_pop [2 4 4 4 5 5 7 9]) -- 2.0
+(dev_pop [2 4 4 4 5 5 7 9]) -- 2.0
 (dev        [2 4 4 4 5 5 7 9]) -- 2.0
 
 ;; sample_var = 32/7 — compare with tolerance.
@@ -28,7 +28,7 @@
 
 ;; ─── F64 input gives the same answers as I64 input ────────────────
 (var_pop    [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0]) -- 4.0
-(stddev_pop [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0]) -- 2.0
+(dev_pop [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0]) -- 2.0
 (dev        [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0]) -- 2.0
 (< (abs (- (var    [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0]) 4.571428571428571)) 0.000001) -- true
 (< (abs (- (stddev [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0]) 2.138089935299395)) 0.000001) -- true
@@ -43,8 +43,8 @@
 (type (var_pop    [1 2 3])) -- 'f64
 (stddev     [1 2 3]) -- 1.0
 (type (stddev     [1 2 3])) -- 'f64
-(< (abs (- (stddev_pop [1 2 3]) 0.8164965809277260)) 0.000001) -- true
-(type (stddev_pop [1 2 3])) -- 'f64
+(< (abs (- (dev_pop [1 2 3]) 0.8164965809277260)) 0.000001) -- true
+(type (dev_pop [1 2 3])) -- 'f64
 (< (abs (- (dev [1 2 3]) 0.8164965809277260)) 0.000001) -- true
 (type (dev        [1 2 3])) -- 'f64
 
@@ -52,31 +52,31 @@
 (var        [3 3 3 3]) -- 0.0
 (var_pop    [3 3 3 3]) -- 0.0
 (stddev     [3 3 3 3]) -- 0.0
-(stddev_pop [3 3 3 3]) -- 0.0
+(dev_pop [3 3 3 3]) -- 0.0
 (dev        [3 3 3 3]) -- 0.0
 
 ;; constant F64 column — same story.
 (var_pop    [7.5 7.5 7.5 7.5 7.5]) -- 0.0
-(stddev_pop [7.5 7.5 7.5 7.5 7.5]) -- 0.0
+(dev_pop [7.5 7.5 7.5 7.5 7.5]) -- 0.0
 
 ;; ─── two-element diff [1 5]: mean=3, Σ(x-mean)² = 4+4 = 8 ─────────
 ;;   pop_var = 8/2 = 4,  sample_var = 8/1 = 8
 ;;   pop_stddev = 2,     sample_stddev = √8 ≈ 2.828427…
 (var_pop    [1 5]) -- 4.0
 (var        [1 5]) -- 8.0
-(stddev_pop [1 5]) -- 2.0
+(dev_pop [1 5]) -- 2.0
 (dev        [1 5]) -- 2.0
 (< (abs (- (stddev [1 5]) 2.828427124746190)) 0.000001) -- true
 
 ;; ─── narrow-int coercion to F64 (I32 / I16 / U8 paths) ────────────
 (var_pop    (as 'I32 [2 4 4 4 5 5 7 9])) -- 4.0
-(stddev_pop (as 'I32 [2 4 4 4 5 5 7 9])) -- 2.0
+(dev_pop (as 'I32 [2 4 4 4 5 5 7 9])) -- 2.0
 (dev        (as 'I32 [2 4 4 4 5 5 7 9])) -- 2.0
 (type (var_pop (as 'I32 [2 4 4 4 5 5 7 9]))) -- 'f64
 
 (var_pop    (as 'I16 [2 4 4 4 5 5 7 9])) -- 4.0
-(stddev_pop (as 'I16 [2 4 4 4 5 5 7 9])) -- 2.0
-(type (stddev_pop (as 'I16 [2 4 4 4 5 5 7 9]))) -- 'f64
+(dev_pop (as 'I16 [2 4 4 4 5 5 7 9])) -- 2.0
+(type (dev_pop (as 'I16 [2 4 4 4 5 5 7 9]))) -- 'f64
 
 (var_pop    (as 'U8 [2 4 4 4 5 5 7 9])) -- 4.0
 (dev        (as 'U8 [2 4 4 4 5 5 7 9])) -- 2.0
@@ -90,7 +90,7 @@
 ;; var_stddev_core(sample=0) → make_f64(0.0)
 ;; var_stddev_core(sample=1, n<=1) → ray_typed_null(-RAY_F64) == 0Nf
 (var_pop    [42]) -- 0.0
-(stddev_pop [42]) -- 0.0
+(dev_pop [42]) -- 0.0
 (dev        [42]) -- 0.0
 (var    [42]) -- 0Nf
 (stddev [42]) -- 0Nf
@@ -99,16 +99,16 @@
 
 ;; F64 length-1 pop side.
 (var_pop    [3.14]) -- 0.0
-(stddev_pop [3.14]) -- 0.0
+(dev_pop [3.14]) -- 0.0
 
 ;; ─── algebraic invariant: stddev² == var (within fp tolerance) ────
 (set V [2 4 4 4 5 5 7 9])
 (< (abs (- (* (stddev V) (stddev V)) (var V))) 0.000001) -- true
-(< (abs (- (* (stddev_pop V) (stddev_pop V)) (var_pop V))) 0.000001) -- true
+(< (abs (- (* (dev_pop V) (dev_pop V)) (var_pop V))) 0.000001) -- true
 (< (abs (- (* (dev V) (dev V)) (var_pop V))) 0.000001) -- true
 
-;; dev is an alias for stddev_pop — must be bit-equal.
-(== (dev V) (stddev_pop V)) -- true
+;; dev is an alias for dev_pop — must be bit-equal.
+(== (dev V) (dev_pop V)) -- true
 
 ;; population variance is bounded above by sample variance for n>=2.
 (<= (var_pop V) (var V)) -- true
@@ -118,5 +118,5 @@
 (>= (var R) 0.0) -- true
 (>= (var_pop R) 0.0) -- true
 (>= (stddev R) 0.0) -- true
-(>= (stddev_pop R) 0.0) -- true
+(>= (dev_pop R) 0.0) -- true
 (>= (dev R) 0.0) -- true

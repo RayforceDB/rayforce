@@ -90,8 +90,7 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `mode` | unary, aggr | Most frequent non-null value; ties keep the first encountered value | `(mode [1 2 2 3])` → `2` |
 | `dev` | unary, aggr | Population standard deviation; a vector of another type than numbers and temporals is a type error, empty or not | `(dev [1 2 3])` → `0.816...` |
 | `stddev` | unary, aggr | Sample standard deviation (Bessel-corrected; not an alias of `dev`); a vector of another type than numbers and temporals is a type error, empty or not | `(stddev [1 2 3])` → `1.0` |
-| `stddev_pop` | unary, aggr | Population standard deviation | `(stddev_pop [1 2 3])` |
-| `dev_pop` | unary, aggr | Population standard deviation (alias) | `(dev_pop [1 2 3])` |
+| `dev_pop` | unary, aggr | Population standard deviation | `(dev_pop [1 2 3])` |
 | `var` | unary, aggr | Sample variance; a vector of another type than numbers and temporals is a type error, empty or not | `(var [1 2 3])` → `1.0` |
 | `var_pop` | unary, aggr | Population variance ([accuracy](../language/math.md#variance-and-standard-deviation-accuracy)) | `(var_pop [1 2 3])` |
 | `pearson_corr` | binary, aggr | Pearson correlation over paired non-null numeric inputs | `(pearson_corr [1 2 3] [2 4 6])` → `1.0` |

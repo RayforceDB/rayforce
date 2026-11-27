@@ -5794,7 +5794,7 @@ static test_result_t test_parted_nullable_stats(void) {
     static const char* const qs[] = {
         "(select {a: (avg x) b: (avg y) from: T by: g asc: g})",
         "(select {v: (var x) w: (var y) vp: (var_pop x) wp: (var_pop y) from: T by: g asc: g})",
-        "(select {d: (dev x) e: (dev y) s: (stddev x) t: (stddev y) sp: (stddev_pop y) from: T by: g asc: g})",
+        "(select {d: (dev x) e: (dev y) s: (stddev x) t: (stddev y) sp: (dev_pop y) from: T by: g asc: g})",
         "(select {a: (avg x) b: (avg y) v: (var x) d: (dev y) from: T where: (> y 100) by: g asc: g})",
         "(select {one: 1 a: (avg x) v: (var y) from: T by: g asc: g})",
         "(select {a: (avg x) v: (var x) d: (dev x) c: (count x) from: T where: (== 0 (% y 4)) by: g asc: g})",

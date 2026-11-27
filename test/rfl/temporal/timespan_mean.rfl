@@ -119,5 +119,5 @@
 (as 'I64 (at (select {r: (max sp) from: Nu}) 'r)) -- [10800000000000]
 (at (select {r: (stddev sp) from: Nu}) 'r) -- (enlist (stddev (at Nu 'sp)))
 (at (select {r: (dev sp) from: Nu}) 'r) -- (enlist (dev (at Nu 'sp)))
-(at (select {r: (stddev_pop sp) from: Nu}) 'r) -- (enlist (stddev_pop (at Nu 'sp)))
+(at (select {r: (dev_pop sp) from: Nu}) 'r) -- (enlist (dev_pop (at Nu 'sp)))
 (at (select {r: (count sp) from: Nu}) 'r) -- [3]

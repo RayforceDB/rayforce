@@ -438,7 +438,7 @@
 ;;    local wall-clock value to UTC.  No offset → stored verbatim (UTC).
 ;; ════════════════════════════════════════════════════════════════════════════
 (.sys.exec "printf 'ts\n2001-01-01 01:01:01+05:30\n2001-01-01 01:01:01\n2001-01-01 01:01:01+01:00\n2001-01-01 01:01:01Z\n2001-01-01 01:01:01+0530\n2001-01-01 06:01:01-05:00\n2001-01-01 01:01:01.500000000+01:00\n' > rf_test_csv_types_tz.csv") -- 0
-(set Ttz (read-csv [TIMESTAMP] "rf_test_csv_types_tz.csv"))
+(set Ttz (.csv.read [TIMESTAMP] "rf_test_csv_types_tz.csv"))
 (count Ttz) -- 7
 (at (at Ttz 'ts) 0) -- 2000.12.31D19:31:01.000000000
 (at (at Ttz 'ts) 1) -- 2001.01.01D01:01:01.000000000

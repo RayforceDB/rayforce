@@ -77,7 +77,7 @@ static inline double clear_neg_zero(double v) {
 #endif
 
 /* ══════════════════════════════════════════
- * I/O builtins: println, show, format, read-csv, write-csv, as, type
+ * I/O builtins: println, show, format, .csv.read, .csv.write, as, type
  * ══════════════════════════════════════════ */
 
 /* Helper: print a ray_t value to a file handle */
@@ -827,7 +827,7 @@ ray_t* ray_exit_fn(ray_t* arg) {
 #endif
 }
 
-/* (read-csv path) — read CSV file, return RAY_TABLE */
+/* (.csv.read path) — read CSV file, return RAY_TABLE */
 /* Helper: resolve a type name symbol to a ray type code */
 static int8_t resolve_type_name(int64_t sym_id) {
     ray_t* s = ray_sym_str(sym_id);
@@ -862,9 +862,9 @@ static int8_t resolve_type_name(int64_t sym_id) {
 }
 
 ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
-    if (n < 1 || n > 3) return ray_error("arity", "read-csv: expects 1 to 3 arguments, got %lld", (long long)n);
+    if (n < 1 || n > 3) return ray_error("arity", ".csv.read: expects 1 to 3 arguments, got %lld", (long long)n);
 
-    /* (read-csv [types] "path"), (read-csv [names] [types] "path"), or (read-csv "path") */
+    /* (.csv.read [types] "path"), (.csv.read [names] [types] "path"), or (.csv.read "path") */
     ray_t* path_obj = NULL;
     ray_t* schema = NULL;
     ray_t* names = NULL;
@@ -884,8 +884,8 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
     if (path_obj->type == -RAY_STR)
         path = ray_str_ptr(path_obj);
     else
-        return ray_error("type", "read-csv: path must be str, got %s", ray_type_name(path_obj->type));
-    if (!path) return ray_error("domain", "read-csv: empty path");
+        return ray_error("type", ".csv.read: path must be str, got %s", ray_type_name(path_obj->type));
+    if (!path) return ray_error("domain", ".csv.read: empty path");
 
     if (schema) {
         int64_t ncols = schema->len;
@@ -895,11 +895,11 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
         for (int64_t i = 0; i < ncols; i++) {
             int64_t sid = ray_read_sym(sym_data, i, schema->type, schema->attrs);
             col_types[i] = resolve_type_name(sid);
-            if (col_types[i] < 0) return ray_error("type", "read-csv: unknown column type name in schema");
+            if (col_types[i] < 0) return ray_error("type", ".csv.read: unknown column type name in schema");
         }
         int64_t col_names[256];
         if (names) {
-            if (names->len != ncols) return ray_error("length", "read-csv: names and types must match, got %lld names and %lld types", (long long)names->len, (long long)ncols);
+            if (names->len != ncols) return ray_error("length", ".csv.read: names and types must match, got %lld names and %lld types", (long long)names->len, (long long)ncols);
             void* name_data = ray_data(names);
             for (int64_t i = 0; i < ncols; i++)
                 col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
@@ -1143,23 +1143,23 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
     return out;
 }
 
-/* (write-csv table path) — write table to CSV file */
+/* (.csv.write table path) — write table to CSV file */
 ray_t* ray_write_csv_fn(ray_t** args, int64_t n) {
 #ifdef RAY_FUZZING
     /* No filesystem writes to attacker-controlled paths under fuzzing. */
     (void)args; (void)n;
-    return ray_error("restricted", "write-csv disabled under fuzzing");
+    return ray_error("restricted", ".csv.write disabled under fuzzing");
 #endif
-    if (n < 2) return ray_error("arity", "write-csv: expects 2 arguments, got %lld", (long long)n);
+    if (n < 2) return ray_error("arity", ".csv.write: expects 2 arguments, got %lld", (long long)n);
     ray_t* tbl = args[0];
     ray_t* path_obj = args[1];
-    if (tbl->type != RAY_TABLE) return ray_error("type", "write-csv: first argument must be table, got %s", ray_type_name(tbl->type));
+    if (tbl->type != RAY_TABLE) return ray_error("type", ".csv.write: first argument must be table, got %s", ray_type_name(tbl->type));
     const char* path = NULL;
     if (path_obj->type == -RAY_STR)
         path = ray_str_ptr(path_obj);
     else
-        return ray_error("type", "write-csv: path must be str, got %s", ray_type_name(path_obj->type));
-    if (!path) return ray_error("domain", "write-csv: empty path");
+        return ray_error("type", ".csv.write: path must be str, got %s", ray_type_name(path_obj->type));
+    if (!path) return ray_error("domain", ".csv.write: empty path");
     ray_err_t err = ray_write_csv(tbl, path);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
     return make_i64(0);
