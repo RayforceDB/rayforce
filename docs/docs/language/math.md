@@ -582,6 +582,10 @@ Median value.
 (med [1 3 5 7 9])  ; 5.0
 ```
 
+For a float vector, a midpoint or an interpolation that overflows, as in
+`(med [1e308 1e308])` or `(quantile [-1e308 1e308] 0.5)`, is the null `0Nf`,
+in a direct call and in a `select`, with or without `by:`, alike.
+
 For a TIMESPAN vector, the median is a TIMESPAN: a median of durations is a
 duration. An even-sized input takes the midpoint of the two middle values,
 rounded to the nanosecond (half away from zero); an odd-sized input answers one

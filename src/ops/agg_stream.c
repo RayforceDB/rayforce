@@ -871,7 +871,7 @@ static void median_merge(void* dd, const void* ss, acc_arena_t* a){ (void)a;
     for (int64_t i=0;i<s->len;i++) median_push(d, s->buf[i]); }
 static ray_t* median_final(const void* s, acc_arena_t* a, int64_t param){ (void)a; (void)param; median_state* st=(median_state*)s;
     if (st->len==0) return ray_typed_null(-RAY_F64);
-    return ray_f64(ray_median_dbl_inplace(st->buf, st->len)); }
+    return ray_f64(ray_f64_fin(ray_median_dbl_inplace(st->buf, st->len))); }
 static void median_destroy(void* s){ median_state* st=s; ray_free_raw(st->buf); st->buf=NULL; st->len=st->cap=0; }
 static const agg_vtable_t MEDIAN_I64 = { .state_size=sizeof(median_state), .kind=ACC_BUFFERED, .out_type=RAY_F64,
     .init=median_init, .update_batch=median_update_i64, .merge=median_merge, .finalize=median_final, .destroy=median_destroy };

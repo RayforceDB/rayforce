@@ -278,7 +278,7 @@ The lazy descriptor accepts `types` and `strict`; projections and predicates bel
 in the query. Schema conversions are validated when a query opens the file.
 
 `strict: true` rejects decoded nonnull values that would become native nulls
-(including empty text, NaNs, and sentinel integers after type conversion), and
+(including empty text, NaNs, infinities, and sentinel integers after type conversion), and
 validates UTF-8 for annotated text. Actual Parquet nulls remain supported.
 Widening an integer type can preserve a value otherwise reserved as null.
 Strict mode validates decoded values; projections, footer-only counts, and
@@ -352,8 +352,8 @@ table operations.
 - Parquet dates/timestamps are converted from the Unix epoch to Rayforce's
   2000 epoch. Timestamp timezone annotations are not retained as separate
   metadata. Unannotated integer columns remain integers.
-- Existing Rayforce null semantics apply: empty strings, NaNs, and native
-  integer null sentinels are represented as nulls. Their original distinction
+- Existing Rayforce null semantics apply: empty strings, NaNs, DOUBLE and
+  FLOAT infinities, and native integer null sentinels are represented as nulls. Their original distinction
   from Parquet nulls is not preserved. This is not a lossless interchange path
   for those values. Enable `strict: true` to reject these collisions instead.
 - Timestamps outside the native nanosecond range (a 9999-12-31 "end of time"

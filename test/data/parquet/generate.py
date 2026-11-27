@@ -389,3 +389,11 @@ if __name__ == '__main__':
     rows_unsupported=[[1,2,3],[1500,-250,0],[b'\x01',b'\x02',b'\x03'],[bytes([i])*16 for i in (1,2,3)],[bytes([i])*12 for i in (1,2,3)]]
     write(root/'unsupported-columns.parquet',specs_unsupported,[rows_unsupported],codec=0,dictionary=False)
     write(root/'decimal-bad-scale.parquet',[('d',2,False,('decimal',5,3,True))],[[[1,2,3]]],dictionary=False)
+    # Raw infinities, which the reader turns into the float null (#1769):
+    # DOUBLE and FLOAT, plain and dictionary-encoded, required and optional.
+    inf, ninf = float('inf'), float('-inf')
+    inf_rows=[[inf,1.5,ninf,2.5,inf,3.5,ninf,4.5,5.5],[inf,1.5,ninf,2.5,inf,3.5,ninf,4.5,5.5],
+              [inf,None,ninf,2.5,None,3.5,inf,4.5,5.5],[inf,None,ninf,2.5,None,3.5,inf,4.5,5.5]]
+    inf_specs=[('d',5,False,None),('f',4,False,None),('od',5,True,None),('of',4,True,None)]
+    for dictionary in (False,True):
+        write(root/f'infinities-{int(dictionary)}.parquet',inf_specs,[inf_rows],codec=0,dictionary=dictionary)

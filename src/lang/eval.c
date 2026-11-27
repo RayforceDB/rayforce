@@ -3033,16 +3033,6 @@ static ray_t* int_vec_copy(ray_t* v, int64_t len) {
     return r;
 }
 
-/* Whether an F64 vector holds an infinity: one branch-free pass, which the
- * compiler vectorises. */
-static bool f64_any_inf(const ray_t* v, int64_t len) {
-    const uint64_t* u = (const uint64_t*)ray_data((ray_t*)v);
-    uint64_t hit = 0;
-    for (int64_t i = 0; i < len; i++)
-        hit |= (u[i] & UINT64_C(0x7fffffffffffffff)) == UINT64_C(0x7ff0000000000000);
-    return hit != 0;
-}
-
 /* A unary atomic builtin over a typed vector through the vector kernel the
  * query path runs (#1756): the boxed map below costs two allocations and
  * two frees per element around a one-instruction operation.  Taken only for
@@ -3071,14 +3061,6 @@ __attribute__((noinline)) static ray_t* unary_kernel_vec(ray_unary_fn fn, ray_t*
     if (v->type != RAY_BOOL && v->type != RAY_U8 && v->type != RAY_I16 &&
         v->type != RAY_I32 && v->type != RAY_I64 && v->type != RAY_F32 &&
         v->type != RAY_F64) return NULL;
-    /* An infinity is the null to the atom builtins `neg abs floor ceil
-     * round` (the boxed map's answer), where their kernels keep it: a
-     * vector holding one keeps the boxed map, at every length.  A literal
-     * cannot write one, but a deserialized vector can. */
-    if (v->type == RAY_F64 &&
-        (fn == ray_neg_fn || fn == ray_abs_fn || fn == ray_floor_fn ||
-         fn == ray_ceil_fn || fn == ray_round_fn) && f64_any_inf(v, len))
-        return NULL;
     /* floor and ceil of an integer are the integer (ray_floor_fn hands the
      * atom back, a null included): the vector's copy, its nulls flagged as
      * the boxed map's stores flag them.  No kernel, no cast. */
