@@ -34933,8 +34933,12 @@ by_dict_done:
                  * slices give at most n_groups-way parallelism and the
                  * largest group is one serial dedup (12 groups over 4M rows:
                  * one of 1.2M rows); the kernel partitions by (group, value)
-                 * there, see count_distinct_per_group_parallel. */
-                bool cd_gid_kernel = n_groups > 50000 || ray_cd_few_groups_kernel_ok(nrows, n_groups);
+                 * there, see count_distinct_per_group_parallel.  Many rows
+                 * are the rows a where: keeps: the slices hold only those,
+                 * while the kernel reads the group of every row of the
+                 * table (a hundred million for a few thousand kept). */
+                int64_t cd_rows = saved_selection ? ray_rowsel_meta(saved_selection)->total_pass : nrows;
+                bool cd_gid_kernel = n_groups > 50000 || ray_cd_few_groups_kernel_ok(cd_rows, n_groups);
                 int needs_slice_idx = 0;
                 for (int64_t ni = 0; ni < n_nonaggs && !needs_slice_idx; ni++) {
                     ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni], tbl);
@@ -35057,6 +35061,7 @@ by_dict_done:
                                     col = count_distinct_per_group_buf(
                                         cd_inner, tbl, idx_buf, offsets, grp_cnt, n_groups);
                                 } else {
+                                    agg_route_note_cd_row_map();
                                     col = ray_count_distinct_per_group(
                                         src_for_global, row_gid, nrows, n_groups);
                                 }

@@ -4690,6 +4690,43 @@ static bool cd_step_faults_ok(cd_step_t s, long max, long* faults, long* excused
     return *faults - *excused <= max;
 }
 
+/* count distinct by a few groups under a where: the row-map kernel reads
+ * the group of every row of the table, the per-group slices only the rows
+ * the where: keeps, so the kernel's few-groups gate counts the kept rows: a
+ * where: keeping 2,000 of 400,000 rows stays on the slices.  Without the
+ * where: the gate decides over all the rows (the kernel at 4 workers when
+ * the heap has room).  The min beside it keeps the count distinct off the
+ * grouping itself, on the per-group route.  Each of the 4 groups holds 250
+ * distinct values either way: v = i mod 1000 over the rows i = g mod 4. */
+static test_result_t test_cd_few_groups_kept_rows(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* init = ray_eval_str(
+        "(set cdk (table [g v w u] (list (% (til 400000) 4) (% (til 400000) 1000) (til 400000)"
+        " (as 'SYM (as 'STR (% (til 400000) 977))))))");
+    TEST_ASSERT_NOT_NULL(init); TEST_ASSERT_FALSE(RAY_IS_ERR(init)); ray_release(init);
+    static const struct { const char* q; int64_t rows; } cases[] = {
+        { "(select {n: (count (distinct v)) m: (min u) from: cdk by: g where: (< w 2000)})", 2000 },
+        { "(select {n: (count (distinct v)) m: (min u) from: cdk by: g})", 400000 },
+    };
+    for (size_t t = 0; t < sizeof(cases) / sizeof(cases[0]); t++) {
+        bool kernel = ray_cd_few_groups_kernel_ok(cases[t].rows, 4);
+        agg_route_reset();
+        ray_t* got = ray_eval_str(cases[t].q);
+        agg_route_stats_t st = agg_route_stats();
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->type == RAY_TABLE, "%s: error", cases[t].q);
+        TEST_ASSERT_EQ_I(ray_table_nrows(got), 4);
+        const int64_t* n = ray_data(ray_table_get_col_idx(got, 1));
+        for (int64_t i = 0; i < 4; i++) TEST_ASSERT_EQ_I(n[i], 250);
+        TEST_ASSERT_FMT(st.cd_row_map == (kernel ? 1u : 0u), "%s: row-map kernel ran %llu times, gate %d",
+                        cases[t].q, (unsigned long long)st.cd_row_map, (int)kernel);
+        ray_release(got);
+    }
+    /* the gate itself: the kept rows alone are too few for the kernel */
+    TEST_ASSERT_FALSE(ray_cd_few_groups_kernel_ok(2000, 4));
+    PASS();
+}
+
 static test_result_t test_cd_gate_read_ahead(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
@@ -6815,6 +6852,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/select_read_ahead_sparse_filter", test_select_read_ahead_sparse_filter, contract_setup, contract_teardown },
     { "agg_contract/agg_topk_ask_ahead", test_agg_topk_ask_ahead, contract_setup, contract_teardown },
     { "agg_contract/cd_gate_read_ahead", test_cd_gate_read_ahead, contract_setup, contract_teardown },
+    { "agg_contract/cd_few_groups_kept_rows", test_cd_few_groups_kept_rows, contract_setup, contract_teardown },
 #endif
     { NULL, NULL, NULL, NULL },
 };
