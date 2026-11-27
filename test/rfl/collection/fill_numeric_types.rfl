@@ -1,0 +1,70 @@
+;; fill with a replacement of another numeric or temporal type: the result is
+;; the vector's type, the replacement cast to it as (as 'T r) casts it,
+;; whichever cell comes first (#1778).  A float casts to an integer, DATE,
+;; TIME or TIMESTAMP toward zero, and to a TIMESPAN to the nearest
+;; nanosecond, half away from zero.
+(fill 3 [0Nf 1.5]) -- [3.0 1.5]
+(fill 3 [1.5 0Nf]) -- [1.5 3.0]
+(type (fill 2.5 [1 0N])) -- 'I64
+(fill 2.5 [0N 1]) -- [2 1]
+(fill 2.5 [1 0N]) -- [1 2]
+(fill -2.7 [0N 1]) -- [-2 1]
+(fill 3 (as 'DATE [0N 1])) -- (as 'DATE [3 1])
+(type (fill true [0N 1 2])) -- 'I64
+(fill true [0N 1 2]) -- [1 1 2]
+(fill 3i [0N 1]) -- [3 1]
+(type (fill 2.5 (as 'F32 [0Nf 1.5]))) -- 'F32
+(fill 2.5 (as 'TIMESPAN [0N 7])) -- (as 'TIMESPAN [3 7])
+(fill 1e300 (as 'I16 [0N 7])) -- (as 'I16 [32767 7])
+(fill (as 'TIMESTAMP 86400000000000) (as 'DATE [0N 7])) -- (as 'DATE [1 7])
+(fill (as 'DATE 5) (as 'TIMESTAMP [0N 7])) -- (as 'TIMESTAMP [432000000000000 7])
+;; a replacement vector is cast the same way
+(fill [3.5 4.5] [0N 1]) -- [3 1]
+(fill (as 'DATE [3 4]) (as 'I32 [7 0N])) -- (as 'I32 [7 4])
+;; every numeric and temporal vector type against every such replacement
+;; type, the null first and the null last: the vector's type both times,
+;; with each null replaced by the cast replacement
+(set types (list 'B8 'U8 'I16 'I32 'I64 'F32 'F64 'DATE 'TIME 'TIMESTAMP))
+(set reps (list true 0x05 5h 5i 5 (as 'F32 2.5) 2.5 (as 'DATE 5) (as 'TIME 5) (as 'TIMESTAMP 5)))
+(set vec2 (fn [t nf] (if (or (== t 'B8) (== t 'U8)) (as t (if nf [1 7] [7 1])) (as t (if nf [0N 7] [7 0N])))))
+(set ok (fn [t r nf] (let v (vec2 t nf)) (let x (fill r v)) (and (== (type x) t) (identical x (fill (as t r) v)))))
+(set allok (fn [nf] (all (raze (map (fn [t] (map (fn [r] (ok t r nf)) reps)) types)))))
+(allok true) -- true
+(allok false) -- true
+;; a cast as refuses (a TIMESPAN and a DATE, TIME or TIMESTAMP) gives the
+;; LIST of each cell, the null first or last
+(fill (as 'TIMESPAN 5) (as 'DATE [0N 7])) -- (list (as 'TIMESPAN 5) (as 'DATE 7))
+(fill (as 'TIMESPAN 5) (as 'DATE [7 0N])) -- (list (as 'DATE 7) (as 'TIMESPAN 5))
+(fill (as 'DATE 5) (as 'TIMESPAN [7 0N])) -- (list (as 'TIMESPAN 7) (as 'DATE 5))
+(fill (as 'TIMESPAN 5) (as 'DATE [7 8])) -- (as 'DATE [7 8])
+;; same type and non-numeric replacements are unchanged
+(fill 3 [0N 1]) -- [3 1]
+(fill 'z [1 0N]) -- (list 1 'z)
+;; a null atom keeps its type too, so every route that fills row by row
+;; gives the vector's type: a keyless projection, where:, by:, update,
+;; splayed and parted columns
+(fill 2.5 0N) -- 2
+(type (fill 2.5 0N)) -- 'i64
+(type (fill 3 0Nf)) -- 'f64
+(fill 7 0Nd) -- (as 'DATE 7)
+(fill (as 'TIMESPAN 5) 0Nd) -- (as 'TIMESPAN 5)
+(fill 2.5 (list 0N 1)) -- (list 2 1)
+(set t (table [g x f] (list [1 1 2] [0N 2 3] [0Nf 2.5 3.5])))
+(at (select {from: t r: (fill 2.5 x)}) 'r) -- [2 2 3]
+(at (select {from: t r: (fill 3 f)}) 'r) -- [3.0 2.5 3.5]
+(at (select {from: t r: (fill 2.5 x) where: (> g 0)}) 'r) -- [2 2 3]
+(at (select {from: t r: (sum (fill 2.5 x)) by: g}) 'r) -- [4 3]
+(at (update {x: (fill 2.5 x) from: t}) 'x) -- [2 2 3]
+(.sys.exec "rm -rf /tmp/rf_fill_numeric_types && mkdir -p /tmp/rf_fill_numeric_types")
+(.db.splayed.set "/tmp/rf_fill_numeric_types/s/" t)
+(at (select {from: (.db.splayed.get "/tmp/rf_fill_numeric_types/s/") r: (fill 2.5 x)}) 'r) -- [2 2 3]
+(.db.splayed.set "/tmp/rf_fill_numeric_types/p/2024.01.01/t/" t "/tmp/rf_fill_numeric_types/p/.sym")
+(.db.splayed.set "/tmp/rf_fill_numeric_types/p/2024.01.02/t/" t "/tmp/rf_fill_numeric_types/p/.sym")
+(set tp (.db.parted.get "/tmp/rf_fill_numeric_types/p" 't))
+(at (select {from: tp r: (fill 2.5 x)}) 'r) -- [2 2 3 2 2 3]
+(at (select {from: tp r: (fill 2.5 x) where: (> g 1)}) 'r) -- [3 3]
+(.sys.exec "rm -rf /tmp/rf_fill_numeric_types")
+;; as casts a TIME or TIMESTAMP into a TIMESPAN: no LIST there
+(type (fill (as 'TIME 5) (as 'TIMESPAN [0N 7]))) -- 'TIMESPAN
+(type (fill (as 'TIMESTAMP 5) (as 'TIMESPAN [0N 7]))) -- 'TIMESPAN
+

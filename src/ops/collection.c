@@ -5832,8 +5832,49 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
 
 /* (fill replacement values) — replace null cells in values.  Registered as
  * atomic, so scalar replacement broadcasts and vector replacements zip. */
+/* A numeric or temporal atom type (negative tag). */
+static inline bool fill_num_atom_type(int8_t t) {
+    switch (t) {
+    case -RAY_BOOL: case -RAY_U8: case -RAY_I16: case -RAY_I32: case -RAY_I64:
+    case -RAY_F32: case -RAY_F64: case -RAY_DATE: case -RAY_TIME:
+    case -RAY_TIMESTAMP: case -RAY_TIMESPAN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* fill keeps the type of what it fills (#1778): a null atom of a numeric or
+ * temporal type takes a replacement of another such type cast to its own,
+ * as (as 'T r) casts it, so a row-by-row fill (a keyless select projection,
+ * a list's cells) answers as the vector's does.  A cast `as` refuses keeps
+ * the replacement as it is. */
+static __attribute__((noinline)) ray_t* fill_null_cast(ray_t* replacement, ray_t* value) {
+    const char* tn = ray_type_name((int8_t)-value->type);
+    ray_t* tsym = ray_sym(ray_sym_intern(tn, strlen(tn)));
+    if (!tsym || RAY_IS_ERR(tsym)) return tsym ? tsym : ray_error("oom", NULL);
+    ray_t* c = ray_cast_fn(tsym, replacement);
+    ray_release(tsym);
+    if (c && !RAY_IS_ERR(c) && c->type == value->type) return c;
+    if (c && RAY_IS_ERR(c)) {
+        if (strcmp(ray_err_code(c), "oom") == 0) return c;
+        ray_error_free(c);
+        ray_error_clear();
+    } else if (c) {
+        ray_release(c);
+    }
+    ray_retain(replacement);
+    return replacement;
+}
+
 ray_t* ray_fill_fn(ray_t* replacement, ray_t* value) {
-    ray_t* out = RAY_ATOM_IS_NULL(value) ? replacement : value;
+    ray_t* out = value;
+    if (RAY_ATOM_IS_NULL(value)) {
+        if (RAY_UNLIKELY(replacement->type != value->type && fill_num_atom_type(value->type) &&
+                         fill_num_atom_type(replacement->type)))
+            return fill_null_cast(replacement, value);
+        out = replacement;
+    }
     ray_retain(out);
     return out;
 }
