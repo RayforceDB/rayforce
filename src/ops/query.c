@@ -939,6 +939,11 @@ static uint16_t resolve_moving_opcode(int64_t sym_id) {
     return 0;
 }
 
+static bool const_op_is_bool(ray_graph_t* g, ray_op_t* op) {
+    ray_op_ext_t* ext = op && op->opcode == OP_CONST ? find_ext(g, op->id) : NULL;
+    return ext && ext->literal && !RAY_IS_ERR(ext->literal) && ext->literal->type == -RAY_BOOL;
+}
+
 static bool const_op_i64(ray_graph_t* g, ray_op_t* op, int64_t* out) {
     if (!op || op->opcode != OP_CONST) return false;
     ray_op_ext_t* ext = find_ext(g, op->id);
@@ -3344,7 +3349,9 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             if (mov_op) {
                 ray_op_t* wop = compile_expr_dag(g, elems[1]);
                 int64_t window = 0;
-                if (!const_op_i64(g, wop, &window) || window < 1)
+                /* a boolean window is the builtin's type error (#1796):
+                 * leave it to the builtin rather than lower it as 1 */
+                if (!const_op_i64(g, wop, &window) || window < 1 || const_op_is_bool(g, wop))
                     return NULL;
                 ray_op_t* arg = compile_expr_dag(g, elems[2]);
                 if (!arg) return NULL;

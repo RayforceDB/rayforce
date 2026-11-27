@@ -141,6 +141,23 @@ static inline int64_t as_i64(ray_t* x) {
     return x->i64; /* fallback */
 }
 
+/* A key or count argument a builtin reads as a position: an integer atom of
+ * a type as_i64 reads as its value (I64, I32, I16, U8), and for a vector of
+ * keys a vector of one of those types.  A float is not one (as_i64 reads its
+ * bits), nor a boolean; at (#1785) and drop take keys by this rule. */
+static inline bool ray_int_key_type(int8_t t) {
+    switch (t) {
+    case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: return true;
+    default: return false;
+    }
+}
+static inline bool ray_int_key(ray_t* k) {
+    switch (k->type) {
+    case -RAY_I64: case -RAY_I32: case -RAY_I16: case -RAY_U8: return true;
+    default: return false;
+    }
+}
+
 static inline double as_f64(ray_t* x) {
     if (x->type == -RAY_F64) return x->f64;
     if (x->type == -RAY_F32) return (double)((float)x->f64);

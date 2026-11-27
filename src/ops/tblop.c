@@ -1979,7 +1979,16 @@ static ray_t* alter_target(ray_t** args, int64_t n,
             ray_t** out = (ray_t**)ray_data(new_list);
             for (int64_t i = 0; i < vlen; i++) { ray_retain(elems[i]); out[i] = elems[i]; }
 
-            if (ray_is_atom(idx) && is_numeric(idx)) {
+            /* the key rule of `at` (ray_int_key): a float, boolean or
+             * symbol index is a type error, not a position read from its
+             * payload or a silent no-op (#1796) */
+            if (!ray_int_key(idx) && !(ray_is_vec(idx) && ray_int_key_type(idx->type))) {
+                int8_t it = idx->type;
+                ray_release(new_list);
+                ray_release(idx); ray_release(val); ray_release(name_sym);
+                return ray_error("type", "alter set: index must be an integer atom or an integer vector, got %s", ray_type_name(it));
+            }
+            if (ray_is_atom(idx)) {
                 int64_t i = as_i64(idx);
                 if (i >= 0 && i < vlen) { ray_release(out[i]); ray_retain(val); out[i] = val; }
             } else if (ray_is_vec(idx)) {
@@ -2029,13 +2038,13 @@ static ray_t* alter_target(ray_t** args, int64_t n,
         /* Validate idx shape + (for the atom case) bounds BEFORE we
          * touch any state.  The accelerator-index drop below would
          * otherwise outlive a failed write. */
-        bool idx_is_atom_num = ray_is_atom(idx) && is_numeric(idx);
-        bool idx_is_vec      = ray_is_vec(idx);
+        bool idx_is_atom_num = ray_int_key(idx);
+        bool idx_is_vec      = ray_is_vec(idx) && ray_int_key_type(idx->type);
         if (!idx_is_atom_num && !idx_is_vec) {
             int8_t it = idx->type;
             ray_release(var);
             ray_release(idx); ray_release(val); ray_release(name_sym);
-            return ray_error("type", "alter set: index must be a numeric atom or a vector, got %s", ray_type_name(it));
+            return ray_error("type", "alter set: index must be an integer atom or an integer vector, got %s", ray_type_name(it));
         }
         if (idx_is_atom_num) {
             int64_t i_check = as_i64(idx);
@@ -2158,10 +2167,10 @@ static ray_t* alter_target(ray_t** args, int64_t n,
         /* Build a set of indices to remove */
         int64_t remove_idx[256];
         int64_t nremove = 0;
-        if (ray_is_atom(idx) && is_numeric(idx)) {
+        if (ray_int_key(idx)) {
             remove_idx[0] = as_i64(idx);
             nremove = 1;
-        } else if (ray_is_vec(idx)) {
+        } else if (ray_is_vec(idx) && ray_int_key_type(idx->type)) {
             nremove = idx->len;
             if (nremove > 256) { ray_release(idx); ray_release(name_sym); return ray_error("limit", NULL); }
             for (int64_t i = 0; i < nremove; i++) {
@@ -2173,7 +2182,7 @@ static ray_t* alter_target(ray_t** args, int64_t n,
         } else {
             int8_t it = idx->type;
             ray_release(idx); ray_release(name_sym);
-            return ray_error("type", "alter remove: index must be a numeric atom or a vector, got %s", ray_type_name(it));
+            return ray_error("type", "alter remove: index must be an integer atom or an integer vector, got %s", ray_type_name(it));
         }
         ray_release(idx);
 
