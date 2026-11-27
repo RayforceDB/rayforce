@@ -212,7 +212,7 @@ Use `-U` instead of `-u` to enable authentication with read-only restrictions:
 ./rayforce -p 5000 -U secretpass
 ```
 
-In read-only mode, clients can run queries and read data, but mutating operations (`set`, a top-level `let`, `insert`, `upsert`, `update`, file writes, system commands) are blocked; a `let` inside the request's own lambda or `do` still binds a local. The server returns an error if a restricted builtin is called.
+In read-only mode, clients can run queries and read data, but mutating operations (`set`, a top-level `let`, an `update`, `delete`, `insert` or `upsert` on a named table such as `from: 't`, file writes, system commands) are blocked; a `let` inside the request's own lambda or `do` still binds a local, and the same four forms on a table value (`from: t`) answer a new table and bind nothing (see [restricted mode](../storage/ipc.md#-u-password-restricted-mode)). The server returns an error if a restricted builtin is called.
 
 The rule covers the server's own functions too. A read verb that needs a restricted builtin itself, such as one that asks another process for its half over `.ipc.send`, can be marked with [`.sys.trust`](../namespaces/sys.md#sys-trust) in the server's boot script. A client calling it runs its body unrestricted, isolated from the client's own bindings, while everything else the client sends stays read-only:
 

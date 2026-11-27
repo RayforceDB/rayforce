@@ -3508,6 +3508,35 @@ static test_result_t test_repl_cli_cores_reject_malformed(void) {
 
 /* ─── Suite definition ───────────────────────────────────────────── */
 
+/* `:h` for update, delete, insert and upsert (#1878): under -U they are
+ * refused only on a named target, so the line says so, and set, refused
+ * whatever its arguments, keeps the plain marker. */
+static test_result_t test_repl_help_restricted_named(void) {
+    ray_repl_t* repl = ray_repl_create(NULL);
+    TEST_ASSERT_NOT_NULL(repl);
+    ray_syscmd_ctx_t ctx = { repl, false };
+    const char* cmds[] = { "h update", "h delete", "h insert", "h upsert", "h set" };
+    char path[256];
+    char buf[8192];
+    int saved = cap_begin(path, sizeof path);
+    for (size_t i = 0; i < sizeof cmds / sizeof cmds[0]; i++) {
+        ray_t* r = ray_syscmd_dispatch(cmds[i], strlen(cmds[i]), &ctx, false);
+        if (r && r != RAY_NULL_OBJ) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+    }
+    cap_end(saved, path, buf, sizeof buf);
+    ray_repl_destroy(repl);
+    const char* want[] = {
+        "update: builtin (vary), special form, restricted under -U on a named target\n",
+        "delete: builtin (vary), special form, restricted under -U on a named target\n",
+        "insert: builtin (vary), special form, restricted under -U on a named target\n",
+        "upsert: builtin (vary), special form, restricted under -U on a named target\n",
+        "set: builtin (binary), special form, restricted under -U\n",
+    };
+    for (size_t i = 0; i < sizeof want / sizeof want[0]; i++)
+        TEST_ASSERT_FMT(strstr(buf, want[i]) != NULL, "no \"%s\" in:\n%.1500s", want[i], buf);
+    PASS();
+}
+
 const test_entry_t repl_entries[] = {
 #if defined(__linux__)
     { "repl/cli/cores_are_total",       test_repl_cli_cores_are_total,       NULL,       NULL          },
@@ -3641,6 +3670,7 @@ const test_entry_t repl_entries[] = {
     { "repl/pty/sigint_during_eval",        test_repl_pty_sigint_during_eval,        repl_setup, repl_teardown },
     { "repl/pty/ctrl_c_during_lazy_materialize", test_repl_pty_ctrl_c_during_lazy_materialize, repl_setup, repl_teardown },
     { "repl/run/piped/with_poll_listen",    test_repl_run_piped_with_poll_listen,    repl_setup, repl_teardown },
+    { "repl/help_restricted_named",          test_repl_help_restricted_named,          repl_setup, repl_teardown },
 
     { NULL, NULL, NULL, NULL },
 };

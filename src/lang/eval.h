@@ -325,6 +325,9 @@ bool   ray_raise_render(char* buf, size_t cap);
 
 /* Restricted mode: when true, builtins with RAY_FN_RESTRICTED are blocked. */
 void ray_eval_set_restricted(bool on);
+/* update, delete, insert, upsert: under -U refused only when the target
+ * names a binding; the value spelling runs (#1878). */
+bool ray_fn_restricted_named(const ray_t* fn);
 bool ray_eval_get_restricted(void);
 typedef struct { bool restricted; int32_t base; } ray_restrict_save_t;
 void ray_eval_restrict_enter(bool on, ray_restrict_save_t* s);

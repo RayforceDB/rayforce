@@ -93,7 +93,7 @@ In restricted mode, specific builtins that write files, mutate state, or control
 
 | Category | Blocked Builtins |
 |---|---|
-| Mutation | `set`, `del`, `update`, `insert`, `upsert`, `modify` |
+| Mutation | `set`, `del`, `modify`; `update`, `delete`, `insert` and `upsert` on a named target (below) |
 | File writes | `write`, `write-bytes`, `.csv.write`, `load`, `.db.splayed.set` |
 | File reads | `read`, `read-bytes`, `.csv.read` |
 | System | `.sys.exec`, `.os.getenv`, `.os.setenv`, `exit` |
@@ -101,6 +101,16 @@ In restricted mode, specific builtins that write files, mutate state, or control
 
 !!! note "Scope"
     Restricted mode blocks every builtin registered with `RAY_FN_RESTRICTED` (the table above is a representative subset). A request binds only in frames it opens itself: a top-level `let` or `times` loop variable, which would bind in the global frame, is refused with `access` just as `set` is, and so is one in a request the server evaluates while its own code waits inside a frame (a request a peer sends back during a sync `.ipc.send`), which would bind into that code's frame. A client therefore cannot rebind a name other code reads or install a [connection hook](ipc-hooks.md). A `let` inside the request's own lambda or `do` block binds a local and is allowed. It does not provide full sandboxing — `select`, `.db.splayed.get`, `.db.parted.get`, and other read operations on already-loaded data or splayed tables remain available.
+
+!!! note "update, delete, insert and upsert"
+    These four run on a restricted connection when their target is a table value: `from:` (or `insert`'s and `upsert`'s first argument) evaluates to a table, such as a global read by name, a `select` result or a table the request builds. The form answers a new table and binds nothing. The table it read is unchanged: the form copies every column it writes, as it does on any connection, and a mapped (splayed or parted) table gives a new in-memory table, never a write to its files.
+
+    A target that evaluates to a symbol names a binding: `from: 't`, `(insert 't row)`, or a symbol computed at run time, `from: (first ['t])`. That form would rebind the global or write it in place, so it is refused with `access` before anything runs. So is the three-argument `insert` into a parted table, even into a value, because it grows the table's file symbol domain, which a later save writes to its symfile. A write the form's own expressions try, such as a `set`, a named `update` or a lambda that calls one, is refused where it runs, as anywhere else in the request.
+
+    ```text
+    (.ipc.send h "(update {c: (+ a b) from: t})")   ;; => a new table with columns a b c; t unchanged
+    (.ipc.send h "(update {c: 0 from: 't})")        ;; => error: access
+    ```
 
 Attempting a restricted operation returns an `"access"` error:
 

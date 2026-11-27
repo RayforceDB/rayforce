@@ -36790,6 +36790,19 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
     return ray_sym(inplace_sym);
 }
 
+/* A restricted request (-U, ray_poll_set_restricted) may run update, delete,
+ * insert and upsert on a table VALUE: the form answers a new table and binds
+ * nothing (#1878).  It may not name a binding: a target that evaluates to a
+ * symbol, quoted or computed, rebinds a global or writes the named object in
+ * place.  This is the refusal, made before anything is computed or written;
+ * the dispatcher lets these four forms through only for it (eval.c,
+ * fn_refuses_at_write).  NULL when the request may go on. */
+static ray_t* restricted_named_target(const char* form) {
+    if (!ray_eval_get_restricted()) return NULL;
+    return ray_error("access", "restricted: %s names a binding; on a restricted connection "
+                     "it takes a table value and answers a new table", form);
+}
+
 ray_t* ray_update_fn(ray_t** args, int64_t n) {
     return ray_update(args, n);
 }
@@ -36825,6 +36838,8 @@ static ray_t* ray_update_lowered(ray_t** args, int64_t n) {
     if (RAY_IS_ERR(tbl)) return tbl;
     if (tbl->type == -RAY_SYM) {
         /* from: 't — resolve symbol to table variable */
+        ray_t* acc = restricted_named_target("update");
+        if (acc) { ray_release(tbl); return acc; }
         inplace_sym = tbl->i64;
         ray_release(tbl);
         tbl = ray_env_get(inplace_sym);
@@ -39313,6 +39328,8 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         tbl = ray_eval(tbl_raw);
         if (!tbl || RAY_IS_ERR(tbl)) return tbl ? tbl : ray_error("type", "insert: target evaluation failed");
         if (tbl->type == -RAY_SYM) {
+            ray_t* acc = restricted_named_target("insert");
+            if (acc) { ray_release(tbl); return acc; }
             /* Resolve once: a local target must never publish into a global. */
             inplace_sym = tbl->i64;
             ray_release(tbl);
@@ -39509,6 +39526,14 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         if (!table_has_parted_columns(tbl)) {
             ray_release(tbl);
             return ray_error("type", "insert: three-argument table form requires a canonical .db.parted.get table");
+        }
+        /* Even into a value, the live tail interns its SYM cells into the
+         * table's FILE symbol domain, which the server's own table shares
+         * and a later save writes to the symfile: a restricted request may
+         * not grow it (#1878). */
+        if (ray_eval_get_restricted()) {
+            ray_release(tbl);
+            return ray_error("access", "restricted: insert into a parted table grows its file symbol domain");
         }
         if (inplace_sym >= 0 && ray_sym_is_reserved(inplace_sym) &&
             !ray_sym_is_ipc_hook(inplace_sym)) {
@@ -41186,6 +41211,8 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
         tbl = ray_eval(tbl_raw);
         if (!tbl || RAY_IS_ERR(tbl)) return tbl ? tbl : ray_error("type", "upsert: target evaluation failed");
         if (tbl->type == -RAY_SYM) {
+            ray_t* acc = restricted_named_target("upsert");
+            if (acc) { ray_release(tbl); return acc; }
             /* Symbol value → resolve the named global for in-place upsert */
             inplace_sym = tbl->i64;
             ray_release(tbl);
@@ -44512,6 +44539,8 @@ static ray_t* ray_delete_hoisted(ray_t** args, int64_t n) {
     ray_t* tbl = ray_eval(from_expr);
     if (RAY_IS_ERR(tbl)) return tbl;
     if (tbl->type == -RAY_SYM) {
+        ray_t* acc = restricted_named_target("delete");
+        if (acc) { ray_release(tbl); return acc; }
         inplace_sym = tbl->i64;
         ray_release(tbl);
         tbl = ray_env_get(inplace_sym);

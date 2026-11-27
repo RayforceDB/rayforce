@@ -76,7 +76,7 @@ You can also exit with `\\`, `exit`, or **Ctrl-D** on an empty line.
 
 - **A builtin:** its documented call forms, one per line, from the engine's usage table (the text its errors cite), then its one-line summary. Through an alias, the header names the builtin the alias holds.
 - **A lambda:** its call shape from its parameter names.
-- **Flags:** `special form` and `restricted under -U` are added where they apply. Then how it treats a collection, from `.repl.signature`'s `atomic`, `elementwise` and `aggregate`: `atomic`; or `element-wise`, or `element-wise in argument 1` when only some arguments map; and `aggregate`. `element-wise` is the row-shape record queries plan by, so for `if` it describes a query: an ordinary `if` with a boolean-vector condition needs an else arm (see [`.repl.signature`](../namespaces/repl.md#repl-signature)).
+- **Flags:** `special form`, `restricted under -U`, and `restricted under -U on a named target` are added where they apply. The last is `update`, `delete`, `insert` and `upsert`, which run on a table value and are refused only on a named target. Then how it treats a collection, from `.repl.signature`'s `atomic`, `elementwise` and `aggregate`: `atomic`; or `element-wise`, or `element-wise in argument 1` when only some arguments map; and `aggregate`. `element-wise` is the row-shape record queries plan by, so for `if` it describes a query: an ordinary `if` with a boolean-vector condition needs an else arm (see [`.repl.signature`](../namespaces/repl.md#repl-signature)).
 - **Anything else:** one line: a namespace root (`:h .sys`) gives its number of names and how to ask for one, `true` and `false` are literals, and a value or a missing name says so.
 
 ```
