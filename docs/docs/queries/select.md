@@ -660,7 +660,27 @@ in every group. To index per row, put the index in a column:
 `(sum (at W i))` with `i` a column reads `W` at each row's index. A helper
 whose body reads a column, itself or through another helper, reads the
 rows: `(count (distinct (f)))` with `f` = `(fn [] y)` counts each group's
-values of `y`. Projections, outputs with no aggregate, are read as before.
+values of `y`. In a projection, an output with no aggregate, a vector as
+long as the table in those positions is a column too (#1760): `(date W)`
+gives one date per row, as `(date ts)` and `(dd W)` do, plain, under
+`where:` and `take:`, in a nested select, under `by:`, under a constructor
+or `type` (`(list (date W))` is `(list (date ts))`), through a helper
+`(h W)` whose body reads its parameter only there, and through such a
+helper in an aggregate, `(first (h W))` by `k`. This is for the builtins a
+projection calls row by row (`date`, `time`, `split`, `.emb.tokens`); others
+such as `(+ W 1)` or `(dd W)` are evaluated over the whole vector, which is
+already the column's answer. A vector written in place as long as the table
+is read the same way. A helper whose body has an effect (a `set`), or
+rebinds, calls or passes on its parameter, keeps the whole vector: given
+`W` it reads `W` whole, as before. The two contexts side by side, over a
+table of `n` rows:
+
+| vector in a row position | in an aggregate, `fold` or `filter` | in a projection |
+|---|---|---|
+| as long as the table (`n` values) | a column | a column |
+| one value | spread over the rows | the per-row reading: each row's cell is the call of the whole vector |
+| any other length | the `length` error | the per-row reading, as above |
+| a list | one whole value | one whole value |
 
 ```lisp
 (set t (table [g x] (list [a a b b b c c c c c] (til 10))))

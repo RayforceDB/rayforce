@@ -22938,6 +22938,15 @@ typedef struct {
     ray_t*         names;    /* I64 vector of their private ids, or NULL */
     const int64_t* aliases;
     int64_t        naliases;
+    /* read as rows by a projection, outside any aggregate: there only a
+     * vector as long as the table is a column, and one of another length
+     * keeps its per-row contract (one cell per row), as before (#1760) */
+    bool           proj;
+    /* while a walk not read as rows looks for one (fv_expr): the table's
+     * column names, and whether a name holding such a vector was met */
+    const int64_t* scan_cols;
+    int64_t        scan_nc;
+    bool           cand;
 } fv_cols_t;
 
 static void fv_cols_free(fv_cols_t* fc) {
@@ -23045,6 +23054,47 @@ static bool fv_arg_rows(ray_t* e, int64_t i, ray_t* tbl, bool rows, ray_t* fn) {
            (void*)(uintptr_t)fn->i64 == (void*)ray_distinct_fn;
 }
 
+/* Does the helper body `e` read its parameter `param` only where a free
+ * vector would be read as rows (fv_arg_rows), given whether `e` itself is
+ * (`rows`)?  Then a free vector given for it is a column, as the column
+ * given for it is read row by row: (hlp W) with hlp (fn [x] (date x)) is
+ * (hlp ts) over a column (#1760).  A rebinding form (let, fn, set) of any
+ * name, a computed head, or the parameter called or passed to a helper is
+ * read as not: the vector stays whole, as before. */
+static bool fv_body_reads_rows(ray_t* e, int64_t param, ray_t* tbl, bool rows, int depth) {
+    if (!e) return true;
+    if (depth > 32) return false;
+    if (e->type == -RAY_SYM) return (e->attrs & ATTR_QUOTED) || e->i64 != param || rows;
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1) return true;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* h = el[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || h->i64 == param) return false;
+    ray_t* hv = ray_env_get(h->i64);
+    if (hv && hv->type == RAY_VARY && (const void*)(uintptr_t)hv->i64 == (const void*)ray_quote_fn) return true;
+    if (!hv || hv->type < RAY_UNARY || hv->type > RAY_VARY || (hv->attrs & RAY_FN_SPECIAL_FORM)) return false;
+    for (int64_t i = 1; i < e->len; i++)
+        if (!fv_body_reads_rows(el[i], param, tbl, fv_arg_rows(e, i, tbl, rows, hv), depth + 1)) return false;
+    return true;
+}
+
+/* The helper the call `e` invokes, when every statement of its body reads
+ * its `i`th parameter only as rows (fv_body_reads_rows): a lambda with no
+ * closure, the head no column of `tbl` shadows. */
+static bool fv_helper_arg_rows(ray_t* e, int64_t i, ray_t* tbl) {
+    ray_t* h = ((ray_t**)ray_data(e))[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || (tbl && tbl_has_col(tbl, h->i64))) return false;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || fn->type != RAY_LAMBDA || LAMBDA_CLOSURE(fn)) return false;
+    ray_t* ps = LAMBDA_PARAMS(fn);
+    ray_t* body = LAMBDA_BODY(fn);
+    if (!ps || ps->type != RAY_SYM || ps->len != e->len - 1 || !body || body->type != RAY_LIST ||
+        body->len < 1) return false;
+    int64_t param = ((int64_t*)ray_data(ps))[i - 1];
+    for (int64_t s = 0; s < body->len; s++)
+        if (!fv_body_reads_rows(((ray_t**)ray_data(body))[s], param, tbl, s == body->len - 1, 0)) return false;
+    return true;
+}
+
 /* Is `e` a JSON read, .json.get or .json.parse, of a column: its path is
  * then paired with the rows, one path per document (#1437). */
 static bool fv_json_read_of_rows(ray_t* e, ray_t* tbl) {
@@ -23059,6 +23109,41 @@ static bool fv_json_read_of_rows(ray_t* e, ray_t* tbl) {
     return json && expr_refs_row_column(el[1], tbl);
 }
 
+/* The builtins a projection calls row by row, on a whole vector when it is
+ * a free one, by the function object (#1760): a timestamp vector's dates
+ * and times, a text vector split row by row, each text's tokens.  Other
+ * row-shaped builtins (atomic ones, dd, strlen, ...) run over the whole
+ * vector at once, which is already the column's answer. */
+static bool fv_rowwise_whole_fn(const ray_t* f) {
+    if (!f) return false;
+    const void* fp = (const void*)(uintptr_t)f->i64;
+    return (f->type == RAY_UNARY && (fp == (const void*)ray_date_clock_fn ||
+                                     fp == (const void*)ray_time_clock_fn)) ||
+           (f->type == RAY_BINARY && (fp == (const void*)ray_split_fn ||
+                                      fp == (const void*)ray_emb_tokens_fn));
+}
+
+/* Is the call `e` one of those (fv_rowwise_whole_fn), its head no column? */
+static bool hfn0_rowwise_whole(ray_t* e, ray_t* tbl) {
+    ray_t* f = fv_head_fn(e);
+    return f && !fv_head_shadowed(e, tbl) && fv_rowwise_whole_fn(f);
+}
+
+/* Is `a` a vector as long as the table, written in place or held by a name
+ * that is no column (a column is a compare with the schema): what the look
+ * for a projection's free vector seeks? */
+static bool fv_scan_row_vector(ray_t* a, ray_t* tbl, fv_cols_t* fc) {
+    if (!a) return false;
+    int64_t nr = ray_table_nrows(tbl);
+    if (a->type == -RAY_SYM) {
+        if (a->attrs & ATTR_QUOTED) return false;
+        for (int64_t c = 0; c < fc->scan_nc; c++) if (fc->scan_cols[c] == a->i64) return false;
+        ray_t* v = ray_env_get(a->i64);
+        return v && ray_is_vec(v) && v->len == nr;
+    }
+    return a->type > 0 && a->type != RAY_LIST && ray_is_vec(a) && a->len == nr;
+}
+
 /* `e` with each free vector it reads as rows (`rows`: `e` itself is read
  * so) replaced by the private id of a column holding it, registered in
  * `fc`; a free vector there of neither one value nor the table's length is
@@ -23066,11 +23151,12 @@ static bool fv_json_read_of_rows(ray_t* e, ray_t* tbl) {
  * reference. */
 static ray_t* fv_subst(ray_t* e, ray_t* tbl, bool rows, fv_cols_t* fc) {
     ray_t* b = rows ? fv_value(e, tbl, fc) : NULL;
+
     if (b) {
         int64_t nr = ray_table_nrows(tbl);
         /* one value is spread as an atom, and over no row nothing is read,
          * whatever the table's length: both keep their answers */
-        if (b->len == 1 || nr == 0) { ray_retain(e); return e; }
+        if (b->len == 1 || nr == 0 || (fc->proj && b->len != nr)) { ray_retain(e); return e; }
         if (b->len != nr)
             return ray_error("length", "aggregate input has %lld values for %lld rows",
                              (long long)b->len, (long long)nr);
@@ -23134,10 +23220,39 @@ static ray_t* fv_subst(ray_t* e, ray_t* tbl, bool rows, fv_cols_t* fc) {
         hfn = NULL;
     else if (hfn && fv_head_shadowed(e, tbl))
         hfn = NULL;
+    /* The look for a projection's free vector (#1760, fv_expr): a vector
+     * as long as the table given to a builtin a projection calls row by row
+     * on a whole vector (fv_rowwise_whole_fn), at a row-shaped position, or
+     * to a helper that reads it so (fv_helper_arg_rows).  Only there does
+     * reading it as a column change the answer: (+ V 1) is evaluated over
+     * the whole vector already, and keeps dev's route and cost. */
+    if (!rows && fc->scan_cols && !fc->cand) {
+        for (int64_t i = 1; i < e->len && !fc->cand; i++) {
+            if (!fv_scan_row_vector(el[i], tbl, fc)) continue;
+            ray_t* f = fv_head_fn(e);
+            if (f && !fv_head_shadowed(e, tbl)) {
+                fc->cand = fv_rowwise_whole_fn(f) && ray_fn_row_arg(f, e->len - 1, i);
+            } else if (!f) {
+                fc->cand = fv_helper_arg_rows(e, i, tbl);
+            }
+        }
+    }
+    /* In the projection's walk a row-shaped argument of such a builtin is
+     * rows under any call, as a list's or type's element reads its row:
+     * (list (date W)) is (list (date ts)). */
+    bool rows_fn = fc->proj && hfn0_rowwise_whole(e, tbl);
+    /* an aggregate, a fold or a filter: its arguments are no projection's */
+    bool proj0 = fc->proj;
+    if (proj0 && (is_agg_expr(e) ||
+                  (hfn && hfn->type == RAY_VARY && fn_is_fold((const void*)(uintptr_t)hfn->i64)) ||
+                  (hfn && hfn->type == RAY_BINARY && (void*)(uintptr_t)hfn->i64 == (void*)ray_filter_fn)))
+        fc->proj = false;
     for (int64_t i = 1; i < e->len; i++) {
-        bool r = fv_arg_rows(e, i, tbl, rows, hfn) || (json_path && i == 2);
+        bool r = fv_arg_rows(e, i, tbl, rows, hfn) || (json_path && i == 2) ||
+                 (rows && !hfn && fv_helper_arg_rows(e, i, tbl)) ||   /* #1760 */
+                 (rows_fn && ray_fn_row_arg(fv_head_fn(e), e->len - 1, i));
         ray_t* c = fv_subst(el[i], tbl, r, fc);
-        if (!c || RAY_IS_ERR(c)) { if (out) ray_release(out); return c ? c : ray_error("oom", NULL); }
+        if (!c || RAY_IS_ERR(c)) { fc->proj = proj0; if (out) ray_release(out); return c ? c : ray_error("oom", NULL); }
         if (!out && c == el[i]) { ray_release(c); continue; }
         if (!out) {
             out = ray_list_new(e->len);
@@ -23145,8 +23260,9 @@ static ray_t* fv_subst(ray_t* e, ray_t* tbl, bool rows, fv_cols_t* fc) {
         }
         if (out && !RAY_IS_ERR(out)) out = ray_list_append(out, c);
         ray_release(c);
-        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        if (!out || RAY_IS_ERR(out)) { fc->proj = proj0; return out ? out : ray_error("oom", NULL); }
     }
+    fc->proj = proj0;
     if (!out) { ray_retain(e); return e; }
     out->attrs = e->attrs;
     return out;
@@ -23179,7 +23295,22 @@ static ray_t* fv_expr(ray_t* expr, ray_t* tbl, fv_cols_t* fc) {
     if (!expr || expr->type != RAY_LIST) return NULL;
     ray_t* x = query_inline_helpers(expr, tbl);
     if (!x || RAY_IS_ERR(x)) return x ? x : ray_error("oom", NULL);
+    /* a projection reads its free vectors as rows too (#1760): (date W) is
+     * (date ts) over a column, as (dd W) is; looked for only when an
+     * argument may be one, so other queries walk as before */
+    ray_t* schema = ray_table_schema(tbl);
+    bool scan = ray_table_nrows(tbl) >= 2 && schema && schema->type == RAY_I64;
+    fc->scan_cols = scan ? (const int64_t*)ray_data(schema) : NULL;
+    fc->scan_nc = scan ? schema->len : 0;
+    fc->cand = false;
     ray_t* s = fv_subst(x, tbl, false, fc);
+    fc->scan_cols = NULL;
+    if (fc->cand && s && !RAY_IS_ERR(s)) {
+        ray_release(s);
+        fc->proj = true;
+        s = fv_subst(x, tbl, true, fc);
+        fc->proj = false;
+    }
     bool same = s == x;
     ray_release(x);
     if (!s || RAY_IS_ERR(s)) return s ? s : ray_error("oom", NULL);

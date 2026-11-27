@@ -1,0 +1,62 @@
+;; #1760: a projection of date, time, split or .emb.tokens over a free
+;; vector as long as the table read the vector whole in every row (a list
+;; of whole vectors), where the column gives one value per row, as (dd W)
+;; already does.  Under #1492's length rule such a vector is a column in a
+;; projection too: plain, under where:, take:, nested, through a helper
+;; called per row, and through a helper in an aggregate under by:.  A LIST
+;; global stays one whole value; a vector of one value, or in a projection
+;; of another length, keeps its per-row reading; in an aggregate another
+;; length is the length error, as before.
+(.sys.exec "rm -rf /tmp/rf_issue_1760 && mkdir -p /tmp/rf_issue_1760") -- 0
+(set TS [2024.03.01D10:00:00.000 2024.01.05D09:30:00.000 2024.03.01D23:59:00.000 2024.02.07D11:00:00.000])
+(set SS ["a,b" "c" "d,e,f" "g,h"])
+(set t (table [k ts s v] (list [1 2 1 2] TS SS [10 20 30 40])))
+(set W TS)
+(set WS SS)
+(set hlp (fn [x] (date x)))
+(set M (.emb.model.get "test/data/emb/tiny"))
+(set TX ["hello world" "a cat, hello!" "hello" "a,b"])
+(set te (table [k s] (list [1 2 1 2] TX)))
+(set WT TX)
+(.db.splayed.set "/tmp/rf_issue_1760/spl/t/" t "/tmp/rf_issue_1760/spl/.sym")
+(set S (.db.splayed.get "/tmp/rf_issue_1760/spl/t/" "/tmp/rf_issue_1760/spl/.sym"))
+(.db.splayed.set "/tmp/rf_issue_1760/par/2024.01.01/t" t "/tmp/rf_issue_1760/par/.sym")
+(set P (.db.parted.get "/tmp/rf_issue_1760/par/" 't))
+;; the column forms and (dd W), as on dev
+(at (select {from: t r: (date ts)}) 'r) -- [2024.03.01 2024.01.05 2024.03.01 2024.02.07]
+(at (select {from: t r: (dd W)}) 'r) -- [1 5 1 7]
+(at (select {from: t by: k r: (first (hlp ts))}) 'r) -- [2024.03.01 2024.01.05]
+;; the free vector is the column
+(at (select {from: t r: (date W)}) 'r) -- [2024.03.01 2024.01.05 2024.03.01 2024.02.07]
+(at (select {from: t r: (time W)}) 'r) -- [10:00:00.000 09:30:00.000 23:59:00.000 11:00:00.000]
+(at (select {from: t where: (> v 15) r: (date W)}) 'r) -- [2024.01.05 2024.03.01 2024.02.07]
+(at (select {from: t r: (split WS ",") take: 2}) 'r) -- (list ["a" "b"] ["c"])
+(at (select {from: (select {from: t r: (date W) k: k}) by: k n: (first r)}) 'n) -- [2024.03.01 2024.01.05]
+(at (select {from: t r: (hlp W)}) 'r) -- [2024.03.01 2024.01.05 2024.03.01 2024.02.07]
+(at (select {from: t by: k r: (first (hlp W))}) 'r) -- [2024.03.01 2024.01.05]
+(at (select {from: t by: k r: (date W)}) 'r) -- (list [2024.03.01 2024.03.01] [2024.01.05 2024.02.07])
+(at (select {from: te r: (.emb.tokens M WT)}) 'r) -- (at (select {from: te r: (.emb.tokens M s)}) 'r)
+(at (select {from: te where: (> k 1) r: (.emb.tokens M WT)}) 'r) -- (at (select {from: te where: (> k 1) r: (.emb.tokens M s)}) 'r)
+(at (select {from: S r: (date W)}) 'r) -- [2024.03.01 2024.01.05 2024.03.01 2024.02.07]
+(at (select {from: P where: (> v 15) r: (split WS ",")}) 'r) -- (list ["c"] ["d" "e" "f"] ["g" "h"])
+;; a LIST global is one whole value; one value and another length keep
+;; their per-row reading in a projection; another length in an aggregate
+;; is the length error
+(set WL (list "a,b" "c" "d,e,f" "g,h"))
+(at (select {from: t r: (split WL ",")}) 'r) -- (list (list ["a" "b"] ["c"] ["d" "e" "f"] ["g" "h"]) (list ["a" "b"] ["c"] ["d" "e" "f"] ["g" "h"]) (list ["a" "b"] ["c"] ["d" "e" "f"] ["g" "h"]) (list ["a" "b"] ["c"] ["d" "e" "f"] ["g" "h"]))
+(at (select {from: t r: (date [2024.03.01D10:00:00.000])}) 'r) -- (list [2024.03.01] [2024.03.01] [2024.03.01] [2024.03.01])
+(set W3 (take TS 3))
+(at (select {from: t r: (date W3)}) 'r) -- (list [2024.03.01 2024.01.05 2024.03.01] [2024.03.01 2024.01.05 2024.03.01] [2024.03.01 2024.01.05 2024.03.01] [2024.03.01 2024.01.05 2024.03.01])
+(select {from: t by: k r: (first (date W3))}) !- length
+;; under a constructor or type, as the column form (review of 7822e2d10)
+(at (select {from: t r: (list (date W))}) 'r) -- (at (select {from: t r: (list (date ts))}) 'r)
+(at (select {from: t r: (enlist (split WS ","))}) 'r) -- (at (select {from: t r: (enlist (split s ","))}) 'r)
+(at (select {from: t r: (type (date W))}) 'r) -- (at (select {from: t r: (type (date ts))}) 'r)
+(at (select {from: t where: (> v 15) r: (list (split WS ","))}) 'r) -- (at (select {from: t where: (> v 15) r: (list (split s ","))}) 'r)
+(at (select {from: t r: (list (date W) (date W3))}) 'r) -- (at (select {from: t r: (list (date ts) (date W3))}) 'r)
+;; a vector written in place as long as the table is one too
+(at (select {from: t r: (date [2024.03.01D10:00:00.000 2024.01.05D09:30:00.000 2024.03.01D23:59:00.000 2024.02.07D11:00:00.000])}) 'r) -- [2024.03.01 2024.01.05 2024.03.01 2024.02.07]
+;; a helper whose body has an effect keeps the whole vector, as on dev
+(set hs (fn [x] (do (set zz 1) (date x))))
+(at (select {from: t r: (hs W)}) 'r) -- (list (date TS) (date TS) (date TS) (date TS))
+(.sys.exec "rm -rf /tmp/rf_issue_1760") -- 0
