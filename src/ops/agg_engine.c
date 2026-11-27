@@ -86,7 +86,8 @@ void agg_route_reason(agg_v2_reason_t reason) {
 /* Dense direct-index serial grouping; defined below agg_run_one. */
 static int agg_group_keys_dense(ray_t** key_cols, int64_t nrows,
                                 const dense_plan_t* dp, agg_groups_t* out);
-/* 0, -1 on failure, or AGG_KEYS_SERIAL: a LIST key needs the serial scan. */
+/* 0, -1 on failure, AGG_KEYS_CANCELLED (agg_engine.h) on a cancel, or
+ * AGG_KEYS_SERIAL: a LIST key needs the serial scan. */
 enum { AGG_KEYS_SERIAL = -2 };
 static int agg_group_keys_parallel(ray_t** keys, uint32_t nkeys, int64_t rows,
                                     const dense_plan_t* dp, int hash_mode, agg_groups_t* out);
@@ -96,6 +97,12 @@ static int agg_group_keys_mode(ray_t** key_cols, uint32_t n_keys, int64_t nrows,
 static bool agg_cancelled(void) {
     ray_pool_t* pool = ray_pool_get();
     return pool && atomic_load_explicit(&pool->cancelled, memory_order_relaxed);
+}
+
+/* The error for a failed key grouping: `cancel` when it was cancelled,
+ * `oom` for anything else (#1780). */
+static ray_t* agg_keys_error(int rc) {
+    return ray_error(rc == AGG_KEYS_CANCELLED ? "cancel" : "oom", NULL);
 }
 
 /* Row-index consumers share one grouping and one stable index layout. */
@@ -11689,7 +11696,7 @@ ray_t* agg_group_indices(ray_t* source) {
                    : agg_group_keys_mode(&source, 1, n,
                                          source->type == RAY_LIST ? RAY_KEY_EXACT_INT : 0,
                                          &groups);
-    if (rc) return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+    if (rc) return agg_keys_error(rc);
     int64_t ng = groups.ngroups;
     int64_t* scratch = ray_calloc_raw((size_t)(n + 3 * ng + 1) * sizeof(int64_t));
     if (!scratch) { agg_groups_free(&groups); return ray_error("oom", NULL); }
@@ -11730,7 +11737,7 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                          ext->n_keys == 1 && keys[0]->type == RAY_LIST ? RAY_KEY_EXACT_INT : 0,
                                          &groups);
     agg_dense_plan_free(&dp);   /* compaction tables serve the key build only */
-    if (rc) return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+    if (rc) return agg_keys_error(rc);
     if (agg_cancelled()) { agg_groups_free(&groups); return ray_error("cancel", NULL); }
     int64_t ng = groups.ngroups;
     int64_t* counts = ray_calloc_raw((size_t)(ng + 1) * sizeof(int64_t));
@@ -13612,7 +13619,7 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     agg_groups_t groups = {0};
     int grp_rc = dense ? agg_group_keys_dense(key_cols, nrows, &dp, &groups)
                        : agg_group_keys(key_cols, ext->n_keys, nrows, &groups);
-    if (grp_rc != 0) { agg_dense_plan_free(&dp); return ray_error("oom", NULL); }
+    if (grp_rc != 0) { agg_dense_plan_free(&dp); return agg_keys_error(grp_rc); }
 
     ray_t* result = ray_table_new(ext->n_keys + ext->n_aggs);
     if (!result || RAY_IS_ERR(result)) { agg_dense_plan_free(&dp); agg_groups_free(&groups); return ray_error("oom", NULL); }
@@ -14297,7 +14304,7 @@ retry_insert:
     ray_profile_tick("directory: initialized");
     ray_pool_dispatch(pool, agg_key_directory_insert, &c, rows);
     ray_profile_tick("directory: inserted keys");
-    if (agg_cancelled()) goto done;
+    if (agg_cancelled()) { rc = AGG_KEYS_CANCELLED; goto done; }
     uint8_t inexact = atomic_load(&c.inexact);
     if (c.hash_mode == RAY_KEY_EXACT_INT && (inexact & RAY_KEY_FLOAT)) {
         /* The joined speculative pass may have skipped rows. Discard its
@@ -14313,7 +14320,7 @@ retry_insert:
     }
     ray_pool_dispatch_n(pool, agg_key_directory_count, &c, tasks);
     ray_profile_tick("directory: counted groups");
-    if (agg_cancelled()) goto done;
+    if (agg_cancelled()) { rc = AGG_KEYS_CANCELLED; goto done; }
     for (uint32_t t = 0; t < tasks; t++) c.offsets[t + 1] += c.offsets[t];
     out->ngroups = c.offsets[tasks];
     /* Representatives need one entry per group, not per input row. Delay
@@ -14324,7 +14331,7 @@ retry_insert:
     ray_profile_tick("directory: compacted groups");
     ray_pool_dispatch(pool, agg_key_directory_remap, &c, rows);
     ray_profile_tick("directory: remapped rows");
-    if (!agg_cancelled()) rc = 0;
+    rc = agg_cancelled() ? AGG_KEYS_CANCELLED : 0;
 done:
     ray_free_raw(c.data); ray_free_raw(c.first); ray_free_raw(c.unique); ray_free_raw(c.offsets);
     if (rc) agg_groups_free(out);
@@ -14491,8 +14498,8 @@ ray_t* agg_select_distinct(ray_t* tbl, ray_t** key_cols, const int64_t* key_syms
                            uint32_t nk, int64_t nrows,
                            const int64_t* keep_syms, int keep_n) {
     agg_groups_t groups = {0};
-    if (agg_group_keys(key_cols, nk, nrows, &groups) != 0)
-        return ray_error("oom", NULL);
+    int grp_rc = agg_group_keys(key_cols, nk, nrows, &groups);
+    if (grp_rc != 0) return agg_keys_error(grp_rc);
     int64_t ncol = ray_table_ncols(tbl);
     ray_t* result = ray_table_new(ncol);
     if (!result || RAY_IS_ERR(result)) {

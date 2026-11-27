@@ -229,10 +229,13 @@ typedef struct {
  * gids incrementally on first sight → gid
  * order == first-occurrence order; first_row[gid] records the row where the
  * group first appeared. Returns 0 on success (caller releases out via
- * agg_groups_free()), -1 on allocation failure.
+ * agg_groups_free()), -1 on allocation failure, AGG_KEYS_CANCELLED when the
+ * query was cancelled while it grouped (#1780: the caller answers `cancel`,
+ * not `oom`).  out holds nothing on either failure.
  * n_keys is uint32_t: unbounded key count.  Cut-3 lifted both admission gates
  * (the GROUP path and the keys-only DISTINCT path) and the fixed data[16]
  * inside became an exact carve, so any key count groups correctly. */
+#define AGG_KEYS_CANCELLED (-3)
 int agg_group_keys(ray_t** key_cols, uint32_t n_keys, int64_t nrows, agg_groups_t* out);
 /* Exact wide-value distinct counts over an existing stable group index. */
 ray_t* agg_count_distinct_indexed(ray_t* src, const int64_t* rows,

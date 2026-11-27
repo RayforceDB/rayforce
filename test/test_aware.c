@@ -3512,6 +3512,84 @@ static int64_t aw_live_blocks(void) {
     return (int64_t)st.alloc_count - (int64_t)st.free_count;
 }
 
+/* #1780: a cancel that lands while a group runs answers `cancel`, never
+ * `oom` and never an answer it did not finish.  For each query, the nth
+ * pool dispatch finds the query cancelled (mode 0: a cancel request; mode
+ * 1: the pool's flag alone), for every n up to past the query's last
+ * dispatch: each run answers `cancel` with no block left behind, or the
+ * same answer as the uncancelled run.
+ *  - a group by two keys with nothing else: agg_select_distinct mapped any
+ *    failure of agg_group_keys to `oom`;
+ *  - a whole-table median beside a sum: the median's recompute after the
+ *    shared reduction dropped its `cancel` error (leaking it) and left the
+ *    integer default in the column;
+ *  - a deviation by group over a parted table, 80,000 groups of the two
+ *    partitions' partials, so the variance fold groups them on the pool:
+ *    the fold took a cancel for a shape it cannot read and declined, and
+ *    the whole query ran again on the concat path before it answered. */
+static test_result_t test_group_cancel_status(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    aw_eval_ok("(set i (til 262144))");
+    aw_eval_ok("(set T (table [a b v] (list (% i 1000) (% i 7) (% (* i 7919) 100003))))");
+    for (int p = 0; p < 2; p++) {
+        char q[400];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/gcs/2024.01.0%d/t/\" "
+                 "(table [k v] (list (%% (+ %d (til 140000)) 40000) (as 'F64 (%% (* 7 (+ %d (til 140000))) 1009)))) "
+                 "\"" AW_TMP "/gcs/.sym\")", p + 1, p * 140000, p * 140000);
+        aw_eval_ok(q);
+    }
+    aw_eval_ok("(set P (.db.parted.get \"" AW_TMP "/gcs\" 't))");
+    static const char* const qs[] = {
+        "(select {from: T by: [a b]})",
+        "(select {m: (med v) t: (sum v) from: T})",
+        "(select {d: (dev v) from: P by: k})",
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
+        char setq[300];
+        snprintf(setq, sizeof setq, "(set R0 %s)", qs[i]);
+        aw_eval_ok(setq);
+        int cancelled = 0, answered = 0;
+        for (int mode = 0; mode < 2; mode++)
+            for (int k = 1; k <= 40; k++) {
+                ray_heap_gc();
+                int64_t live0 = aw_live_blocks();
+                ray_pool_test_cancel_at((uint32_t)k, mode == 1);
+                ray_t* got = aw_eval(qs[i]);
+                ray_pool_test_cancel_at(0, false);
+                ray_clear_interrupt();
+                TEST_ASSERT_NOT_NULL(got);
+                if (RAY_IS_ERR(got)) {
+                    char code[32];
+                    snprintf(code, sizeof code, "%s", ray_err_code(got));
+                    ray_error_free(got);
+                    ray_heap_gc();
+                    int64_t live = aw_live_blocks() - live0;
+                    TEST_ASSERT_FMT(strcmp(code, "cancel") == 0, "%s, mode %d, cancel before dispatch %d: %s, not cancel",
+                                    qs[i], mode, k, code);
+                    /* no block more than before.  The count is this
+                     * thread's heap: a block a pool worker allocated and this
+                     * thread frees counts as a free only, so the parted query
+                     * reads one or two below, cancelled or not (on dev too) */
+                    TEST_ASSERT_FMT(live <= 0, "%s, mode %d, cancel before dispatch %d: %lld blocks left",
+                                    qs[i], mode, k, (long long)live);
+                    cancelled++;
+                    continue;
+                }
+                ray_env_set(ray_sym_intern("Q", 1), got);
+                ray_release(got);
+                ray_t* v = ray_eval_str("(and (== (count (ser Q)) (count (ser R0))) (all (== (ser Q) (ser R0))))");
+                bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+                if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+                TEST_ASSERT_FMT(ok, "%s, mode %d, cancel before dispatch %d: not the uncancelled answer", qs[i], mode, k);
+                answered++;
+            }
+        TEST_ASSERT_FMT(cancelled > 0 && answered > 0, "%s: %d cancelled, %d answered", qs[i], cancelled, answered);
+    }
+    aw_eval_ok("(set Q 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set T 0)"); aw_eval_ok("(set P 0)"); aw_eval_ok("(set i 0)");
+    PASS();
+}
+
 static test_result_t test_topk_cancel_at_dispatch(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
@@ -6419,6 +6497,7 @@ const test_entry_t aware_entries[] = {
     { "aware/sort_head_late",     test_sort_head_late,     aw_setup, aw_teardown },
     { "aware/sort_head_late_chunked", test_sort_head_late_chunked, aw_setup, aw_teardown },
     { "aware/topk_cancel_at_dispatch", test_topk_cancel_at_dispatch, aw_setup, aw_teardown },
+    { "aware/group_cancel_status", test_group_cancel_status, aw_setup, aw_teardown },
     { "aware/sel_compact_cancel_at_dispatch", test_sel_compact_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/distinct_str_cancel", test_distinct_str_cancel, aw_setup, aw_teardown },
     { "aware/topk_inplace", test_topk_inplace, aw_setup, aw_teardown },
