@@ -21,6 +21,8 @@
  *   SOFTWARE.
  */
 
+#include <sched.h>        /* sched_yield: a settling lazy handle */
+#include "core/platform.h"   /* RAY_CPU_RELAX */
 #include "ops/colbind.h"
 #include "ops/temporal.h"   /* ray_temporal_trunc_type */
 #include "graph.h"
@@ -2137,6 +2139,12 @@ ray_op_t* ray_knn_rerank(ray_graph_t* g, ray_op_t* src,
 
 /* --------------------------------------------------------------------------
  * Lazy DAG handles
+ *
+ * A handle is single-use for one owner: ray_lazy_append extends it in place
+ * and ray_lazy_materialize consumes its graph.  A handle with more than one
+ * owner (rc > 1) stays readable for each (#1860): the first extension or
+ * materialization runs its graph once and the handle keeps the result, or
+ * the error, which every other owner reads again (lazy_settle, below).
  * -------------------------------------------------------------------------- */
 
 ray_op_t* ray_graph_input_vec(ray_graph_t* g, ray_t* vec) {
@@ -2203,7 +2211,124 @@ ray_t* ray_lazy_promote(ray_t* lazy) {
     return NULL;
 }
 
+/* ---- Shared lazy handles ---- */
+
+/* A graph lazy handle with more than one owner (rc > 1): a compiled
+ * frame's slot and the scope frame its window binds both hold a
+ * parameter's handle (#1860), and pool workers may each hold it (a pmap
+ * over a collection that repeats it).  A handle is single-use: extended in
+ * place or consumed by one owner, it would be a dead handle for the
+ * others.  So it settles, once: its graph runs and the handle keeps the
+ * result (GRAPH RAY_LAZY_G_SETTLED, OP holding the result, owned) or the
+ * error (RAY_LAZY_G_FAILED, OP holding the error, owned).  A settled handle is only
+ * read from then on: every owner gets the result retained, or a copy of the
+ * error, and an extension goes to a fresh handle over the result.
+ *
+ * Settling is claimed with one compare-and-swap of the GRAPH slot to
+ * RAY_LAZY_G_SETTLING (not attrs or rc: ray_retain reads those on any
+ * thread without atomics).  An owner that loses waits, yielding, until the
+ * winner publishes SETTLED or FAILED with a release store; the winner
+ * leaves SETTLING on every path.  The winner's graph never waits on the
+ * pool: a dispatch made while another is in flight (a pmap task) runs its
+ * tasks on the calling thread (pool_dispatch_at), so owners waiting on
+ * other workers cannot hold it up.  A single-owner handle never comes
+ * here: the fused path is unchanged. */
+static ray_t* lazy_error_copy(ray_t* e) {
+    const char* m = ray_err_msg(e);
+    return m ? ray_error(ray_err_code(e), "%s", m) : ray_error(ray_err_code(e), NULL);
+}
+
+/* Settle `lazy` (or find it settled).  NULL, with the result retained in
+ * `*out`; or an owned error: the value's own (a copy for each owner). */
+static ray_t* lazy_settle(ray_t* lazy, ray_t** out) {
+    ray_t* ctbl; int64_t csym;
+    if (ray_lazy_colref_get(lazy, &ctbl, &csym)) {
+        /* a column reference reads its table: no state to settle */
+        ray_t* r = ray_table_col_value(ctbl, csym);
+        if (!r || RAY_IS_ERR(r)) return r ? r : ray_error("oom", NULL);
+        *out = r;
+        return NULL;
+    }
+    ray_graph_t** slot = &RAY_LAZY_GRAPH(lazy);
+    ray_graph_t* g = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+    uint32_t spins = 0;
+    for (;;) {
+        if (g == RAY_LAZY_G_SETTLED) {
+            ray_t* r = (ray_t*)RAY_LAZY_OP(lazy);
+            ray_retain(r);
+            *out = r;
+            return NULL;
+        }
+        if (g == RAY_LAZY_G_FAILED) return lazy_error_copy((ray_t*)RAY_LAZY_OP(lazy));
+        if (g == RAY_LAZY_G_SETTLING) {
+            RAY_CPU_RELAX();
+            if (++spins % 1024 == 0) sched_yield();
+            g = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+            continue;
+        }
+        if (__atomic_compare_exchange_n(slot, &g, RAY_LAZY_G_SETTLING, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            break;
+    }
+    ray_op_t* op = RAY_LAZY_OP(lazy);
+    ray_t* r;
+    if (!g || !op) r = ray_error("domain", "lazy handle already materialized");
+    else {
+        op = ray_optimize(g, op);
+        r = ray_execute(g, op);
+        ray_graph_free(g);
+    }
+    if (!r) r = ray_error("oom", NULL);
+    bool ok = !RAY_IS_ERR(r);
+    RAY_LAZY_OP(lazy) = (ray_op_t*)(ok ? r : lazy_error_copy(r));
+    __atomic_store_n(slot, ok ? RAY_LAZY_G_SETTLED : RAY_LAZY_G_FAILED, __ATOMIC_RELEASE);
+    if (!ok) return r;
+    ray_retain(r);                                /* the handle keeps one */
+    *out = r;
+    return NULL;
+}
+
+/* Whether `lazy` must settle before it is read or extended: shared, or
+ * settled already. */
+static inline bool lazy_needs_settle(ray_t* lazy) {
+    return __atomic_load_n(&lazy->rc, __ATOMIC_RELAXED) > 1 ||
+           RAY_LAZY_G_STATE(__atomic_load_n(&RAY_LAZY_GRAPH(lazy), __ATOMIC_ACQUIRE));
+}
+
+/* A fresh single-owner handle over the settled value of `lazy`: owned, or
+ * the error. */
+static ray_t* lazy_fresh(ray_t* lazy) {
+    ray_t* r = NULL;
+    ray_t* err = lazy_settle(lazy, &r);
+    if (err) return err;
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* c = !g ? NULL : r->type == RAY_TABLE ? ray_const_table(g, r)
+                : ray_is_atom(r) ? ray_const_atom(g, r) : ray_const_vec(g, r);
+    ray_release(r);
+    if (!c) { if (g) ray_graph_free(g); return ray_error("oom", NULL); }
+    return ray_lazy_wrap(g, c);                   /* frees g on failure */
+}
+
+ray_t* ray_lazy_own(ray_t* lazy) {
+    if (!lazy_needs_settle(lazy)) {
+        ray_t* perr = ray_lazy_promote(lazy);    /* one owner: in place */
+        return perr ? perr : lazy;
+    }
+    return lazy_fresh(lazy);
+}
+
+/* ray_lazy_append for a handle that must settle: the call extends a fresh
+ * handle over the value.  The result is the fresh handle, owned. */
+static ray_t* lazy_append_shared(ray_t* lazy, uint16_t opcode, bool param, int64_t p) {
+    ray_t* h = lazy_fresh(lazy);
+    if (!h || RAY_IS_ERR(h)) return h ? h : ray_error("oom", NULL);
+    ray_t* res = param ? ray_lazy_append_param(h, opcode, p) : ray_lazy_append(h, opcode);
+    ray_release(h);                               /* the append retained it for its caller */
+    return res;
+}
+
 ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
+    if (__builtin_expect(lazy_needs_settle(lazy), 0)) return lazy_append_shared(lazy, opcode, false, 0);
     ray_t* perr = ray_lazy_promote(lazy);
     if (perr) return perr;
     ray_graph_t* g    = RAY_LAZY_GRAPH(lazy);
@@ -2276,6 +2401,7 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
 }
 
 ray_t* ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param) {
+    if (__builtin_expect(lazy_needs_settle(lazy), 0)) return lazy_append_shared(lazy, opcode, true, param);
     ray_t* perr = ray_lazy_promote(lazy);
     if (perr) return perr;
     ray_graph_t* g    = RAY_LAZY_GRAPH(lazy);
@@ -2318,6 +2444,14 @@ ray_t* ray_lazy_materialize(ray_t* val) {
         ray_t* r = ray_table_col_value(ctbl, csym);
         ray_release(val);
         return r;
+    }
+
+    if (__builtin_expect(lazy_needs_settle(val), 0)) {
+        /* shared or settled: the settled value for this owner */
+        ray_t* r = NULL;
+        ray_t* err = lazy_settle(val, &r);
+        ray_release(val);
+        return err ? err : r;
     }
 
     ray_graph_t* g  = RAY_LAZY_GRAPH(val);
