@@ -1,0 +1,49 @@
+;; #1772: under an unaggregated by:, a helper given to map, pmap, apply,
+;; scan or prior read its free source columns over the whole table, where
+;; the lambda literal with the same body and the direct call see each
+;; group's rows.  The owner's answer: the group's rows, as the literal and
+;; the direct call.  A call through a computed head under by: is the call of
+;; the function it gives too: a builtin is written as its name (#1815), and
+;; one left as written (a lambda) runs per group.
+(.sys.exec "rm -rf /tmp/rf_issue_1772 && mkdir -p /tmp/rf_issue_1772") -- 0
+(set t (table [a c s] (list [1 2 3 4] [100 200 300 400] ['x 'y 'x 'y])))
+(set f (fn [v] (+ v c)))
+(set f2 (fn [x y] (+ x (+ y c))))
+(set g (fn [v] (f v)))
+(set k (fn [v] (* v 2)))
+(.db.splayed.set "/tmp/rf_issue_1772/spl/t/" t "/tmp/rf_issue_1772/spl/.sym")
+(set S (.db.splayed.get "/tmp/rf_issue_1772/spl/t/" "/tmp/rf_issue_1772/spl/.sym"))
+(map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1772/par/%/t" (+ 2024.01.01 p)) t "/tmp/rf_issue_1772/par/.sym")) (til 2))
+(set P (.db.parted.get "/tmp/rf_issue_1772/par/" 't))
+;; the lambda literal and the direct call, as on dev
+(at (select {from: t by: s r: (map (fn [v] (+ v c)) [1 2])}) 'r) -- (list (list [101 301] [102 302]) (list [201 401] [202 402]))
+(at (select {from: t by: s r: (f 1)}) 'r) -- (list [101 301] [201 401])
+(at (select {from: t by: s r: (first (map f [1 2]))}) 'r) -- (list [101 301] [201 401])
+(at (select {from: t r: (map f [1 2])}) 'r) -- (list [101 102] [201 202] [301 302] [401 402])
+(at (select {from: t by: s r: (map k [1 2])}) 'r) -- (list [2 4] [2 4])
+;; the helper given to a higher-order builtin: each group's rows
+(at (select {from: t by: s r: (map f [1 2])}) 'r) -- (list (list [101 301] [102 302]) (list [201 401] [202 402]))
+(at (select {from: t by: s r: (pmap f [1 2])}) 'r) -- (list (list [101 301] [102 302]) (list [201 401] [202 402]))
+(at (select {from: t by: s r: (apply f2 [1 2] [3 4])}) 'r) -- (list (list [104 304] [106 306]) (list [204 404] [206 406]))
+(at (select {from: t by: s r: (scan f2 [1 2])}) 'r) -- (list (list 1 [103 303]) (list 1 [203 403]))
+(at (select {from: t by: s r: (prior f2 [1 2])}) 'r) -- (list (list [102 302] [103 303]) (list [202 402] [203 403]))
+(at (select {from: t by: s r: (map g [1 2])}) 'r) -- (list (list [101 301] [102 302]) (list [201 401] [202 402]))
+;; a lambda literal calling such a helper reads the group, as the direct call
+(at (select {from: t by: s r: (map (fn [v] (f v)) [1 2])}) 'r) -- (list (list [101 301] [102 302]) (list [201 401] [202 402]))
+(at (select {from: t by: s r: (g 1)}) 'r) -- (list [101 301] [201 401])
+(at (select {from: t by: s where: (> a 1) r: (map f [1 2])}) 'r) -- (list (list [201 401] [202 402]) (list [301] [302]))
+(at (select {from: S by: s r: (map f [1 2])}) 'r) -- (list (list [101 301] [102 302]) (list [201 401] [202 402]))
+(at (select {from: P by: s r: (apply f2 [1 2] [3 4])}) 'r) -- (list (list [104 304 104 304] [106 306 106 306]) (list [204 404 204 404] [206 406 206 406]))
+;; a computed head under by:: the named call's group
+(set T (table [g c i] (list ['a 'a 'b 'b 'b 'c 'a 'c 'b 'a] [true false true false true false true true false false] [10 20 30 40 50 60 70 80 90 15])))
+(set D (dict ['f 'r 'q 'l 'n] (list filter reverse iasc (fn [x] (reverse x)) count)))
+(at (select {from: T by: g r: (filter i c)}) 'r) -- (list [10 70] [30 50] [80])
+(at (select {from: T by: g r: ((at D 'f) i c)}) 'r) -- (list [10 70] [30 50] [80])
+(at (select {from: T by: g r: ((at D 'r) i)}) 'r) -- (list [15 70 20 10] [90 50 40 30] [80 60])
+(at (select {from: T by: g r: ((at D 'q) i)}) 'r) -- (list [0 3 1 2] [0 1 2 3] [0 1])
+(at (select {from: T by: g r: ((at D 'l) i)}) 'r) -- (list [15 70 20 10] [90 50 40 30] [80 60])
+(at (select {from: T by: g where: (> i 15) r: ((at D 'r) i)}) 'r) -- (list [70 20] [90 50 40 30] [80 60])
+(at (select {from: T by: g r: (sum ((at D 'f) i c))}) 'r) -- [80 80 80]
+;; inside an aggregate's arguments the head is left as written, as on dev
+(at (select {from: T by: g r: (first ((at D 'n) i))}) 'r) -- [4 4 2]
+(.sys.exec "rm -rf /tmp/rf_issue_1772") -- 0
