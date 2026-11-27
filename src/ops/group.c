@@ -475,6 +475,8 @@ static inline void out_col_adopt_str_pool(ray_t* dst, const ray_t* src) {
         dst->str_pool = owner->str_pool;
     }
 }
+/* WIDE_CANCELLED: the scan saw a cancel (#1780), apart from -1, no row. */
+#define WIDE_CANCELLED (-2)
 /* Scan rows [optionally via sel] and return the winning row index for
  * op (OP_MIN/OP_MAX/OP_FIRST/OP_LAST), or -1 if every scanned row is null.
  *
@@ -490,7 +492,7 @@ static int64_t wide_winner_row(ray_t* input, uint16_t op,
     /* first/last: positional — return the first/last non-null row, no compare. */
     if (op == OP_FIRST) {
         for (int64_t i = 0; i < scan_n; i++) {
-            if ((i & 65535) == 0 && ray_interrupted()) return -1;
+            if ((i & 65535) == 0 && ray_interrupted()) return WIDE_CANCELLED;
             int64_t row = sel ? sel[i] : i;
             if (input->type == RAY_LIST) {
                 ray_t* e = ((ray_t**)ray_data(input))[row];
@@ -503,7 +505,7 @@ static int64_t wide_winner_row(ray_t* input, uint16_t op,
     }
     if (op == OP_LAST) {
         for (int64_t i = scan_n - 1; i >= 0; i--) {
-            if ((i & 65535) == 0 && ray_interrupted()) return -1;
+            if ((i & 65535) == 0 && ray_interrupted()) return WIDE_CANCELLED;
             int64_t row = sel ? sel[i] : i;
             if (input->type == RAY_LIST) {
                 ray_t* e = ((ray_t**)ray_data(input))[row];
@@ -520,7 +522,7 @@ static int64_t wide_winner_row(ray_t* input, uint16_t op,
     if (input->type == RAY_GUID) {
         const uint8_t* d = (const uint8_t*)ray_data(input);
         for (int64_t i = 0; i < scan_n; i++) {
-            if ((i & 65535) == 0 && ray_interrupted()) return -1;
+            if ((i & 65535) == 0 && ray_interrupted()) return WIDE_CANCELLED;
             int64_t row = sel ? sel[i] : i;
             if (has_nulls && ray_vec_is_null(input, row)) continue;
             if (best < 0) { best = row; continue; }
@@ -529,7 +531,7 @@ static int64_t wide_winner_row(ray_t* input, uint16_t op,
         }
     } else {  /* RAY_STR — lexicographic over the pooled bytes */
         for (int64_t i = 0; i < scan_n; i++) {
-            if ((i & 65535) == 0 && ray_interrupted()) return -1;
+            if ((i & 65535) == 0 && ray_interrupted()) return WIDE_CANCELLED;
             int64_t row = sel ? sel[i] : i;
             if (has_nulls && ray_vec_is_null(input, row)) continue;
             if (best < 0) { best = row; continue; }
@@ -550,6 +552,7 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
                               const int64_t* sel, int64_t scan_n,
                               bool has_nulls) {
     int64_t best = wide_winner_row(input, op, sel, scan_n, has_nulls);
+    if (best == WIDE_CANCELLED) return ray_error("cancel", NULL);
     if (best < 0)
         return input->type == RAY_LIST
             ? ray_typed_null(-RAY_I64)
@@ -18688,8 +18691,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* Row-gathered min/max/first/last cannot be represented in
          * emit_agg_columns' fixed-width accumulator slots.  Recompute those
          * 1-row columns by materialising the winning row — mirroring
-         * exec_reduction — and override them in the result table. */
-        for (uint32_t a = 0; a < n_aggs; a++) {
+         * exec_reduction — and override them in the result table.  A cancel
+         * in these recomputes, or in the holistic ones below, is the answer
+         * (#1780): the columns it left are the integer default, not the
+         * aggregate. */
+        ray_t* recompute_err = NULL;
+        for (uint32_t a = 0; a < n_aggs && !recompute_err; a++) {
             uint16_t aop = ext->agg_ops[a];
             if (!(agg_vecs[a] &&
                   agg_needs_row_gather(agg_vecs[a]->type, aop)))
@@ -18706,6 +18713,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             bool hn = ray_vec_may_have_nulls(agg_vecs[a]);
             ray_t* atom = agg_wide_reduce(agg_vecs[a], aop, wsel, wscan, hn);
             if (wsel_blk) ray_release(wsel_blk);
+            if (!atom || RAY_IS_ERR(atom)) { recompute_err = atom ? atom : ray_error("oom", NULL); break; }
             ray_t* col = agg_vecs[a]->type == RAY_LIST
                 ? ray_list_new(1)
                 : col_vec_new(agg_vecs[a], 1);
@@ -18745,7 +18753,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 if (ext->agg_ops[a] == OP_MEDIAN ||
                     ext->agg_ops[a] == OP_QUANTILE ||
                     ext->agg_ops[a] == OP_MODE) { any_rank = true; break; }
-            if (any_rank) {
+            if (any_rank && !recompute_err) {
                 ray_t* hsel_blk = NULL; const int64_t* hsel = NULL; int64_t hscan = nrows;
                 if (g->selection) {
                     ray_rowsel_t* sm = ray_rowsel_meta(g->selection);
@@ -18764,7 +18772,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     else      { for (int64_t i = 0; i < hscan; i++) idxb[i] = i; }
                     int64_t offs[1] = {0};
                     int64_t cnts[1] = {hscan};
-                    for (uint32_t a = 0; a < n_aggs; a++) {
+                    for (uint32_t a = 0; a < n_aggs && !recompute_err; a++) {
                         if (!agg_vecs[a]) continue;
                         uint16_t aop = ext->agg_ops[a];
                         ray_t* hv = NULL;
@@ -18778,6 +18786,9 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                             hv = ray_mode_per_group_buf(agg_vecs[a], idxb, offs, cnts, 1);
                         } else {
                             continue;
+                        }
+                        if (hv && RAY_IS_ERR(hv) && strcmp(ray_err_code(hv), "cancel") == 0) {
+                            recompute_err = hv; break;
                         }
                         if (hv && !RAY_IS_ERR(hv)) ray_table_set_col_idx(result, a, hv);
                         if (hv) ray_release(hv);
@@ -18796,6 +18807,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
         AGG_OWN_SRC_RELEASE();
         if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
+        if (recompute_err) { ray_release(result); return recompute_err; }
         return result;
     }
 
@@ -23387,9 +23399,11 @@ static bool pp_wide_avg_split(ray_t** partp, int64_t si, int64_t mi, int64_t ci,
  * the merge takes as FIRST (its count merges as a SUM).  A group with no
  * value yet (n = 0 everywhere: absent, or all null) stays null.  Four
  * doubles per group; false on a shape it cannot read (the caller bails to
- * the concat path). */
+ * the concat path), and false with *cancelled set when the query was
+ * cancelled while it grouped (the caller answers `cancel`, #1780). */
 static bool pp_var_fold(ray_t* mt, uint32_t n_keys, uint32_t n_std, const uint8_t* k_slot,
-                        const uint8_t* d_slot, const uint8_t* vp_slot, const uint8_t* cnt_slot) {
+                        const uint8_t* d_slot, const uint8_t* vp_slot, const uint8_t* cnt_slot,
+                        bool* cancelled) {
     int64_t nr = ray_table_nrows(mt);
     if (nr <= 0) return true;
     agg_groups_t gr = { 0 };
@@ -23404,7 +23418,7 @@ static bool pp_var_fold(ray_t* mt, uint32_t n_keys, uint32_t n_std, const uint8_
         }
         int rc = agg_group_keys(kc, n_keys, nr, &gr);
         scratch_free(kc_hdr);
-        if (rc != 0) return false;
+        if (rc != 0) { *cancelled = rc == AGG_KEYS_CANCELLED; return false; }
         ng = gr.ngroups;
     }
     ray_t* st_hdr = NULL;
@@ -24536,9 +24550,12 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         }
 
         /* The variance partials, combined per group (pp_var_fold) */
+        bool var_cancelled = false;
         if (n_std && !pp_var_fold(merge_tbl, n_keys, n_std, std_idx, std_sq_slot,
-                                  std_vp_slot, std_cnt_slot))
+                                  std_vp_slot, std_cnt_slot, &var_cancelled)) {
+            if (var_cancelled) ret = ray_error("cancel", NULL);
             goto batch_fail;
+        }
 
         /* Pass 3: merge GROUP BY */
         ray_graph_t* mg = ray_graph_new(merge_tbl);

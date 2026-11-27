@@ -1,0 +1,28 @@
+;; @requires: posix  (the server is spawned and stopped through test/serve.sh)
+;; A group by two or more keys with nothing else in the select
+;; (`select {from: T by: [a b]}`) groups its keys with agg_group_keys, and
+;; mapped any failure of it to `oom`: a cancel that landed while it grouped
+;; answered `oom`, and the query log recorded an `oom` that never happened
+;; (#1780).  Five requests each get a client deadline of a quarter of the
+;; whole run, so the cancel lands while the query groups; the query log gives
+;; their statuses.  The server is its own process, with its own port
+;; (test/serve.sh), stopped by its own pid only.
+(.sys.exec "rm -rf /tmp/rf_gkoom")
+(.sys.exec "test/serve.sh /tmp/rf_gkoom -Q 1") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rf_gkoom/port"))))
+(set h (.ipc.open addr))
+(.ipc.send h "(do (set T (table [a b] (list (% (til 16777216) 1000) (% (til 16777216) 7)))) 0)") -- 0
+(set q "(count (select {from: T by: [a b]}))")
+(set t0 (.time.now))
+(.ipc.send h q) -- 7000
+(set dl (max 2 (div (- (.time.now) t0) 4)))
+(set n0 (at (.ipc.send h "(.sys.querylog.stats)") 'next))
+(set cut (fn [i] (do (set c (.ipc.open addr)) (try (.ipc.send c q dl) (fn [e] e)) (try (.ipc.close c) (fn [e] e)) i)))
+(map cut (til 5)) -- [0 1 2 3 4]
+(.ipc.send h "1") -- 1
+(set st (.ipc.send h (format "(at (select {from: (.sys.querylog %) where: (== query \"%\")}) 'status)" n0 q)))
+;; control: the cancels landed while the query ran
+(count (where (== st 'ok))) -- 0
+(.sys.exec "test/serve.sh --stop /tmp/rf_gkoom") -- 0
+(count (where (== st 'oom))) -- 0
+(count (where (== st 'cancel))) -- 5
