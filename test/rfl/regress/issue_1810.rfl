@@ -1,0 +1,51 @@
+;; #1810: a keyless projection whose head is a name holding a whole-column
+;; verb -- a lambda parameter, a let, a global alias -- applied the verb row
+;; by row: the verbs were matched by spelling.  A head is now also judged by
+;; the builtin it holds, as the named call; a rebound name keeps its
+;; spelling's meaning, as before.
+(set T (table [g c i] (list ['a 'a 'b 'b 'b 'c 'a 'c 'b 'a] [true false true false true false true true false false] [10 20 30 40 50 60 70 80 90 10])))
+(at (select {from: T r: (reverse i)}) 'r) -- [10 90 80 70 60 50 40 30 20 10]
+((fn [h] (at (select {from: T r: (h i)}) 'r)) reverse) -- [10 90 80 70 60 50 40 30 20 10]
+((fn [] (let h reverse) (at (select {from: T r: (h i)}) 'r))) -- [10 90 80 70 60 50 40 30 20 10]
+(set rv reverse)
+(at (select {from: T r: (rv i)}) 'r) -- [10 90 80 70 60 50 40 30 20 10]
+((fn [h] (at (select {from: T where: (> i 15) r: (h i)}) 'r)) reverse) -- [90 80 70 60 50 40 30 20]
+((fn [h] (at (select {from: T r: (h i)}) 'r)) asc) -- [10 10 20 30 40 50 60 70 80 90]
+((fn [h] (at (select {from: T r: (h i)}) 'r)) distinct) -- [10 20 30 40 50 60 70 80 90]
+((fn [h] (at (select {from: T r: (h c)}) 'r)) where) -- [0 2 4 6 7]
+((fn [h] (at (select {from: T r: (h i)}) 'r)) rank) -- (at (select {from: T r: (rank i)}) 'r)
+;; nested, where the projection always evaluates it
+((fn [h] (at (select {from: T r: (+ 0 (h i))}) 'r)) reverse) -- [10 90 80 70 60 50 40 30 20 10]
+((fn [h] (at (select {from: T r: (do 0 (h i))}) 'r)) desc) -- (at (select {from: T r: (desc i)}) 'r)
+;; holding anything else, the head keeps its row-by-row call
+((fn [h] (at (select {from: T r: (h i)}) 'r)) neg) -- [-10 -20 -30 -40 -50 -60 -70 -80 -90 -10]
+((fn [h] (at (select {from: T r: (h i)}) 'r)) (fn [x] (+ x 1))) -- [11 21 31 41 51 61 71 81 91 11]
+;; under by:, as before
+((fn [h] (at (select {from: T by: g r: (h i)}) 'r)) reverse) -- (at (select {from: T by: g r: (reverse i)}) 'r)
+;; whatever the name is spelled, a builtin's own name included: enlist
+;; holding reverse is reverse (review), a verb's name holding another verb
+;; is that verb, a verb's name holding til is til
+(set TE (table [i] (list [3 1 2])))
+((fn [enlist] (at (select {from: TE r: (enlist i)}) 'r)) reverse) -- [2 1 3]
+((fn [] (let enlist reverse) (at (select {from: TE r: (enlist i)}) 'r))) -- [2 1 3]
+(set enlist0 enlist)
+(set enlist reverse)
+(at (select {from: TE r: (enlist i)}) 'r) -- [2 1 3]
+(set enlist enlist0)
+(at (select {from: TE r: (enlist 5)}) (quote r)) -- [5 5 5]
+((fn [asc] (at (select {from: TE r: (asc i)}) 'r)) reverse) -- [2 1 3]
+((fn [list] (at (select {from: TE r: (list i)}) 'r)) asc) -- [1 2 3]
+(set reverse0 reverse)
+(set reverse til)
+(at (select {from: TE r: (reverse i)}) 'r) -- (list [0 1 2] [0] [0 1])
+(set reverse reverse0)
+(at (select {from: TE r: (reverse i)}) 'r) -- [2 1 3]
+
+;; a parameter or a let spelled like a form and holding that same form is
+;; the form: quote held by quote still quotes the cast's head (review), do
+;; held by do still reads its last form whole
+(set TQ (table [i] (list [3 1 2])))
+((fn [quote] (at (select {from: TQ r: ((quote as) 'LIST i)}) 'r)) quote) -- (at (select {from: TQ r: ((quote as) 'LIST i)}) 'r)
+((fn [] (let quote quote) (at (select {from: TQ r: ((quote as) 'LIST i)}) 'r))) -- (at (select {from: TQ r: ((quote as) 'LIST i)}) 'r)
+((fn [do] (at (select {from: TQ r: (do 0 (reverse i))}) 'r)) do) -- [2 1 3]
+((fn [enlist] (at (select {from: TQ r: (enlist 5)}) 'r)) enlist) -- [5 5 5]

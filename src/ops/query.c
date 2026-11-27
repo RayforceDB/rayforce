@@ -26,6 +26,7 @@
  */
 
 #include "lang/internal.h"
+#include "io/json.h"     /* ray_json_get_fn, ray_json_parse_fn: json_rowwise */
 #include "io/parquet.h"
 #include "lang/eval.h"
 #include "lang/env.h"
@@ -5407,17 +5408,15 @@ static int json_rowwise(ray_t* e, ray_t* tbl) {
     ray_t** el = (ray_t**)ray_data(e);
     ray_t* head = el[0];
     if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return -1;
-    ray_t* hs = ray_sym_str(head->i64);
-    size_t hl = hs ? ray_str_len(hs) : 0;
-    const char* hp = hs ? ray_str_ptr(hs) : "";
-    bool json = (hl == 9 && memcmp(hp, ".json.get", 9) == 0) ||
-                (hl == 11 && memcmp(hp, ".json.parse", 11) == 0);
+    /* the builtin the head holds, whatever it is spelled (#1810 review) */
+    ray_t* fn = ray_env_get(head->i64);
+    if (!fn || RAY_IS_ERR(fn) || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY))
+        return -1;
+    bool json = fn->type == RAY_VARY &&
+                ((const void*)(uintptr_t)fn->i64 == (const void*)ray_json_get_fn ||
+                 (const void*)(uintptr_t)fn->i64 == (const void*)ray_json_parse_fn);
     if (json && !expr_refs_row_column(el[1], tbl)) return -1;
-    if (!json) {
-        ray_t* fn = ray_env_get(head->i64);
-        if (!fn || RAY_IS_ERR(fn) || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY) ||
-            !(fn->attrs & RAY_FN_ATOMIC)) return -1;
-    }
+    if (!json && !(fn->attrs & RAY_FN_ATOMIC)) return -1;
     int r = json ? 1 : 0;
     for (int64_t i = 1; i < ray_len(e); i++) {
         /* a JSON read's path and limits: a column, a literal, or a name
@@ -5457,6 +5456,20 @@ static bool as_target_is_list(ray_t* t) {
     return sym >= 0 && sym == ray_sym_intern("LIST", 4);
 }
 
+/* Is `fn` one of the whole-column projection verbs (distinct, where,
+ * reverse, asc, desc, iasc, idesc, rank), by the builtin object: a head a
+ * parameter or a let holds is judged by what it holds (#1810). */
+typedef struct wv_scope_s wv_scope_t;
+static bool wv_head_is_form(ray_t* h, const wv_scope_t* sc, const void* native);
+static bool fn_is_whole_col_projection_verb(const ray_t* fn) {
+    if (!fn || fn->type != RAY_UNARY) return false;
+    const void* f = (const void*)(uintptr_t)fn->i64;
+    return f == (const void*)ray_distinct_fn || f == (const void*)ray_where_fn ||
+           f == (const void*)ray_reverse_fn || f == (const void*)ray_asc_fn ||
+           f == (const void*)ray_desc_fn || f == (const void*)ray_iasc_fn ||
+           f == (const void*)ray_idesc_fn || f == (const void*)ray_rank_fn;
+}
+
 static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return 0;
     if (ray_len(expr) < 2) return 0;
@@ -5466,10 +5479,17 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
         (expr_reads_group_whole(expr, tbl) || helper_reads_group_whole(expr, tbl))) return 1;
     ray_t* head = ((ray_t**)ray_data(expr))[0];
     if (!head) return 0;
-    /* ((quote as) 'T c) is the cast (as 'T c) is (#1585). */
-    int64_t as_sym = ray_sym_intern("as", 2);
-    int64_t head_sym = head->type == -RAY_SYM ? head->i64
-                     : quote_call_sym(head) == as_sym ? as_sym : -1;
+    /* ((quote as) 'T c) is the call of what `as` holds, as (as 'T c) is
+     * (#1585): a quote form judged by what its head holds, a parameter or a
+     * let holding the quote builtin included (wv_head_is_form) */
+    int64_t head_sym = -1;
+    if (head->type == -RAY_SYM) head_sym = head->i64;
+    else if (head->type == RAY_LIST && !(head->attrs & ATTR_QUOTED) && ray_len(head) == 2) {
+        ray_t** hq = (ray_t**)ray_data(head);   /* not-a-table */
+        ray_t* qs = hq[1];                      /* not-a-table */
+        if (wv_head_is_form(hq[0], NULL, (const void*)ray_quote_fn) && qs && qs->type == -RAY_SYM)
+            head_sym = qs->i64;
+    }
     if (head_sym < 0) return 0;
     ray_t* fn = ray_env_get(head_sym);
     if (fn && fn->type == RAY_LAMBDA) {
@@ -5481,12 +5501,15 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
         ray_graph_free(g);
         return whole;
     }
-    ray_t* s = ray_sym_str(head_sym);
-    if (!s) return 0;
-    size_t l = ray_str_len(s);
-    const char* p = ray_str_ptr(s);
+    /* Every rule below is the builtin the head holds, judged by the object
+     * (#1810): a name holding one of the whole-column verbs is that verb,
+     * whatever it is spelled (an alias, a parameter, a let), and a name
+     * spelled like one of the rules' builtins but holding another function
+     * is that function.  A column of the name shadows it. */
+    bool named = head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED);
+    if (named && fn_is_whole_col_projection_verb(fn) && !tbl_has_col(tbl, head_sym)) return 1;
     if (json_rowwise(expr, tbl) == 1) return 1;
-    if (l == 6 && memcmp(p, "concat", 6) == 0) {
+    if (head_is_builtin_binary(fn, ray_concat_fn)) {
         /* Preserve row-wise text concatenation when another projection
          * forces fallback, but evaluate collection concat once. Compilation
          * only inspects types/literals; it does not run user expressions. */
@@ -5508,8 +5531,7 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
         ray_graph_free(g);
         return whole;
     }
-    if (l == 2 && memcmp(p, "as", 2) == 0 && ray_len(expr) == 3 &&
-        head_is_builtin_binary(fn, ray_cast_fn)) {
+    if (ray_len(expr) == 3 && head_is_builtin_binary(fn, ray_cast_fn)) {
         /* A cast of a LIST column casts the list as a whole, as eager as
          * does (#1400): a typed vector of its cells, not one cast per cell
          * (#1406).  It keeps the column's length. */
@@ -5520,7 +5542,7 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
          * (#1582).  Per row it had nothing to box: (as 'LIST 1) is type. */
         return as_target_is_list(ae[1]) && expr_refs_row_column(ae[2], tbl);
     }
-    if (l == 6 && memcmp(p, "enlist", 6) == 0) {
+    if (fn && fn->type == RAY_VARY && (const void*)(uintptr_t)fn->i64 == (const void*)ray_enlist_fn) {
         /* Only a single scalar value can stand for a broadcast column.
          * Column arguments, vector constants and multi-argument enlist
          * remain per-row constructors. Aggregate arguments are handled by
@@ -5535,19 +5557,7 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
         }
         return value && ray_is_atom(value);
     }
-    return (l == 8 && memcmp(p, "distinct", 8) == 0) ||
-           (l == 5 && memcmp(p, "where", 5) == 0) ||
-           (l == 7 && memcmp(p, "reverse", 7) == 0) ||
-           (l == 3 && memcmp(p, "asc", 3) == 0) ||
-           (l == 4 && memcmp(p, "desc", 4) == 0) ||
-           /* grade/rank: only while the name is still the builtin, so a
-            * rebound `rank` keeps its per-row projection semantics. */
-           (l == 4 && memcmp(p, "iasc", 4) == 0 &&
-            head_is_builtin_unary(fn, ray_iasc_fn)) ||
-           (l == 5 && memcmp(p, "idesc", 5) == 0 &&
-            head_is_builtin_unary(fn, ray_idesc_fn)) ||
-           (l == 4 && memcmp(p, "rank", 4) == 0 &&
-            head_is_builtin_unary(fn, ray_rank_fn));
+    return 0;
 }
 
 /* Does `e` call a whole-column verb (is_whole_column_projection's list:
@@ -5579,12 +5589,12 @@ static bool whole_verb_is_param(ray_t* params, int64_t sym) {
  * the parameters (the latest binding of a name decides, so a parameter
  * rebound to a constant no longer is the argument). */
 enum { WV_MAX_NAMES = 32 };
-typedef struct {
+struct wv_scope_s {
     ray_t*  params;
     int64_t names[WV_MAX_NAMES];
     bool    derived[WV_MAX_NAMES];
     int     n;
-} wv_scope_t;
+};
 
 static bool wv_name_derived(const wv_scope_t* sc, int64_t sym) {
     for (int k = sc->n - 1; k >= 0; k--) if (sc->names[k] == sym) return sc->derived[k];
@@ -5598,6 +5608,26 @@ static bool wv_name_set(wv_scope_t* sc, int64_t sym, bool d) {
     if (sc->n >= WV_MAX_NAMES) return false;
     sc->names[sc->n] = sym; sc->derived[sc->n] = d; sc->n++;
     return true;
+}
+
+/* Does the head `h` hold the special form or builtin `native`: judged by
+ * the object the name holds, as the evaluator calls it ((set myfn fn) makes
+ * (myfn [x] ...) a lambda literal), not by its spelling (#1810 review).  In
+ * a helper's body (`sc`) a free name is a global and a parameter holds an
+ * argument; in the query's own expression the scope is read first.  `let`
+ * is not asked here: the compiler binds it by its spelling, and an alias of
+ * it binds nothing, so the walkers read `let` as spelled (wv_head_is_let). */
+static bool wv_head_is_form(ray_t* h, const wv_scope_t* sc, const void* native) {
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
+    if (sc && whole_verb_is_param(sc->params, h->i64)) return false;
+    ray_t* fn = sc ? ray_env_get_global(h->i64) : ray_env_get(h->i64);
+    return fn && fn->type >= RAY_UNARY && fn->type <= RAY_VARY &&
+           (const void*)(uintptr_t)fn->i64 == native;
+}
+
+/* Is the head `h` the `let` form, as the compiler reads it: spelled let. */
+static bool wv_head_is_let(ray_t* h) {
+    return h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED) && h->i64 == ray_sym_intern("let", 3);
 }
 
 /* A name a `let` or `set` binds inside `e` (a nested `do`, an `if` arm, an
@@ -5619,8 +5649,9 @@ static bool wv_drop_nested_as(ray_t* e, wv_scope_t* sc, bool skip_top, int depth
     ray_t** es = (ray_t**)ray_data(e);
     ray_t* h = es[0];
     if (h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED)) {
-        if (h->i64 == ray_sym_intern("fn", 2) || h->i64 == ray_sym_intern("quote", 5)) return true;
-        if ((h->i64 == ray_sym_intern("let", 3) || h->i64 == ray_sym_intern("set", 3)) &&
+        if (wv_head_is_form(h, sc, (const void*)ray_fn) ||
+            wv_head_is_form(h, sc, (const void*)ray_quote_fn)) return true;
+        if ((wv_head_is_let(h) || wv_head_is_form(h, sc, (const void*)ray_set_fn)) &&
             e->len == 3 && es[1]->type == -RAY_SYM && !skip_top &&
             !wv_name_set(sc, es[1]->i64, as))
             return false;
@@ -5639,8 +5670,7 @@ static bool wv_derives(ray_t* e, const wv_scope_t* sc, int depth) {
     if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1) return false;
     ray_t** es = (ray_t**)ray_data(e);
     ray_t* h = es[0];
-    if (h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED) &&
-        (h->i64 == ray_sym_intern("quote", 5) || h->i64 == ray_sym_intern("fn", 2)))
+    if (wv_head_is_form(h, sc, (const void*)ray_quote_fn) || wv_head_is_form(h, sc, (const void*)ray_fn))
         return false;
     for (int64_t i = 1; i < e->len; i++)
         if (wv_derives(es[i], sc, depth + 1)) return true;
@@ -5653,13 +5683,17 @@ static bool wv_lambda_head(ray_t* h, ray_t* tbl, bool in_body, ray_t** params,
                            ray_t* const** body, int64_t* nbody) {
     if (h && h->type == RAY_LIST && !(h->attrs & ATTR_QUOTED) && h->len >= 3) {
         ray_t** hs = (ray_t**)ray_data(h);
-        if (!hs[0] || hs[0]->type != -RAY_SYM || (hs[0]->attrs & ATTR_QUOTED) ||
-            hs[0]->i64 != ray_sym_intern("fn", 2)) return false;
+        /* a lambda literal: a head holding the fn form */
+        ray_t* ff = !hs[0] || hs[0]->type != -RAY_SYM || (hs[0]->attrs & ATTR_QUOTED) ? NULL
+                  : in_body ? ray_env_get_global(hs[0]->i64) : ray_env_get(hs[0]->i64);
+        if (!ff || ff->type != RAY_VARY || (const void*)(uintptr_t)ff->i64 != (const void*)ray_fn)
+            return false;
         *params = hs[1]; *body = hs + 2; *nbody = h->len - 2;
         return true;
     }
     if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || tbl_has_col(tbl, h->i64)) return false;
-    if (!in_body && ray_env_has_lexical_local(h->i64)) return false;
+    /* what the name holds: a parameter or a let holding a lambda is that
+     * lambda, as a global helper is (#1810 review) */
     ray_t* fn = in_body ? ray_env_get_global(h->i64) : ray_env_get(h->i64);
     if (!fn || fn->type != RAY_LAMBDA || LAMBDA_CLOSURE(fn)) return false;
     ray_t* bodies = LAMBDA_BODY(fn);
@@ -5674,17 +5708,14 @@ static bool wv_lambda_head(ray_t* h, ray_t* tbl, bool in_body, ray_t** params,
  * where a caller's local shadows instead.  A helper's free names are
  * globals. */
 static uint16_t resolve_agg_call_opcode(int64_t sym_id, int64_t nargs);
-/* Is the call `e`'s head, bound to `fn`, that aggregate builtin itself: by
- * the name the function object carries, which a program rebinding the name
- * to another function does not change? */
+/* Is the call `e`'s head, bound to `fn`, an aggregate builtin at this
+ * arity: by the name the function object itself carries (its registered
+ * name, ray_env_builtin_own_sym), not by the spelling of the head, so an
+ * alias of sum is sum and a name rebound to another function is that
+ * function (#1810 review). */
 static bool wv_head_is_own_agg(ray_t* e, ray_t* fn) {
-    ray_t* h = ((ray_t**)ray_data(e))[0];
-    if (!resolve_agg_call_opcode(h->i64, e->len - 1)) return false;
-    ray_t* hn = ray_sym_str(h->i64);
-    const char* own = ray_fn_name(fn);
-    size_t hl = hn ? ray_str_len(hn) : 0, ol = 0;
-    while (ol < 14 && own[ol]) ol++;
-    return hn && ol == hl && memcmp(own, ray_str_ptr(hn), hl) == 0;
+    int64_t own = ray_env_builtin_own_sym(fn);
+    return own >= 0 && resolve_agg_call_opcode(own, e->len - 1) != 0;
 }
 
 /* `agg`: find, instead of a whole-column verb, an aggregate applied in a
@@ -5718,8 +5749,7 @@ static bool expr_nests_whole_verb_in(ray_t* e, ray_t* tbl, int depth, const wv_s
             for (int64_t b = 0; b < nlbody; b++) {
                 ray_t* st = lbody[b];
                 bool top_let = st && st->type == RAY_LIST && !(st->attrs & ATTR_QUOTED) && st->len == 3 &&
-                               ((ray_t**)ray_data(st))[0]->type == -RAY_SYM &&
-                               ((ray_t**)ray_data(st))[0]->i64 == ray_sym_intern("let", 3);
+                               wv_head_is_let(((ray_t**)ray_data(st))[0]);
                 /* a name rebound inside the statement is not followed:
                  * not derived from here on, before the statement is read */
                 if (!wv_drop_nested(st, &inner, top_let, 0)) break;
@@ -5728,8 +5758,7 @@ static bool expr_nests_whole_verb_in(ray_t* e, ray_t* tbl, int depth, const wv_s
                  * after it: derived from the arguments when its value is */
                 if (st && st->type == RAY_LIST && !(st->attrs & ATTR_QUOTED) && st->len == 3) {
                     ray_t** ss = (ray_t**)ray_data(st);
-                    if (ss[0]->type == -RAY_SYM && ss[0]->i64 == ray_sym_intern("let", 3) &&
-                        ss[1]->type == -RAY_SYM) {
+                    if (wv_head_is_let(ss[0]) && ss[1]->type == -RAY_SYM) {
                         if (!wv_name_set(&inner, ss[1]->i64, wv_derives(ss[2], &inner, 0)))
                             break;   /* too many names to track: no further statement counts */
                     }
@@ -5742,14 +5771,17 @@ static bool expr_nests_whole_verb_in(ray_t* e, ray_t* tbl, int depth, const wv_s
     }
     if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
     if (tbl_has_col(tbl, h->i64)) return false;
-    if (sc ? whole_verb_is_param(sc->params, h->i64) : ray_env_has_lexical_local(h->i64)) return false;
+    if (sc && whole_verb_is_param(sc->params, h->i64)) return false;
+    /* what the head holds: in the query's own expression a parameter or a
+     * let of its caller is read first (ray_env_get), in a body a free name
+     * is a global (#1810) */
     ray_t* fn = sc ? ray_env_get_global(h->i64) : ray_env_get(h->i64);
     if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return false;
     if (fn->attrs & RAY_FN_SPECIAL_FORM) {
         /* a `let`'s value is evaluated wherever the `let` is */
-        if (h->i64 == ray_sym_intern("let", 3))
+        if (wv_head_is_let(h))
             return e->len == 3 && expr_nests_whole_verb_in(es[2], tbl, depth + 1, sc, agg);
-        if (h->i64 != ray_sym_intern("do", 2)) return false;
+        if ((const void*)(uintptr_t)fn->i64 != (const void*)ray_do_fn) return false;
         ray_t* last = es[e->len - 1];
         return (!sc && !agg && is_whole_column_projection(last, tbl)) ||
                expr_nests_whole_verb_in(last, tbl, depth + 1, sc, agg);
@@ -5760,19 +5792,12 @@ static bool expr_nests_whole_verb_in(ray_t* e, ray_t* tbl, int depth, const wv_s
             for (int64_t i = 1; i < e->len; i++)
                 if (wv_derives(es[i], sc, 0)) return true;
     } else if (depth > 0) {
-        static const char* const verbs[] = { "distinct", "where", "reverse", "asc", "desc", "iasc", "idesc", "rank" };
-        ray_t* nm = ray_sym_str(h->i64);
-        if (nm) {
-            size_t l = ray_str_len(nm);
-            const char* pp = ray_str_ptr(nm);
-            for (size_t k = 0; k < sizeof verbs / sizeof *verbs; k++)
-                if (l == strlen(verbs[k]) && memcmp(pp, verbs[k], l) == 0) {
-                    /* in a helper's body, only a verb over its argument */
-                    if (!sc) return true;
-                    for (int64_t i = 1; i < e->len; i++)
-                        if (wv_derives(es[i], sc, 0)) return true;
-                    break;
-                }
+        /* a name holding one of the verbs is that verb, whatever it is
+         * spelled (#1810): in a helper's body, only over its argument */
+        if (fn_is_whole_col_projection_verb(fn)) {
+            if (!sc) return true;
+            for (int64_t i = 1; i < e->len; i++)
+                if (wv_derives(es[i], sc, 0)) return true;
         }
     }
     for (int64_t i = 1; i < e->len; i++)
@@ -5841,8 +5866,7 @@ static bool helper_result_one_value(ray_t* e, ray_t* tbl, const wv_scope_t* sc, 
         for (int64_t b = 0; b + 1 < nlbody; b++) {
             ray_t* st = lbody[b];
             bool top_let = st && st->type == RAY_LIST && !(st->attrs & ATTR_QUOTED) && st->len == 3 &&
-                           ((ray_t**)ray_data(st))[0]->type == -RAY_SYM &&
-                           ((ray_t**)ray_data(st))[0]->i64 == ray_sym_intern("let", 3);
+                           wv_head_is_let(((ray_t**)ray_data(st))[0]);
             /* a name rebound where this walk cannot follow it: rows */
             if (!wv_drop_nested_rows(st, &inner, top_let, 0)) return false;
             if (top_let) {
@@ -5857,17 +5881,19 @@ static bool helper_result_one_value(ray_t* e, ray_t* tbl, const wv_scope_t* sc, 
         return helper_result_one_value(last, tbl, &inner, depth + 1);
     }
     if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || tbl_has_col(tbl, h->i64)) return false;
-    if (sc ? wv_name_derived(sc, h->i64) : ray_env_has_lexical_local(h->i64)) return false;
+    if (sc && wv_name_derived(sc, h->i64)) return false;
+    /* what the head holds: in the query's own expression a parameter or a
+     * let of its caller is read first (ray_env_get) */
     ray_t* fn = sc ? ray_env_get_global(h->i64) : ray_env_get(h->i64);
     if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return false;
     if (fn->attrs & RAY_FN_SPECIAL_FORM) {
-        if (h->i64 == ray_sym_intern("let", 3))
+        if (wv_head_is_let(h))
             return e->len == 3 && helper_result_one_value(es[2], tbl, sc, depth + 1);
-        if (h->i64 == ray_sym_intern("do", 2))
+        if ((const void*)(uintptr_t)fn->i64 == (const void*)ray_do_fn)
             return helper_result_one_value(es[e->len - 1], tbl, sc, depth + 1);
         return false;
     }
-    if (wv_head_is_own_agg(e, fn) && is_agg_expr(e)) return true;
+    if (wv_head_is_own_agg(e, fn)) return true;
     if (!(fn->attrs & RAY_FN_ATOMIC)) return false;
     for (int64_t i = 1; i < e->len; i++)
         if (!helper_result_one_value(es[i], tbl, sc, depth + 1)) return false;
