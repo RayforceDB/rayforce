@@ -37,7 +37,11 @@ value subsequent reads see.
 A source column takes precedence over a global of the same name. To use a
 global, bind it to a different local name before the query, or pass it as a
 parameter to a helper. A local parameter or `let` named like a column hides
-that column. A helper's body sees the source columns the same way, whether the
+that column. A call's head is the function its name holds, as outside a
+query: an aggregate is an aggregate under any name (an alias, a parameter, a
+`let`), and a name rebound to another function is that function. A column
+named like a builtin (`count`, `max`, `first`) does not hide the builtin a
+head names. A helper's body sees the source columns the same way, whether the
 query calls it directly or a higher-order builtin such as `map`, `fold` or
 `scan` calls it, and whether it is named or fetched at run time:
 

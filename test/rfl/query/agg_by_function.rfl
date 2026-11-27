@@ -1,0 +1,57 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; An aggregate is recognised by the RAY_FN_AGGR builtin a call's head
+;; holds, not by its spelling (#1814): an alias, a parameter or a let holding
+;; sum aggregates; a name spelled like an aggregate but holding another
+;; function is that function; a column named like an aggregate does not hide
+;; it, as before.  Each line compares with the named call, in memory,
+;; splayed and parted.
+(.sys.exec "rm -rf /tmp/rfl_agg_fn && mkdir -p /tmp/rfl_agg_fn") -- 0
+(set T (table [g c i] (list ['a 'a 'b 'b 'b 'c 'a 'c 'b 'a] [true false true false true false true true false false] [10 20 30 40 50 60 70 80 90 10])))
+(.db.splayed.set "/tmp/rfl_agg_fn/s/t/" T)
+(.db.splayed.set "/tmp/rfl_agg_fn/p/2024.01.01/t/" (at T [0 1 2 3 4]) "/tmp/rfl_agg_fn/p/.sym")
+(.db.splayed.set "/tmp/rfl_agg_fn/p/2024.01.02/t/" (at T [5 6 7 8 9]) "/tmp/rfl_agg_fn/p/.sym")
+(set S (.db.splayed.get "/tmp/rfl_agg_fn/s/t/"))
+(set P (.db.parted.get "/tmp/rfl_agg_fn/p/" 't))
+;; the issue's cases: a name spelled like an aggregate holding a whole-column verb
+((fn [sum] (select {from: T r: (sum i)})) desc) -- (select {from: T r: (desc i)})
+((fn [] (let count reverse) (select {from: T r: (count i)}))) -- (select {from: T r: (reverse i)})
+((fn [first] (select {from: S where: (> i 15) r: (first i)})) asc) -- (select {from: S where: (> i 15) r: (asc i)})
+((fn [max] (select {from: P r: (+ 0 (max i))})) reverse) -- (select {from: P r: (+ 0 (reverse i))})
+((fn [last] (update {from: T r: (last i)})) iasc) -- (update {from: T r: (iasc i)})
+;; an alias, a parameter or a let holding an aggregate aggregates
+(set total sum)
+(select {from: T r: (total i)}) -- (select {from: T r: (sum i)})
+(select {from: S where: (> i 15) r: (total i)}) -- (select {from: S where: (> i 15) r: (sum i)})
+(select {from: P by: g r: (total i)}) -- (select {from: P by: g r: (sum i)})
+((fn [n] (select {from: T r: (n i) c: c})) count) -- (select {from: T r: (count i) c: c})
+((fn [] (let f first) (select {from: P by: g r: (f i)}))) -- (select {from: P by: g r: (first i)})
+((fn [q] (select {from: S by: g r: (q i 50)})) percentile) -- (select {from: S by: g r: (percentile i 50)})
+((fn [q] (select {from: T r: (q i 0.5)})) quantile) -- (select {from: T r: (quantile i 0.5)})
+(at ((fn [m] (select {from: T r: (m i)})) med) 'r) -- [45.0]
+;; a column named like an aggregate does not hide it
+(set U (table [g price max count first] (list ['a 'a 'b] [10 20 30] [1 2 3] [7 8 9] [4 5 6])))
+(at (select {from: U r: (max price)}) 'r) -- [30]
+(at (select {from: U by: g r: (count price)}) 'r) -- [2 1]
+(at (select {from: U by: g r: (first price)}) 'r) -- [10 30]
+(at (select {from: U r: max}) 'r) -- [1 2 3]
+;; med inside an expression, and a helper whose body is (med x), whether
+;; global or a parameter: the median, where the expression was nyi
+(set hm (fn [x ignored] (med x)))
+(at (select {from: T r: (+ 0 (med i))}) 'r) -- (at (select {from: T r: (med i)}) 'r)
+(at (select {from: P r: (+ 0 (med i))}) 'r) -- (at (select {from: P r: (med i)}) 'r)
+(at (select {from: T r: (hm i 0.5)}) 'r) -- (at (select {from: T r: (med i)}) 'r)
+(at ((fn [h] (select {from: T r: (h i 0.5)})) hm) 'r) -- (at (select {from: T r: (med i)}) 'r)
+(count (at (select {from: S r: (med i) c: c}) 'r)) -- 10
+(first (at (select {from: S r: (med i) c: c}) 'r)) -- 45.0
+;; a global helper's free names are globals: the caller's local named sum
+;; does not reach into the helper's (sum x)
+(set hs (fn [x] (sum x)))
+(at ((fn [sum] (select {from: T r: (hs i)})) desc) 'r) -- (at (select {from: T r: (sum i)}) 'r)
+(at ((fn [sum] (select {from: T by: g r: (hs i)})) desc) 'r) -- (at (select {from: T by: g r: (sum i)}) 'r)
+;; window: the function a funcs: entry names, as a select's aggregates
+(set W (table [k t v] (list ['a 'a 'b 'b 'a 'b] [1 2 3 4 5 6] [5 2 9 4 4 7])))
+(at (window {from: W part: [k] funcs: {x: (total v)}}) 'x) -- (at (window {from: W part: [k] funcs: {x: (sum v)}}) 'x)
+(at ((fn [m] (window {from: W part: [k] funcs: {x: (m v)}})) max) 'x) -- (at (window {from: W part: [k] funcs: {x: (max v)}}) 'x)
+(at ((fn [f] (window {from: W part: [k] order: [t] funcs: {x: (f v)}})) first) 'x) -- (at (window {from: W part: [k] order: [t] funcs: {x: (first v)}}) 'x)
+((fn [sum] (window {from: W part: [k] funcs: {x: (sum v)}})) til) !- domain
+(.sys.exec "rm -rf /tmp/rfl_agg_fn") -- 0

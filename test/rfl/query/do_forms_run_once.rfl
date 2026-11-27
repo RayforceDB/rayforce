@@ -232,15 +232,16 @@ cnt -- 2
 (.sys.exec "rm -rf rfl_do_forms_run_once")
 
 ;; a name rebound to another function is not that builtin: an update arm's
-;; prefix through it runs, so it is not skipped (the fallback then refuses
-;; the if, as for any other prefix); the builtins are restored after
+;; prefix through it runs, so it is not skipped; count rebound to til is no
+;; aggregate either (#1814), so the arm is evaluated per row as written; the
+;; builtins are restored after
 (set Cnt0 count)
 (set Fst0 first)
 (set count til)
-(update {v: (if (> i 2) (do (count i) i) 0) from: T}) !- nyi
+(at (update {v: (if (> i 2) (do (count i) i) 0) from: T}) 'v) -- [0 0 0 3 4 5]
 (set count Cnt0)
 (set first raise)
-(update {v: (if (> i 2) (do (first i) i) 0) from: T}) !- nyi
+(update {v: (if (> i 2) (do (first i) i) 0) from: T}) !- domain
 (set first Fst0)
 (at (update {v: (if (> i 2) (do (count i) i) 0) from: T}) 'v) -- [0 0 0 3 4 5]
 (count [1 2]) -- 2

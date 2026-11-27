@@ -83,6 +83,65 @@ ALSO_BINARY = ("min", "max")
 ARITIES = ("Unary", "Binary", "Variadic / Special")
 
 
+# The names the planner and the evaluator recognise by spelling: the
+# comparisons with a head's name and the spelling tables below.  Each must be
+# a registered builtin, so that no second name for one behaviour is only
+# known to the planner (#1814, `median`), unless it is listed here with a
+# reason.  A listed name that no longer occurs fails the check too, so
+# removing one is deleting its line.
+SPELLING_FILES = tuple(sorted(str(p.relative_to(ROOT)) for p in (ROOT / "src" / "ops").glob("*.c"))) + \
+    ("src/lang/compile.c", "src/lang/eval.c")
+# Tables of strings that are no head names at all: they are left out.
+SPELLING_SKIP_TABLES = {("src/ops/agg_engine.c", "names"): "the group engine's route labels"}
+TYPE_NAMES = ("B8", "U8", "I16", "I32", "I64", "INT", "F32", "F64", "DATE", "TIME", "TIMESTAMP",
+              "TIMESPAN", "SYM", "SYMBOL", "STR", "GUID", "LIST")
+SPELLING_COMPARE = re.compile(r'memcmp\(\s*(?:\w*name\w*|nm|fname|s)\s*,\s*"([^"]+)"')
+SPELLING_PRUNE = re.compile(r'prune_head_named\([^,]+,\s*"([^"]+)"\)')
+SPELLING_TABLE = re.compile(r'static const char\s*\*\s*const\s+(\w+)\[\]\s*=\s*\{(.*?)\};', re.S)
+ALLOWED_SPELLINGS = {
+    "by": "a query clause key, not a function",
+    "from": "a query clause key, not a function",
+    "nearest": "a query clause key, not a function",
+    "self": "the evaluator's keyword for the lambda being called",
+    "ilike": "owner decision 2026-11-27: query-only case-insensitive like",
+    "cond": "pending removal, #1826",
+    "year": "pending removal, #1826 (the builtin is yyyy)",
+    "month": "pending removal, #1826 (the builtin is mm)",
+    "day": "pending removal, #1826 (the builtin is dd)",
+    "hour": "pending removal, #1826 (the builtin is hh)",
+    "second": "pending removal, #1826 (the builtin is ss)",
+    "dayofweek": "pending removal, #1826 (the builtin is dow)",
+    "dayofyear": "pending removal, #1826 (the builtin is doy)",
+}
+ALLOWED_SPELLINGS.update({t: "a type name `as` casts to, not a function" for t in TYPE_NAMES})
+
+
+def spellings():
+    """name -> the places the planner or evaluator compares a head with it."""
+    found = {}
+    for rel in SPELLING_FILES:
+        text = (ROOT / rel).read_text(errors="ignore")
+        for name in SPELLING_COMPARE.findall(text) + SPELLING_PRUNE.findall(text):
+            found.setdefault(name, set()).add(rel)
+        for table, body in SPELLING_TABLE.findall(text):
+            if (rel, table) in SPELLING_SKIP_TABLES:
+                continue
+            for name in re.findall(r'"([^"]*)"', body):
+                if name:
+                    found.setdefault(name, set()).add(f"{rel} ({table})")
+    return found
+
+
+def spelling_problems(names):
+    found = spellings()
+    problems = [f"{n}: recognised by spelling in {', '.join(sorted(found[n]))}, "
+                "but no builtin is registered under it"
+                for n in sorted(found) if n not in names and n not in ALLOWED_SPELLINGS]
+    problems += [f"{n}: listed in ALLOWED_SPELLINGS but no longer recognised: delete its line"
+                 for n in sorted(ALLOWED_SPELLINGS) if n not in found]
+    return problems
+
+
 def registered():
     """The set of (name, arity) pairs registered in src/."""
     pairs = set()
@@ -269,6 +328,12 @@ def main():
                     if t.endswith(".") and not t.endswith("..."))
     if dotted:
         print("a summary ends without a full stop: " + " ".join(dotted))
+        bad = 1
+    spelled = spelling_problems({n for n, _ in reg})
+    if spelled:
+        print("names the planner recognises by spelling (scripts/check-builtin-docs.py):")
+        for p in spelled:
+            print("  " + p)
         bad = 1
     problems = self_test(reg, summ)
     if problems:

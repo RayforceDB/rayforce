@@ -74,7 +74,7 @@ All comparison operators are **atomic** and return boolean results.
 
 ## Aggregation
 
-Aggregation functions are marked **aggr** and reduce vectors to scalar values. Used in `select` with `by:` for group-by aggregation.
+Aggregation functions are marked **aggr** and reduce vectors to scalar values. Used in `select` with `by:` for group-by aggregation. A query recognises an aggregate by the function a call's head holds, not by its spelling: after `(set total sum)`, `(total price)` aggregates as `(sum price)` does, and so does a parameter or a `let` holding `sum`; a name spelled like an aggregate but holding another function, `((fn [sum] (select {from: t r: (sum i)})) desc)`, calls that function. A column named like an aggregate (`count`, `max`, `first`) does not hide it: `(max price)` still aggregates.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
