@@ -1,0 +1,33 @@
+;; fill never builds a number out of a GUID, a symbol or a string (#1777).
+;; Once a cell's result is a number, a later cell holding a GUID, symbol or
+;; string used to be read through its integer field: the GUID's pointer, the
+;; symbol's id, the string's bytes.  Whichever cell comes first, the result
+;; of cells of different kinds is the LIST of each cell.
+(set G (as 'GUID ["00000000-0000-0000-0000-000000000000" "00000000-0000-0000-0000-000000000001"]))
+(set g (at G 1))
+(set S (as 'SYM (list "" "a")))
+(fill 3 G) -- (list 3 g)
+(fill 3 (reverse G)) -- (list g 3)
+(fill 0N G) -- (list 0N g)
+(fill 2.5 G) -- (list 2.5 g)
+(fill 0Nf G) -- (list 0Nf g)
+(fill 3 S) -- (list 3 'a)
+(fill 3 (reverse S)) -- (list 'a 3)
+(fill 3 ["" "ab"]) -- (list 3 "ab")
+(fill 3 ["ab" ""]) -- (list "ab" 3)
+(fill 'z [1 0N]) -- (list 1 'z)
+(fill 'z [0N 1]) -- (list 'z 1)
+(fill "z" [1 0N]) -- (list 1 "z")
+(fill g [1 0N]) -- (list 1 g)
+(fill 'z (as 'DATE [1 0N])) -- (list (as 'DATE 1) 'z)
+;; the lengths the report named, each cell checked
+(set same (fn [n r] (let v (take G n)) (let x (fill r v)) (and (== (type x) 'LIST) (all (map (fn [i] (identical (at x i) (fill r (at v i)))) (til n))))))
+(map (fn [n] (same n 3)) [7 8 9 33]) -- [true true true true]
+(map (fn [n] (same n 0N)) [7 8 9 33]) -- [true true true true]
+(map (fn [n] (same n 2.5)) [7 8 9 33]) -- [true true true true]
+(map (fn [n] (same n 0Nf)) [7 8 9 33]) -- [true true true true]
+;; unchanged: cells of one kind keep their typed vector
+(fill g G) -- (as 'GUID ["00000000-0000-0000-0000-000000000001" "00000000-0000-0000-0000-000000000001"])
+(fill 'z S) -- (as 'SYM (list "z" "a"))
+(fill 3 [1 0N 2]) -- [1 3 2]
+(fill 3 [0N 1 2]) -- [3 1 2]
