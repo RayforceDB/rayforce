@@ -13833,6 +13833,95 @@ static bool group_inputs_subset_invariant(ray_graph_t* g, const ray_op_ext_t* ex
     }
     return true;
 }
+
+/* The columns a group reads: its keys' and both inputs' of every aggregate
+ * (a scan its column, an expression the columns its subtree scans), deduped,
+ * into *needed_out (scratch, freed through *hdr_out).  0 when an input
+ * cannot be characterized (every column is read then), -1 out of memory. */
+static int group_needed_cols(ray_graph_t* g, const ray_op_ext_t* ext, int64_t ncols,
+                             int64_t** needed_out, ray_t** hdr_out) {
+    *needed_out = NULL; *hdr_out = NULL;
+    uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
+    /* Collect needed column sym IDs (keys + agg inputs).  A bare OP_SCAN
+     * key/agg contributes its own source column; an EXPRESSION key (e.g.
+     * `(xbar time N)`) contributes the distinct source columns its subtree
+     * scans — those MUST be carried into flat_tbl or exec_group's re-eval
+     * of the key over flat_tbl fails "by: column not found" (the former
+     * collector silently dropped expression-key sources).  A distinct
+     * source column can never exceed the table's column count, and each
+     * slot may reference several, so bound the union at
+     * n_keys+2*n_aggs+ncols (min 1; an agg has up to two inputs); the
+     * dedup keeps the live count ≤ ncols. */
+    int64_t needed_max = (int64_t)n_keys + 2 * (int64_t)n_aggs + ncols;
+    if (needed_max < 1) needed_max = 1;
+    ray_t* needed_hdr = NULL;
+    int64_t* needed = (int64_t*)scratch_alloc(&needed_hdr,
+            (size_t)needed_max * sizeof(int64_t));
+    int64_t esrc_max = ncols > 0 ? ncols : 1;
+    ray_t* c_esrc_hdr = NULL;
+    int64_t* c_esrc = (int64_t*)scratch_alloc(&c_esrc_hdr,
+            (size_t)esrc_max * sizeof(int64_t));
+    if (!needed || !c_esrc) {
+        scratch_free(needed_hdr); scratch_free(c_esrc_hdr);
+        return -1;
+    }
+    int n_needed = 0;
+    int copy_all = 0;   /* 1 = an unbounded/unknown ref forces "copy all" */
+    for (uint32_t k = 0; k < n_keys && !copy_all; k++) {
+        ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
+        if (ke && ke->base.opcode == OP_SCAN) {
+            int dup = 0;
+            for (int i = 0; i < n_needed; i++)
+                if (needed[i] == ke->sym) { dup = 1; break; }
+            if (!dup) needed[n_needed++] = ke->sym;
+        } else {
+            /* Expression key — carry its source columns.  If the walk
+             * can't characterize the subtree, copy everything (safe). */
+            int ns = group_expr_src_syms(g, ext->keys[k], c_esrc, (int)esrc_max);
+            if (ns < 0) { copy_all = 1; break; }
+            for (int s = 0; s < ns; s++) {
+                int dup = 0;
+                for (int i = 0; i < n_needed; i++)
+                    if (needed[i] == c_esrc[s]) { dup = 1; break; }
+                if (!dup) needed[n_needed++] = c_esrc[s];
+            }
+        }
+    }
+    /* Both inputs of every agg: agg_ins2 carries the second operand of a
+     * binary agg (wsum/wavg/cov/scov/pearson_corr) — a column referenced
+     * only there must be carried into flat_tbl too. */
+    for (uint32_t s2 = 0; !copy_all && s2 < 2 * n_aggs; s2++) {
+        uint32_t a = s2 >> 1;
+        uint32_t in_id = (s2 & 1)
+            ? (ext->agg_ins2 ? ext->agg_ins2[a] : RAY_OP_NONE)
+            : ext->agg_ins[a];
+        if (in_id == RAY_OP_NONE) continue;
+        ray_op_ext_t* ae = find_ext(g, in_id);
+        if (ae && ae->base.opcode == OP_SCAN) {
+            int dup = 0;
+            for (int i = 0; i < n_needed; i++)
+                if (needed[i] == ae->sym) { dup = 1; break; }
+            if (!dup) needed[n_needed++] = ae->sym;
+        } else {
+            /* Expression agg input — carry its source columns; unknown
+             * subtrees copy everything (safe). */
+            int ns = group_expr_src_syms(g, in_id, c_esrc, (int)esrc_max);
+            if (ns < 0) { copy_all = 1; break; }
+            for (int s = 0; s < ns; s++) {
+                int dup = 0;
+                for (int i = 0; i < n_needed; i++)
+                    if (needed[i] == c_esrc[s]) { dup = 1; break; }
+                if (!dup) needed[n_needed++] = c_esrc[s];
+            }
+        }
+    }
+    if (copy_all) n_needed = 0;   /* 0 ⇒ downstream copies all ncols */
+    scratch_free(c_esrc_hdr);
+    *needed_out = needed;
+    *hdr_out = needed_hdr;
+    return n_needed;
+}
+
 static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                                int64_t group_limit) {
     int64_t ncols = ray_table_ncols(parted_tbl);
@@ -14212,81 +14301,10 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
      * Used when query has AVG or expression keys/aggs.
      * Only concatenates the columns actually referenced by the GROUP BY. */
     {
-        /* Collect needed column sym IDs (keys + agg inputs).  A bare OP_SCAN
-         * key/agg contributes its own source column; an EXPRESSION key (e.g.
-         * `(xbar time N)`) contributes the distinct source columns its subtree
-         * scans — those MUST be carried into flat_tbl or exec_group's re-eval
-         * of the key over flat_tbl fails "by: column not found" (the former
-         * collector silently dropped expression-key sources).  A distinct
-         * source column can never exceed the table's column count, and each
-         * slot may reference several, so bound the union at
-         * n_keys+2*n_aggs+ncols (min 1; an agg has up to two inputs); the
-         * dedup keeps the live count ≤ ncols. */
-        int64_t needed_max = (int64_t)n_keys + 2 * (int64_t)n_aggs + ncols;
-        if (needed_max < 1) needed_max = 1;
         ray_t* needed_hdr = NULL;
-        int64_t* needed = (int64_t*)scratch_alloc(&needed_hdr,
-                (size_t)needed_max * sizeof(int64_t));
-        int64_t esrc_max = ncols > 0 ? ncols : 1;
-        ray_t* c_esrc_hdr = NULL;
-        int64_t* c_esrc = (int64_t*)scratch_alloc(&c_esrc_hdr,
-                (size_t)esrc_max * sizeof(int64_t));
-        if (!needed || !c_esrc) {
-            scratch_free(needed_hdr); scratch_free(c_esrc_hdr);
-            return ray_error("oom", NULL);
-        }
-        int n_needed = 0;
-        int copy_all = 0;   /* 1 = an unbounded/unknown ref forces "copy all" */
-        for (uint32_t k = 0; k < n_keys && !copy_all; k++) {
-            ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
-            if (ke && ke->base.opcode == OP_SCAN) {
-                int dup = 0;
-                for (int i = 0; i < n_needed; i++)
-                    if (needed[i] == ke->sym) { dup = 1; break; }
-                if (!dup) needed[n_needed++] = ke->sym;
-            } else {
-                /* Expression key — carry its source columns.  If the walk
-                 * can't characterize the subtree, copy everything (safe). */
-                int ns = group_expr_src_syms(g, ext->keys[k], c_esrc, (int)esrc_max);
-                if (ns < 0) { copy_all = 1; break; }
-                for (int s = 0; s < ns; s++) {
-                    int dup = 0;
-                    for (int i = 0; i < n_needed; i++)
-                        if (needed[i] == c_esrc[s]) { dup = 1; break; }
-                    if (!dup) needed[n_needed++] = c_esrc[s];
-                }
-            }
-        }
-        /* Both inputs of every agg: agg_ins2 carries the second operand of a
-         * binary agg (wsum/wavg/cov/scov/pearson_corr) — a column referenced
-         * only there must be carried into flat_tbl too. */
-        for (uint32_t s2 = 0; !copy_all && s2 < 2 * n_aggs; s2++) {
-            uint32_t a = s2 >> 1;
-            uint32_t in_id = (s2 & 1)
-                ? (ext->agg_ins2 ? ext->agg_ins2[a] : RAY_OP_NONE)
-                : ext->agg_ins[a];
-            if (in_id == RAY_OP_NONE) continue;
-            ray_op_ext_t* ae = find_ext(g, in_id);
-            if (ae && ae->base.opcode == OP_SCAN) {
-                int dup = 0;
-                for (int i = 0; i < n_needed; i++)
-                    if (needed[i] == ae->sym) { dup = 1; break; }
-                if (!dup) needed[n_needed++] = ae->sym;
-            } else {
-                /* Expression agg input — carry its source columns; unknown
-                 * subtrees copy everything (safe). */
-                int ns = group_expr_src_syms(g, in_id, c_esrc, (int)esrc_max);
-                if (ns < 0) { copy_all = 1; break; }
-                for (int s = 0; s < ns; s++) {
-                    int dup = 0;
-                    for (int i = 0; i < n_needed; i++)
-                        if (needed[i] == c_esrc[s]) { dup = 1; break; }
-                    if (!dup) needed[n_needed++] = c_esrc[s];
-                }
-            }
-        }
-        if (copy_all) n_needed = 0;   /* 0 ⇒ downstream copies all ncols */
-        scratch_free(c_esrc_hdr);
+        int64_t* needed = NULL;
+        int n_needed = group_needed_cols(g, ext, ncols, &needed, &needed_hdr);
+        if (n_needed < 0) return ray_error("oom", NULL);
 
         /* Under a where: (#1748), the flat table below would hold every
          * row of the columns the group reads, and the group would evaluate
@@ -14727,6 +14745,125 @@ static ray_t* group_const_inputs_check(ray_graph_t* g, ray_op_ext_t* ext, ray_t*
     return NULL;
 }
 
+/* Does every aggregate of the group give the same bits whatever order its
+ * rows are reduced in: a count, a distinct count, first and last (by row,
+ * kept in order), and sum, min and max of an integer or temporal input
+ * (integer arithmetic wraps the same either way)?  Not a float sum, avg,
+ * var or dev, whose rounding follows the order (a sum of 1e16, 1.0 and
+ * -1e16 keeps the 1.0 only when it is added last), nor a float min or max
+ * (0.0 and -0.0 compare equal: the first one met wins); nor a paired
+ * aggregate.  #1784: the gathered rows are reduced in one pass, where the
+ * parted route reduced each partition and merged the partials. */
+static bool group_aggs_order_free(ray_graph_t* g, const ray_op_ext_t* ext) {
+    for (uint32_t a = 0; a < ext->n_aggs; a++) {
+        if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) return false;
+        uint16_t op = ext->agg_ops[a];
+        if (op == OP_COUNT || op == OP_COUNT_DISTINCT || op == OP_FIRST || op == OP_LAST) continue;
+        if (op != OP_SUM && op != OP_MIN && op != OP_MAX) return false;
+        ray_op_t* in = op_node(g, ext->agg_ins[a]);
+        switch (in ? in->out_type : 0) {
+        case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+        case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
+            continue;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A group under a where: by one key, a generation-2 STR column of a parted
+ * table (#1784): the ids of the key's kept rows only, one per kept row
+ * (ray_strdom_build_kept), beside the kept rows of the other columns the
+ * group reads (sel_compact, as exec_group_parted gathers them for #1748),
+ * and the group over that table without the selection, its groups as the
+ * domain's strings.  The parted route built the ids over every row of
+ * every segment, then gathered them.  One key only: its ids are
+ * first-occurrence over the kept rows, so every route emits its groups in
+ * the order the parted route did; several keys order by route (a
+ * per-partition merge against a composite of the ids) and keep it; so do
+ * aggregates whose bits follow the order of reduction
+ * (group_aggs_order_free).  *done false (and NULL) when this does not
+ * apply -- no selection, another key, an aggregate whose answer could
+ * change, an input that reads other rows (group_inputs_subset_invariant), a column
+ * set it cannot name, a declined gather -- and the caller groups as before. */
+static ray_t* group_strdom_kept(ray_graph_t* g, ray_op_t* op, ray_op_ext_t* ext, ray_t* tbl,
+                                int64_t group_limit, bool* done) {
+    *done = false;
+    if (!g->selection || g->grp_seg_stream || ext->n_keys != 1) return NULL;
+    ray_op_ext_t* ke = find_ext(g, ext->keys[0]);
+    if (!ke || ke->base.opcode != OP_SCAN) return NULL;
+    const int64_t sym = ke->sym;
+    ray_col_meta_t km;
+    if (!ray_table_col_meta(tbl, sym, &km) || !km.enc || !RAY_IS_PARTED(km.type) ||
+        RAY_PARTED_BASETYPE(km.type) != RAY_STR || !strdom_key_ok(g, ext, sym) ||
+        !group_inputs_subset_invariant(g, ext) || !group_aggs_order_free(g, ext)) return NULL;
+    ray_t* needed_hdr = NULL;
+    int64_t* needed = NULL;
+    int n_needed = group_needed_cols(g, ext, ray_table_ncols(tbl), &needed, &needed_hdr);
+    if (n_needed < 0) return ray_error("oom", NULL);
+    if (n_needed == 0) { scratch_free(needed_hdr); return NULL; }
+    /* the other columns' kept rows: the key's are its ids */
+    int n_keep = 0;
+    for (int i = 0; i < n_needed; i++)
+        if (needed[i] != sym) needed[n_keep++] = needed[i];
+    const int64_t pass = ray_rowsel_meta(g->selection)->total_pass;
+    ray_t* kept;
+    if (n_keep > 0) {
+        kept = sel_compact(g, tbl, g->selection, needed, n_keep);
+        scratch_free(needed_hdr);
+        if (!kept || RAY_IS_ERR(kept)) return kept ? kept : ray_error("oom", NULL);
+        if (kept == tbl || ray_table_nrows(kept) != pass) { ray_release(kept); return NULL; }
+    } else {
+        scratch_free(needed_hdr);
+        kept = ray_table_new(1);
+        if (!kept || RAY_IS_ERR(kept)) return kept ? kept : ray_error("oom", NULL);
+    }
+    *done = true;
+    ray_strdom_t* dom = NULL;
+    ray_t* ids = ray_vec_new(RAY_I64, pass > 0 ? pass : 1);
+    ray_t* err = !ids || RAY_IS_ERR(ids) ? (ids ? ids : ray_error("oom", NULL)) : NULL;
+    if (!err) {
+        ids->len = pass;
+        ray_col_src_t src;
+        err = ray_table_col_src(tbl, sym, &src);
+        if (!err && !src.obj) err = ray_error("domain", "group: key column not found");
+        else if (!err) {
+            err = ray_strdom_build_kept(&src, g->selection, (int64_t*)ray_data(ids), &dom);
+            ray_col_src_release(&src);
+        }
+    }
+    /* no cardinality hint (ray_grp_card_add): the parted route grouped the
+     * gathered ids without one */
+    if (!err) {
+        kept = ray_table_add_col(kept, sym, ids);
+        if (!kept || RAY_IS_ERR(kept)) { err = kept ? kept : ray_error("oom", NULL); kept = NULL; }
+    }
+    if (ids && !RAY_IS_ERR(ids)) ray_release(ids);
+    ray_t* result = err;
+    if (!err) {
+        ray_t* sel = g->selection;
+        ray_t* saved = g->table;
+        g->selection = NULL;
+        g->table = kept;
+        result = exec_group_run(g, op, kept, group_limit);
+        g->table = saved;
+        g->selection = sel;
+        ray_graph_unbind_table(g, kept);   /* before its address can be reused */
+    }
+    if (kept) ray_release(kept);
+    if (result && !RAY_IS_ERR(result)) {
+        ray_t* ids_col = result->type == RAY_TABLE ? ray_table_col_idx(result, 0) : NULL;
+        ray_t* str_col = NULL;
+        ray_t* eerr = !ids_col ? ray_error("nyi", "group: a swapped STR key without a table result")
+                    : RAY_IS_ERR(ids_col) ? ids_col : strdom_key_emit(dom, ids_col, &str_col);
+        if (eerr) { ray_release(result); result = eerr; }
+        else { ray_table_set_col_idx(result, 0, str_col); ray_release(str_col); }
+    }
+    ray_strdom_free(dom);
+    return result;
+}
+
 /* Kept out of line: inlined into exec_group, GCC cannot see that the saved
  * group-key hint is only restored when it was saved. */
 __attribute__((noinline)) static ray_t* exec_group_core(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit) {
@@ -14766,6 +14903,11 @@ __attribute__((noinline)) static ray_t* exec_group_core(ray_graph_t* g, ray_op_t
     if (ext && (result = group_const_inputs_check(g, ext, tbl))) goto grp_done;
     if (!ext || ext->n_keys == 0) {
         result = exec_group_run(g, op, tbl, group_limit); goto grp_done;
+    }
+    {
+        bool kept_done = false;
+        result = group_strdom_kept(g, op, ext, tbl, group_limit, &kept_done);
+        if (kept_done || result) goto grp_done;
     }
 
     uint32_t nk = ext->n_keys;
