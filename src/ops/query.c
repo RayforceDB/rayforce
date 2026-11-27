@@ -1038,6 +1038,42 @@ static bool xbar_literal_bucket_ok(ray_graph_t* g, ray_op_t* b) {
     }
 }
 
+/* The aggregate builtins by the C function behind them, each with its DAG
+ * kernel (#1814).  Every builtin here carries RAY_FN_AGGR; the kernel says
+ * which kind it is: a reducer (sum, avg, …) or a selector (first, last,
+ * top, bot), which takes an element by position and keeps its type. */
+static uint16_t agg_kernel_of_fn(const ray_t* fn) {
+    if (!fn || !(fn->attrs & RAY_FN_AGGR)) return 0;
+    const void* f = (const void*)(uintptr_t)fn->i64;
+    if (fn->type == RAY_UNARY) {
+        static const struct { ray_unary_fn fn; uint16_t op; } unary[] = {
+            { ray_sum_fn, OP_SUM }, { ray_avg_fn, OP_AVG }, { ray_min_fn, OP_MIN },
+            { ray_max_fn, OP_MAX }, { ray_dev_fn, OP_STDDEV_POP }, { ray_var_fn, OP_VAR },
+            { ray_all_fn, OP_ALL }, { ray_any_fn, OP_ANY }, { ray_prod_fn, OP_PROD },
+            { ray_first_fn, OP_FIRST }, { ray_last_fn, OP_LAST }, { ray_count_fn, OP_COUNT },
+            { ray_stddev_fn, OP_STDDEV }, { ray_stddev_pop_fn, OP_STDDEV_POP },
+            { ray_var_pop_fn, OP_VAR_POP }, { ray_med_fn, OP_MEDIAN }, { ray_mode_fn, OP_MODE },
+        };
+        for (size_t i = 0; i < sizeof unary / sizeof *unary; i++)
+            if ((const void*)unary[i].fn == f) return unary[i].op;
+    } else if (fn->type == RAY_BINARY) {
+        static const struct { ray_binary_fn fn; uint16_t op; } binary[] = {
+            { ray_cov_fn, OP_COV }, { ray_scov_fn, OP_SCOV }, { ray_wsum_fn, OP_WSUM },
+            { ray_wavg_fn, OP_WAVG }, { ray_pearson_corr_fn, OP_PEARSON_CORR },
+            { ray_top_fn, OP_TOP_N }, { ray_bot_fn, OP_BOT_N },
+            { ray_quantile_fn, OP_QUANTILE }, { ray_percentile_fn, OP_QUANTILE },
+        };
+        for (size_t i = 0; i < sizeof binary / sizeof *binary; i++)
+            if ((const void*)binary[i].fn == f) return binary[i].op;
+    }
+    return 0;
+}
+
+/* A selector kernel: an element by position, not a reduction. */
+static bool agg_kernel_selects(uint16_t op) {
+    return op == OP_FIRST || op == OP_LAST || op == OP_TOP_N || op == OP_BOT_N;
+}
+
 /* Map Rayfall aggregation name to DAG opcode */
 static uint16_t resolve_agg_opcode(int64_t sym_id) {
     ray_t* s = ray_sym_str(sym_id);
@@ -1068,7 +1104,6 @@ static uint16_t resolve_agg_opcode(int64_t sym_id) {
     /* Holistic — DAG path skips accumulator slot, fills via post-radix
      * pass over row_gid+grp_cnt (see exec_group + ray_median_per_group_buf). */
     if (len == 3 && memcmp(name, "med",    3) == 0) return OP_MEDIAN;
-    if (len == 6 && memcmp(name, "median", 6) == 0) return OP_MEDIAN;
     /* Holistic, binary-shape (col + K literal).  K compiled-time literal,
      * not a DAG input — extracted from the dict expr at planner time and
      * stored in agg_k[].  See ray_topk_per_group_buf for the per-group
@@ -3603,7 +3638,7 @@ static bool query_inline_pure_builtin(int64_t id) {
         "quote", "concat", "distinct", "reverse", "asc", "desc", "iasc", "idesc", "rank",
         "til", "take", "drop", "enlist", "list", "count", "first", "last", "at", "in",
         "not-in", "except", "union", "sect", "where", "raze", "flip", "key", "value",
-        "type", "sublist", "differ", "fills", "group", "upper", "lower", "trim", "strlen",
+        "type", "differ", "fills", "group", "upper", "lower", "trim", "strlen",
         "like", "ilike", "str-find", "nil?", "filter",
     };
     enum { NPURE = sizeof pure / sizeof *pure };
@@ -3659,7 +3694,7 @@ static bool pmap_fnobj_ok(const ray_t* fn) {
         "concat", "distinct", "reverse", "asc", "desc", "iasc", "idesc", "rank",
         "til", "take", "drop", "enlist", "list", "count", "first", "last", "at", "in",
         "not-in", "except", "union", "sect", "where", "raze", "flip", "key", "value",
-        "type", "sublist", "differ", "fills", "group", "upper", "lower", "trim", "strlen",
+        "type", "differ", "fills", "group", "upper", "lower", "trim", "strlen",
         "like", "ilike", "str-find", "nil?",
     };
     const char* own = ray_fn_name(fn);
@@ -6921,7 +6956,9 @@ static int is_aggr_unary_call(ray_t* expr) {
     if (elems[0]->type != -RAY_SYM) return 0;
     ray_t* fn_obj = ray_env_get(elems[0]->i64);
     if (!fn_obj || fn_obj->type != RAY_UNARY) return 0;
-    return (fn_obj->attrs & RAY_FN_AGGR) != 0;
+    /* a reducer only: first and last select an element and keep its type
+     * (a list stays a list), which the streaming route cannot */
+    return (fn_obj->attrs & RAY_FN_AGGR) != 0 && !agg_kernel_selects(agg_kernel_of_fn(fn_obj));
 }
 
 static int is_streaming_aggr_unary_call(ray_t* expr, ray_t* tbl) {

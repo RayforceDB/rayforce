@@ -84,7 +84,7 @@ Group by `Symbol` and compute aggregates. The `by:` clause names the grouping co
 └─────────────────────────────────────┘
 ```
 
-Available aggregation functions include `sum`, `avg`, `min`, `max`, `count`, `first`, `last`, and `med` (median).
+Available aggregation functions include `sum`, `avg`, `min`, `max`, `count`, `first`, `last`, and `med` (the median).
 
 ## 4. Sorting
 

@@ -177,6 +177,7 @@ extern const test_entry_t select_merge_entries[];
 extern const test_entry_t sort_entries[];
 extern const test_entry_t splay_entries[];
 extern const test_entry_t srccheck_entries[];
+extern const test_entry_t builtin_names_entries[];
 extern const test_entry_t store_entries[];
 extern const test_entry_t idx_uses_entries[];
 extern const test_entry_t enc_entries[];
@@ -243,7 +244,7 @@ static const test_entry_t* const compiled_groups[] = {
     pool_entries,     progress_entries, shm_entries,      rdma_entries,
     public_api_entries,
     repl_entries,     rowsel_entries,   runtime_entries,  sel_entries, select_merge_entries,
-    sort_entries,     splay_entries,    srccheck_entries, store_entries,    enc_entries,
+    sort_entries,     splay_entries,    srccheck_entries, builtin_names_entries, store_entries,    enc_entries,
     encfmt_entries,   encidx_entries,   encfloat_entries, encstr_entries, enconce_entries,   enccol_entries,
     large_entries,
     colrange_entries,

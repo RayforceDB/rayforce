@@ -6878,8 +6878,8 @@ static void ray_register_builtins(void) {
      * comparator heap for SYM/STR/GUID); falls back to full sort + take
      * when it declines (K >= N, unsupported types).  Per-group usage
      * works through the eval-level scatter. */
-    register_binary("top", RAY_FN_NONE, ray_top_fn);
-    register_binary("bot", RAY_FN_NONE, ray_bot_fn);
+    register_binary("top", RAY_FN_AGGR, ray_top_fn);
+    register_binary("bot", RAY_FN_AGGR, ray_bot_fn);
     /* pearson_corr: 2-input scalar reducer.  Marked AGGR + LAZY_AWARE so
      * the planner picks it up via is_streaming_aggr_binary_call and lowers
      * a `(pearson_corr x y)` reference inside `(select ... by ...)` to an
@@ -6918,8 +6918,8 @@ static void ray_register_builtins(void) {
     register_unary("avg",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_avg_fn);
     register_unary("min",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_min_fn);
     register_unary("max",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_max_fn);
-    register_unary("first", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_first_fn);
-    register_unary("last",  RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_last_fn);
+    register_unary("first", RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_first_fn);
+    register_unary("last",  RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_last_fn);
     /* med/dev/stddev/var materialise inline (no ray_lazy_append shell) — not LAZY_AWARE */
     register_unary("med",   RAY_FN_AGGR, ray_med_fn);
     register_unary("mode",  RAY_FN_AGGR, ray_mode_fn);

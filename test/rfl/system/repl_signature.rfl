@@ -110,7 +110,6 @@ zsg_calls -- 0
 (at (.repl.signature 'min) 'aggregate) -- true
 (at (.repl.signature 'min) 'elementwise) -- [false]
 (at (.repl.signature 'zsg_m) 'aggregate) -- true
-(at (.repl.signature 'first) 'aggregate) -- false
 (at (.repl.signature 'select) 'elementwise) -- (as 'B8 [])
 ;; nothing for what is no builtin
 (at (.repl.signature 'zsg_add) 'atomic) -- false
@@ -122,3 +121,9 @@ zsg_calls -- 0
 ;; the argument is a symbol
 (.repl.signature "zsg_add") !- type
 (.repl.signature 42) !- type
+;; first, last, top and bot are aggregates, flagged as such (#1814)
+(at (.repl.signature 'first) 'aggregate) -- true
+(at (.repl.signature 'last) 'aggregate) -- true
+(at (.repl.signature 'top) 'aggregate) -- true
+(at (.repl.signature 'bot) 'aggregate) -- true
+(at (.repl.signature 'reverse) 'aggregate) -- false
