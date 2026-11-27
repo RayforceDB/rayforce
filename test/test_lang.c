@@ -35,6 +35,7 @@
 #include "store/enccol.h"
 #include "store/encfmt.h"
 #include "table/domain.h"
+#include "io/csv.h"
 #include "table/sym.h"
 #include "lang/internal.h"
 #include "lang/callprof.h"
@@ -16555,6 +16556,118 @@ static test_result_t test_eval_restricted_query_mapped(void) {
     PASS();
 }
 
+/* read's OS reasons that a script cannot set up portably (#1883): a file
+ * the process may not read (not as root, which reads anything), and a read
+ * that fails after the open (Linux: /proc/self/mem at offset 0 is EIO).
+ * The code stays io; the message names read, the path and the reason. */
+static test_result_t test_read_os_reason(void) {
+#if !defined(RAY_OS_WINDOWS)
+    if (geteuid() != 0) {
+        const char* path = ray_test_tmp("/tmp/rf_read_noperm");
+        FILE* f = fopen(path, "w");
+        TEST_ASSERT(f != NULL, "fixture");
+        fputs("x", f);
+        fclose(f);
+        TEST_ASSERT_EQ_I(chmod(path, 0), 0);
+        char src[512];
+        snprintf(src, sizeof src, "(read \"%s\")", path);
+        ray_t* r = ray_eval_str(src);
+        bool io = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "io") == 0;
+        const char* m = io ? ray_err_msg(r) : NULL;
+        /* the path by its file name: a long temp root shows it by its tail */
+        bool named = m && strncmp(m, "read \"", 6) == 0 && strstr(m, "rf_read_noperm\": ") && strstr(m, strerror(EACCES));
+        char mcopy[512];
+        snprintf(mcopy, sizeof mcopy, "%s", m ? m : "(none)");
+        if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+        /* a CSV import of the same unreadable file says so too, not the
+         * reason a later call of the import's cleanup left (review of #1884) */
+        static const char* const imports[] = {
+            "(.csv.splayed [I64] \"%s\" \"%s_out\")",
+            "(.csv.parted [I64] \"%s\" \"%s_root\" 't)",
+        };
+        bool imp_ok[2] = { false, false };
+        char imp_msg[2][512];
+        for (int k = 0; k < 2; k++) {
+            snprintf(src, sizeof src, imports[k], path, path);
+            ray_t* ri = ray_eval_str(src);
+            const char* mi = ri && RAY_IS_ERR(ri) ? ray_err_msg(ri) : NULL;
+            imp_ok[k] = ri && RAY_IS_ERR(ri) && strcmp(ray_err_code(ri), "io") == 0 &&
+                        mi && strstr(mi, strerror(EACCES)) != NULL;
+            snprintf(imp_msg[k], sizeof imp_msg[k], "%s", mi ? mi : "(none)");
+            if (ri) { if (RAY_IS_ERR(ri)) ray_error_free(ri); else ray_release(ri); }
+        }
+        (void)chmod(path, 0600);
+        (void)unlink(path);
+        TEST_ASSERT_TRUE(io);
+        TEST_ASSERT_FMT(named, "the message names read, the path and the reason: %s", mcopy);
+        TEST_ASSERT_FMT(imp_ok[0], "an unreadable .csv.splayed source names its reason: %s", imp_msg[0]);
+        TEST_ASSERT_FMT(imp_ok[1], "an unreadable .csv.parted source names its reason: %s", imp_msg[1]);
+    }
+#endif
+#if defined(__linux__)
+    ray_t* r2 = ray_eval_str("(read \"/proc/self/mem\")");
+    bool io2 = r2 && RAY_IS_ERR(r2) && strcmp(ray_err_code(r2), "io") == 0;
+    const char* m2 = io2 ? ray_err_msg(r2) : NULL;
+    bool named2 = m2 && strstr(m2, "read \"/proc/self/mem\": read failed after 0 bytes: ");
+    char copy[256];
+    snprintf(copy, sizeof copy, "%s", m2 ? m2 : "(none)");
+    if (r2) { if (RAY_IS_ERR(r2)) ray_error_free(r2); else ray_release(r2); }
+    TEST_ASSERT_TRUE(io2);
+    TEST_ASSERT_FMT(named2, "a failed read names the bytes read and the reason: %s", copy);
+    /* a write that fails for space names ENOSPC, the failing call's own */
+    ray_t* r3 = ray_eval_str("(write \"/dev/full\" \"abc\")");
+    bool io3 = r3 && RAY_IS_ERR(r3) && strcmp(ray_err_code(r3), "io") == 0;
+    const char* m3 = io3 ? ray_err_msg(r3) : NULL;
+    bool named3 = m3 && strstr(m3, "write \"/dev/full\": ") && strstr(m3, strerror(ENOSPC));
+    snprintf(copy, sizeof copy, "%s", m3 ? m3 : "(none)");
+    if (r3) { if (RAY_IS_ERR(r3)) ray_error_free(r3); else ray_release(r3); }
+    TEST_ASSERT_TRUE(io3);
+    TEST_ASSERT_FMT(named3, "a write out of space names ENOSPC: %s", copy);
+#endif
+    PASS();
+}
+
+/* A CSV import names the cause it met at the failing call, not what the
+ * source is after the failure (third review of #1884): an import of an
+ * unreadable source fails, then the source is removed, or replaced by an
+ * empty readable file, before the cause is read.  It is still EACCES at
+ * "open", for the splayed and the parted import. */
+static test_result_t test_csv_import_cause_kept(void) {
+#if !defined(RAY_OS_WINDOWS)
+    if (geteuid() == 0) PASS();   /* root reads anything */
+    const char* src = ray_test_tmp("/tmp/rf_csv_cause.csv");
+    const char* dir = ray_test_tmp("/tmp/rf_csv_cause_out");
+    int8_t types[1] = { RAY_I64 };
+    for (int form = 0; form < 2; form++) {
+        for (int after = 0; after < 2; after++) {
+            (void)ray_test_rm_rf(dir);
+            FILE* f = fopen(src, "w");
+            TEST_ASSERT(f != NULL, "fixture");
+            fputs("a\n1\n", f);
+            fclose(f);
+            TEST_ASSERT_EQ_I(chmod(src, 0), 0);
+            ray_err_t err = form == 0
+                ? ray_csv_save_splayed_mode(src, 0, true, types, 1, NULL, 0, dir, 0, RAY_COMPRESS_ABSENT)
+                : ray_csv_save_parted_mode(src, 0, true, types, 1, NULL, 0, dir, "t", 0, RAY_COMPRESS_ABSENT);
+            /* the source changes after the failure */
+            (void)chmod(src, 0600);
+            (void)unlink(src);
+            if (after == 1) { FILE* g = fopen(src, "w"); if (g) fclose(g); }
+            const char* call = NULL;
+            int e = 0;
+            bool rec = ray_csv_source_failure(&call, &e);
+            TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
+            TEST_ASSERT_FMT(rec && call && strcmp(call, "open") == 0 && e == EACCES,
+                            "form %d, source %s after the failure: the cause is %s/%s, not open/EACCES",
+                            form, after ? "emptied" : "removed", call ? call : "(none)", rec ? strerror(e) : "-");
+        }
+    }
+    (void)unlink(src);
+    (void)ray_test_rm_rf(dir);
+#endif
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/query/group_wide_null_masks", test_group_wide_null_masks, lang_setup, lang_teardown },
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
@@ -17108,5 +17221,7 @@ const test_entry_t lang_entries[] = {
 #endif
     { "lang/eval/restricted_query_forms", test_eval_restricted_query_forms, lang_setup, lang_teardown },
     { "lang/eval/restricted_query_mapped", test_eval_restricted_query_mapped, lang_setup, lang_teardown },
+    { "lang/read_os_reason", test_read_os_reason, lang_setup, lang_teardown },
+    { "lang/csv_import_cause_kept", test_csv_import_cause_kept, lang_setup, lang_teardown },
     { NULL, NULL, NULL, NULL },
 };

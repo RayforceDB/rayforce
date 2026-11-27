@@ -28,6 +28,7 @@
 #include "core/timespan.h"
 #include "core/numparse.h"    /* ray_strtod_c, ray_snprintf_c */
 #include <errno.h>
+#include "core/errpath.h"
 #include <stdint.h>
 #include "lang/eval.h"
 #include "lang/internal.h"
@@ -890,7 +891,7 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
     if (schema) {
         int64_t ncols = schema->len;
         int8_t col_types[256];
-        if (ncols > 256) return ray_error("limit", NULL);
+        if (ncols > 256) return ray_error("limit", ".csv.read: at most 256 columns, got %lld types", (long long)ncols);
         void* sym_data = ray_data(schema);
         for (int64_t i = 0; i < ncols; i++) {
             int64_t sid = ray_read_sym(sym_data, i, schema->type, schema->attrs);
@@ -909,13 +910,13 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
             ? ray_read_csv_named_opts(path, 0, false, col_types, (int32_t)ncols,
                                       col_names, (int32_t)ncols)
             : ray_read_csv_opts(path, 0, true, col_types, (int32_t)ncols);
-        if (!tbl) return ray_error("io", NULL);
+        if (!tbl) { char pbuf[RAY_ERR_PATH_MAX + 1]; return ray_error("io", ".csv.read \"%s\": read failed", ray_err_path(path, pbuf)); }
         if (RAY_IS_ERR(tbl)) return tbl;
         return tbl;
     }
 
     ray_t* tbl = ray_read_csv(path);
-    if (!tbl) return ray_error("io", NULL);
+    if (!tbl) { char pbuf[RAY_ERR_PATH_MAX + 1]; return ray_error("io", ".csv.read \"%s\": read failed", ray_err_path(path, pbuf)); }
     if (RAY_IS_ERR(tbl)) return tbl;
     return tbl;
 }
@@ -955,6 +956,34 @@ static const char* csv_default_sym_path(const char* dir, char* buf, size_t bufsz
     int n = snprintf(buf, bufsz, "%s/.sym", dir);
     if (n < 0 || (size_t)n >= bufsz) return NULL;
     return buf;
+}
+
+/* The cause of a CSV import's io failure on its source (#1883), as the
+ * import recorded it at the failing call (ray_csv_source_failure): never
+ * read from errno after the import's cleanup, nor from the source looked at
+ * again.  NULL when the source was read and the import failed past it. */
+static ray_t* csv_source_error(const char* op, const char* path) {
+    const char* call = NULL;
+    int e = 0;
+    if (!ray_csv_source_failure(&call, &e)) return NULL;
+    char pbuf[RAY_ERR_PATH_MAX + 1];
+    const char* epath = ray_err_path(path, pbuf);
+    if (strcmp(call, "empty") == 0) return ray_error("io", "%s \"%s\": the file is empty", op, epath);
+    if (strcmp(call, "directory") == 0) return ray_error("io", "%s \"%s\": is a directory", op, epath);
+    if (strcmp(call, "open") == 0) return ray_error("io", "%s \"%s\": %s", op, epath, strerror(e));
+    return ray_error("io", "%s \"%s\": cannot %s: %s", op, epath, call, strerror(e));
+}
+
+/* An import that failed past its source: what its code says, the
+ * reason first so that two long paths never push it out of the message. */
+static ray_t* csv_import_error(ray_err_t err, const char* op, const char* src, const char* dst) {
+    char sbuf[RAY_ERR_PATH_MAX + 1], dbuf[RAY_ERR_PATH_MAX + 1];
+    const char* why = err == RAY_ERR_LENGTH ? "the types do not match the file's columns"
+                    : err == RAY_ERR_TYPE   ? "a value does not parse as its column's type"
+                    : err == RAY_ERR_IO     ? "a read or a write of the import failed"
+                    : "the import failed";
+    return ray_error(ray_err_code_str(err), "%s: %s (%s): \"%s\" into \"%s\"", op, why, ray_err_code_str(err),
+                     ray_err_path_n(src, sbuf, 72), ray_err_path_n(dst, dbuf, 72));
 }
 
 ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
@@ -1000,7 +1029,7 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
     bool header = true;
 
     if (schema) {
-        if (schema->len > 256) return ray_error("limit", NULL);
+        if (schema->len > 256) return ray_error("limit", ".csv.splayed: at most 256 columns, got %lld types", (long long)schema->len);
         ncols = (int32_t)schema->len;
         void* sym_data = ray_data(schema);
         for (int64_t i = 0; i < schema->len; i++) {
@@ -1023,11 +1052,17 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
                                               types_arg, ncols,
                                               names_arg, ncols,
                                               dir, 0, mode);
-    if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
+    if (err != RAY_OK) {
+        ray_t* serr = err == RAY_ERR_IO ? csv_source_error(".csv.splayed", path) : NULL;
+        return serr ? serr : csv_import_error(err, ".csv.splayed", path, dir);
+    }
 
     char sym_path[1024];
     const char* sym = csv_default_sym_path(dir, sym_path, sizeof(sym_path));
-    if (!sym) return ray_error("io", NULL);
+    if (!sym) {
+        char dbuf[RAY_ERR_PATH_MAX + 1];
+        return ray_error("io", ".csv.splayed: the symfile path is too long under \"%s\"", ray_err_path(dir, dbuf));
+    }
 
     /* The writer builds indexes before publishing its generation. */
     return ray_read_splayed(dir, sym);
@@ -1091,7 +1126,7 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
     bool header = true;
 
     if (schema) {
-        if (schema->len > 256) return ray_error("limit", NULL);
+        if (schema->len > 256) return ray_error("limit", ".csv.parted: at most 256 columns, got %lld types", (long long)schema->len);
         ncols = (int32_t)schema->len;
         void* sym_data = ray_data(schema);
         for (int64_t i = 0; i < schema->len; i++) {
@@ -1132,7 +1167,8 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
         if (stat(dest, &st) != 0 && stat(staging, &st) == 0)
             return ray_error(ray_err_code_str(err), "csv.parted: import failed; partial output retained in %s",
                              staging);
-        return ray_error(ray_err_code_str(err), NULL);
+        ray_t* serr = err == RAY_ERR_IO ? csv_source_error(".csv.parted", path) : NULL;
+        return serr ? serr : csv_import_error(err, ".csv.parted", path, root);
     }
 
     ray_t* out = ray_read_parted(root, table_name);
@@ -1160,8 +1196,20 @@ ray_t* ray_write_csv_fn(ray_t** args, int64_t n) {
     else
         return ray_error("type", ".csv.write: path must be str, got %s", ray_type_name(path_obj->type));
     if (!path) return ray_error("domain", ".csv.write: empty path");
+    errno = 0;
     ray_err_t err = ray_write_csv(tbl, path);
-    if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
+    if (err != RAY_OK) {
+        /* the writer keeps the failing call's errno through its cleanup
+         * (csv.c); an io error names it, any other code its own reason */
+        int e = errno;
+        char pbuf[RAY_ERR_PATH_MAX + 1];
+        const char* epath = ray_err_path(path, pbuf);
+        if (err == RAY_ERR_IO && e) return ray_error("io", ".csv.write \"%s\": %s", epath, strerror(e));
+        if (err == RAY_ERR_TYPE && path[0] == '\0') return ray_error("type", ".csv.write: empty path");
+        if (err == RAY_ERR_TYPE && ray_table_ncols(tbl) <= 0)
+            return ray_error("type", ".csv.write \"%s\": the table has no columns to write", epath);
+        return ray_error(ray_err_code_str(err), ".csv.write \"%s\": the write failed (%s)", epath, ray_err_code_str(err));
+    }
     return make_i64(0);
 }
 
@@ -2752,6 +2800,10 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
     const char* path = ray_str_ptr(path_obj);
     if (!path || ray_str_len(path_obj) == 0)
         return ray_error("domain", "%s: empty path", op);
+    /* the path as messages show it: a long one by its tail, so the
+     * operation and the reason always fit (#1883) */
+    char pbuf[RAY_ERR_PATH_MAX + 1];
+    const char* epath = ray_err_path(path, pbuf);
 
     /* Reject a directory up front, as `load` does (see the S_ISDIR check in
      * ray_load_file_fn).  Platforms disagree on what fopen/fread do with
@@ -2763,11 +2815,11 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
 #if !defined(RAY_OS_WINDOWS)
     struct stat dst;
     if (stat(path, &dst) == 0 && S_ISDIR(dst.st_mode))
-        return ray_error("io", "%s \"%s\": is a directory", op, path);
+        return ray_error("io", "%s \"%s\": is a directory", op, epath);
 #endif
 
     FILE* fp = fopen(path, "rb");
-    if (!fp) return ray_error("io", NULL);
+    if (!fp) { int e = errno; return ray_error("io", "%s \"%s\": %s", op, epath, strerror(e)); }
 
     /* Read until EOF rather than to the size the file reports (#572).
      * Everything under /proc and /sys reports 0 while yielding data, so
@@ -2826,12 +2878,12 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
              * the multiply itself cannot overflow. */
             if (cap > INT64_MAX / 3) {
                 ray_release(result); fclose(fp);
-                return ray_error("io", "%s \"%s\": input too large to read", op, path);
+                return ray_error("io", "%s \"%s\": input too large to read", op, epath);
             }
             if (budget > 0 && cap * 3 > budget) {
                 ray_release(result); fclose(fp);
                 return ray_error("io", "%s \"%s\": unsized input exceeds the readable budget of %lld bytes",
-                                 op, path, (long long)budget);
+                                 op, epath, (long long)budget);
             }
             int64_t ncap = cap * 2;
             ray_t* grown = ray_vec_new(RAY_U8, ncap);
@@ -2846,12 +2898,20 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
         size_t got = fread((uint8_t*)ray_data(result) + len, 1, (size_t)(cap - len), fp);
         len += (int64_t)got;
         if (got == 0) {
-            if (ferror(fp)) { ray_release(result); fclose(fp); return ray_error("io", NULL); }
+            if (ferror(fp)) {
+                int e = errno;
+                ray_release(result); fclose(fp);
+                return ray_error("io", "%s \"%s\": read failed after %lld bytes: %s", op, epath, (long long)len, strerror(e));
+            }
             break;  /* EOF */
         }
     }
 
-    if (fclose(fp) != 0) { ray_release(result); return ray_error("io", NULL); }
+    if (fclose(fp) != 0) {
+        int e = errno;
+        ray_release(result);
+        return ray_error("io", "%s \"%s\": close failed: %s", op, epath, strerror(e));
+    }
     result->len = len;
     return result;
 }
@@ -2994,13 +3054,21 @@ static ray_t* write_file_data(ray_t* path_obj, const void* data, size_t len,
     const char* path = ray_str_ptr(path_obj);
     if (!path || ray_str_len(path_obj) == 0)
         return ray_error("domain", "%s: empty path", op);
+    char pbuf[RAY_ERR_PATH_MAX + 1];
+    const char* epath = ray_err_path(path, pbuf);   /* a long path by its tail (#1883) */
     if (len > 0 && !data) return ray_error("domain", "%s: invalid content", op);
 
     FILE* fp = fopen(path, "wb");
-    if (!fp) return ray_error("io", NULL);
+    if (!fp) { int e = errno; return ray_error("io", "%s \"%s\": %s", op, epath, strerror(e)); }
+    errno = 0;
     size_t written = len > 0 ? fwrite(data, 1, len, fp) : 0;
+    int write_errno = errno;
     int close_rc = fclose(fp);
-    if (written != len || close_rc != 0) return ray_error("io", NULL);
+    int close_errno = errno;
+    if (written != len)
+        return ray_error("io", "%s \"%s\": wrote %zu of %zu bytes: %s", op, epath, written, len,
+                         strerror(write_errno ? write_errno : close_errno ? close_errno : EIO));
+    if (close_rc != 0) return ray_error("io", "%s \"%s\": close failed: %s", op, epath, strerror(close_errno));
     return make_i64(0);
 }
 

@@ -497,7 +497,7 @@ static test_result_t rejection_messages(void) {
         { "08:00", 5, "directly after a literal" },
         { "1.", 2, "directly after a literal" },
         { "1\0" "2", 3, "NUL byte" },
-        { "0xZZ", 4, "invalid literal" },
+        { "0xZZ", 4, "hex literal needs digits" },
     };
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
         ray_t* value = ray_read_value(cases[i].text, cases[i].len, NULL);

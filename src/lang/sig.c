@@ -378,8 +378,10 @@ static const ray_sig_entry_t sigs[] = {
      "Second (0 to 59) of a time or timestamp"},
     {"parse", "(parse <source: str>)",
      "Parse a string into a Rayfall expression tree"},
+    /* docs: . A source it cannot parse raises `parse` with the reason and the byte it stopped at: `parse: unterminated list (opened at byte 0): expected ')' at byte 4`. An empty source, or one of whitespace and comments only, is `parse: no expression: …` */
     {"read", "(read <path: str>)",
      "Read file contents as string, to EOF"},
+    /* docs: . A failure raises `io` naming the operation, the path and the reason: `read "/x": No such file or directory`, `read "/d": is a directory` */
     {"read-bytes", "(read-bytes <path: str>)",
      "Read file contents as a `U8` byte vector, to EOF"},
     {"write", "(write <path: str> <content: str>)",

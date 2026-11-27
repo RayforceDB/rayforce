@@ -233,7 +233,7 @@ static ray_t* scan_number(ray_parser_t *p, ray_scalar_lit_t *out) {
         p->pos += 2;
         uint64_t v;
         size_t n = ray_parse_u64_hex(p->pos, SIZE_MAX, &v);
-        if (n == 0) return ray_error("parse", NULL);
+        if (n == 0) return ray_error("parse", "a hex literal needs digits after 0x");
         p->pos += n;
         out->byte_out_of_range = is_neg || v > UINT8_MAX;
         LIT_INT(-RAY_U8, (uint8_t)v);
@@ -406,7 +406,7 @@ plain_number:;
     if (is_float || is_f32) {
         double v = 0.0;
         if (ray_parse_f64(start, span, &v) == 0)
-            return ray_error("parse", NULL);
+            return ray_error("parse", "invalid float literal '%.*s'", (int)(span > 40 ? 40 : span), start);
         out->nonfinite = !isfinite(v) || (is_f32 && fabs(v) >= 0x1.ffffffp127);
         if (is_f32) { out->type = -RAY_F32; out->f = (double)ray_cast_f64_to_f32_null(v); }
         else        { out->type = -RAY_F64; out->f = v; }
@@ -421,7 +421,7 @@ plain_number:;
     if (n == 0) {
         double fv = 0.0;
         if (ray_parse_f64(start, span, &fv) == 0)
-            return ray_error("parse", NULL);
+            return ray_error("parse", "invalid number literal '%.*s'", (int)(span > 40 ? 40 : span), start);
         out->type = -RAY_F64; out->f = fv;
         out->widened = true;
         out->nonfinite = !isfinite(fv);
@@ -459,7 +459,7 @@ static ray_t* lit_atom(const ray_scalar_lit_t *l) {
     case -RAY_TIME:      return ray_time((int32_t)l->i);
     case -RAY_TIMESTAMP: return ray_timestamp(l->i);
     case -RAY_TIMESPAN:  return ray_timespan(l->i);
-    default:             return ray_error("parse", NULL);
+    default:             return ray_error("parse", "literal of an unsupported type");
     }
 }
 
@@ -494,7 +494,11 @@ static ray_t* parse_string(ray_parser_t *p) {
         scan++;
     }
     size_t raw_len = (size_t)(scan - start);
-    if (*scan != '"') return ray_error("parse", NULL); /* unterminated string */
+    if (*scan != '"') {
+        p->pos = scan;   /* where the input ended: the position the error names */
+        return ray_error("parse", "unterminated string (opened at byte %lld): expected a closing '\"'",
+                         (long long)(start - 1 - p->src));
+    }
     scan++;
     p->pos = scan;
 
@@ -624,7 +628,7 @@ static ray_t* parse_name(ray_parser_t *p) {
            || *p->pos == '&' || *p->pos == '|')
         p->pos++;
     size_t len = (size_t)(p->pos - start);
-    if (len == 0) return ray_error("parse", NULL);
+    if (len == 0) return ray_error("parse", "expected a name");
 
     /* Check for true/false */
     if (len == 4 && memcmp(start, "true", 4) == 0)  return ray_bool(true);
@@ -695,6 +699,7 @@ static ray_t* vec_by_suffix(ray_t** e, int32_t n, int8_t vt, int32_t nul_at, uin
 
 /* ── Vector literal: [1 2 3] ── */
 static ray_t* parse_vector(ray_parser_t *p) {
+    const char *open = p->pos;
     advance(p, 1); /* skip [ */
 
     /* Keep the temporary array on the heap: nested vectors recurse into
@@ -746,7 +751,8 @@ static ray_t* parse_vector(ray_parser_t *p) {
     if (*p->pos != ']') {
         for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
         ray_free(elems_buf);
-        return ray_error("parse", NULL);
+        return ray_error("parse", "unterminated vector (opened at byte %lld): expected ']'",
+                         (long long)(open - p->src));
     }
     advance(p, 1); /* skip ] */
 
@@ -929,6 +935,7 @@ boxed_list:
  * builtin evaluates them on demand).
  */
 static ray_t* parse_dict(ray_parser_t *p) {
+    const char *open = p->pos;
     advance(p, 1); /* skip { */
 
     /* Build keys+vals as a generic RAY_LIST of atoms first; then narrow
@@ -958,7 +965,7 @@ static ray_t* parse_dict(ray_parser_t *p) {
                 p->pos++;
             p->col += (int32_t)(p->pos - kstart);
             size_t klen = (size_t)(p->pos - kstart);
-            if (klen == 0) { ray_release(key_list); ray_release(vals); return ray_error("parse", NULL); }
+            if (klen == 0) { ray_release(key_list); ray_release(vals); return ray_error("parse", "dict: expected a key, a name or a string"); }
             int64_t kid = ray_sym_intern_runtime(kstart, klen);
             key_atom = ray_sym(kid);
             if (RAY_IS_ERR(key_atom)) { ray_release(key_list); ray_release(vals); return key_atom; }
@@ -966,7 +973,7 @@ static ray_t* parse_dict(ray_parser_t *p) {
         }
 
         skip_ws_and_comments(p);
-        if (*p->pos != ':') { ray_release(key_atom); ray_release(key_list); ray_release(vals); return ray_error("parse", NULL); }
+        if (*p->pos != ':') { ray_release(key_atom); ray_release(key_list); ray_release(vals); return ray_error("parse", "dict: expected ':' after a key"); }
         advance(p, 1);
         skip_ws_and_comments(p);
 
@@ -983,7 +990,11 @@ static ray_t* parse_dict(ray_parser_t *p) {
 
         skip_ws_and_comments(p);
     }
-    if (*p->pos != '}') { ray_release(key_list); ray_release(vals); return ray_error("parse", NULL); }
+    if (*p->pos != '}') {
+        ray_release(key_list); ray_release(vals);
+        return ray_error("parse", "unterminated dict (opened at byte %lld): expected '}'",
+                         (long long)(open - p->src));
+    }
     advance(p, 1); /* skip } */
 
     /* Narrow keys to a typed vector when homogeneous. */
@@ -1061,6 +1072,7 @@ static ray_t* parse_times_binding(ray_parser_t *p) {
 }
 
 static ray_t* parse_list(ray_parser_t *p) {
+    const char *open = p->pos;
     advance(p, 1); /* skip ( */
     ray_t* list = ray_list_new(4);
     if (RAY_IS_ERR(list)) return list;
@@ -1087,7 +1099,11 @@ static ray_t* parse_list(ray_parser_t *p) {
         list = grown;
         skip_ws_and_comments(p);
     }
-    if (*p->pos != ')') { ray_release(list); return ray_error("parse", NULL); }
+    if (*p->pos != ')') {
+        ray_release(list);
+        return ray_error("parse", "unterminated list (opened at byte %lld): expected ')'",
+                         (long long)(open - p->src));
+    }
     advance(p, 1); /* skip ) */
     return list;
 }
@@ -1143,7 +1159,7 @@ static ray_t* parse_expr_inner(ray_parser_t *p) {
     bool leaf = true;   /* symbol / keyword / name / number: must end at a delimiter */
 
     switch (PA(*p->pos)) {
-        case PA_END:    return ray_error("parse", NULL);
+        case PA_END:    return ray_error("parse", "expected an expression, got the end of the input");
         case PA_DIGIT:  result = parse_number(p); break;
         case PA_MINUS:
             if (p->pos[1] >= '0' && p->pos[1] <= '9')
@@ -1157,9 +1173,9 @@ static ray_t* parse_expr_inner(ray_parser_t *p) {
         case PA_LPAREN: result = parse_list(p);   leaf = false; break;
         case PA_LBRACK: result = parse_vector(p); leaf = false; break;
         case PA_LBRACE: result = parse_dict(p);   leaf = false; break;
-        case PA_RPAREN: return ray_error("parse", NULL);
-        case PA_RBRACK: return ray_error("parse", NULL);
-        case PA_RBRACE: return ray_error("parse", NULL);
+        case PA_RPAREN: return ray_error("parse", "unexpected ')' with no list open");
+        case PA_RBRACK: return ray_error("parse", "unexpected ']' with no vector open");
+        case PA_RBRACE: return ray_error("parse", "unexpected '}' with no dict open");
         case PA_COLON: {
             /* Keyword literal :name — parse as symbol (like 'name) */
             p->pos++;  /* skip : */
@@ -1209,6 +1225,13 @@ static ray_t* parse_expr_inner(ray_parser_t *p) {
 
 /* ── Internal parse driver (shared by public APIs) ── */
 static ray_t* parse_source(ray_parser_t *p) {
+    /* A source with no expression at all.  The REPL skips a blank line and
+     * load answers 0 for an empty file before calling the parser, so what
+     * reaches it here is (parse "") or a source of whitespace and comments
+     * only: a parse error, which says so (#1883). */
+    skip_ws_and_comments(p);
+    if (*p->pos == '\0')
+        return ray_error("parse", "no expression: the source is empty or only whitespace and comments");
     ray_t* first = parse_expr(p);
     if (RAY_IS_ERR(first)) return first;
 
@@ -1306,8 +1329,26 @@ static void parse_error_frame(ray_parser_t *p, const char* source, ray_t* nfo) {
     if (own) ray_release(own);
 }
 
+/* Every parse error says what went wrong and where: `parse: <reason> at
+ * byte N`, N the byte offset the parser stopped at, the convention
+ * read-value uses (#1883).  The reason is the failing site's; an error of
+ * another code (oom, limit, domain) is left as it is.  The thread's usage
+ * hint is kept. */
+static ray_t* parse_error_located(ray_t* err, const ray_parser_t* p) {
+    const char* code = ray_err_code(err);
+    if (!code || strcmp(code, "parse") != 0) return err;
+    const char* msg = ray_err_msg(err);
+    const char* saved_usage = ray_error_usage();
+    ray_t* located = ray_error("parse", "parse: %s at byte %lld",
+                               msg && *msg ? msg : "invalid source", (long long)(p->pos - p->src));
+    ray_error_usage_set(saved_usage);
+    if (!located || !RAY_IS_ERR(located) || located == RAY_OOM_OBJ) return err;
+    ray_error_free(err);
+    return located;
+}
+
 ray_t* ray_parse_with_nfo(const char* source, ray_t* nfo) {
-    if (!source) return ray_error("parse", NULL);
+    if (!source) return ray_error("parse", "parse: no source at byte 0");
     ray_parser_t p = {
         .src  = source,
         .pos  = source,
@@ -1316,6 +1357,9 @@ ray_t* ray_parse_with_nfo(const char* source, ray_t* nfo) {
         .nfo  = nfo
     };
     ray_t* r = parse_source(&p);
-    if (RAY_IS_ERR(r)) parse_error_frame(&p, source, nfo);
+    if (RAY_IS_ERR(r)) {
+        r = parse_error_located(r, &p);
+        parse_error_frame(&p, source, nfo);
+    }
     return r;
 }

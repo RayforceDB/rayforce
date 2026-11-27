@@ -4898,7 +4898,11 @@ static test_result_t test_ipc_error_message_roundtrip(void) {
     r = ray_ipc_send_timeout(h, call, 2000);
     ray_release(call);
     bool unrelated_io = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "io") == 0;
-    bool no_inherited_message = unrelated_io && ray_error_msg() == NULL;
+    /* its own message (#1883): the operation, the path and the OS reason,
+     * never text left from the remote error before it */
+    const char* own = unrelated_io ? ray_err_msg(r) : NULL;
+    bool no_inherited_message = own && strstr(own, "read-bytes") && strstr(own, missing) &&
+                                !(ray_error_msg() && strstr(ray_error_msg(), "custom failure"));
     if (unrelated_io) ray_error_free(r);
     else if (r) ray_release(r);
     ray_ipc_close(h);

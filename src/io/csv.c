@@ -62,6 +62,8 @@
 #include <stdarg.h>
 
 #include <string.h>
+#include <errno.h>
+#include "core/errpath.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -3048,20 +3050,36 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
     if (ray_interrupted()) return ray_error("cancel", "interrupted");
 
     /* ---- 1. Open file and get size ---- */
+    /* each failure names the file and the reason, the reason saved from
+     * the failing call; a long path is shown by its tail (#1883) */
+    char pbuf[RAY_ERR_PATH_MAX + 1];
+    const char* epath = ray_err_path(path, pbuf);
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return ray_error("io", NULL);
+    if (fd < 0) { int e = errno; return ray_error("io", ".csv.read \"%s\": %s", epath, strerror(e)); }
 
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    if (fstat(fd, &st) != 0) {
+        int e = errno;
         close(fd);
-        return ray_error("io", NULL);
+        return ray_error("io", ".csv.read \"%s\": cannot stat: %s", epath, strerror(e));
+    }
+#ifdef S_ISDIR
+    if (S_ISDIR(st.st_mode)) {
+        close(fd);
+        return ray_error("io", ".csv.read \"%s\": is a directory", epath);
+    }
+#endif
+    if (st.st_size <= 0) {
+        close(fd);
+        return ray_error("io", ".csv.read \"%s\": the file is empty", epath);
     }
     size_t file_size = (size_t)st.st_size;
 
     /* ---- 2. mmap the file ---- */
     char* buf = (char*)ray_vm_map_fd_ro(fd, file_size);
+    int map_errno = errno;
     close(fd);
-    if (!buf) return ray_error("io", NULL);
+    if (!buf) return ray_error("io", ".csv.read \"%s\": cannot map %zu bytes: %s", epath, file_size, strerror(map_errno));
 
 #ifdef __APPLE__
     madvise(buf, file_size, MADV_SEQUENTIAL);
@@ -3582,6 +3600,25 @@ static void csv_splayed_append_task(void* raw, uint32_t wid, int64_t start, int6
     }
 }
 
+/* The failing call on a CSV import's source (#1883): which call and its
+ * errno, saved at that call, so that the builtin names this cause however
+ * the import's cleanup changed errno afterwards, and never by looking at
+ * the source again.  Cleared when an import starts; one per thread, as an
+ * import runs on the calling thread. */
+static _Thread_local struct { const char* call; int errnum; } g_csv_src_fail;
+
+static void csv_source_fail(const char* call, int errnum) {
+    g_csv_src_fail.call = call;
+    g_csv_src_fail.errnum = errnum;
+}
+
+bool ray_csv_source_failure(const char** call, int* errnum) {
+    if (!g_csv_src_fail.call) return false;
+    *call = g_csv_src_fail.call;
+    *errnum = g_csv_src_fail.errnum;
+    return true;
+}
+
 static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool header,
                                           const int8_t* col_types_in, int32_t n_types,
                                           const int64_t* col_names_in, int32_t n_names,
@@ -3600,18 +3637,33 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
 #define TR_MS(ns) ((double)(ns) / 1e6)
 
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return RAY_ERR_IO;
+    if (fd < 0) { csv_source_fail("open", errno); return RAY_ERR_IO; }
 
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    if (fstat(fd, &st) != 0) {
+        int e = errno;
         close(fd);
+        csv_source_fail("stat", e);
+        return RAY_ERR_IO;
+    }
+#ifdef S_ISDIR
+    if (S_ISDIR(st.st_mode)) {
+        close(fd);
+        csv_source_fail("directory", 0);
+        return RAY_ERR_IO;
+    }
+#endif
+    if (st.st_size <= 0) {
+        close(fd);
+        csv_source_fail("empty", 0);
         return RAY_ERR_IO;
     }
     size_t file_size = (size_t)st.st_size;
 
     char* buf = (char*)ray_vm_map_fd_ro(fd, file_size);
+    int map_errno = errno;
     close(fd);
-    if (!buf) return RAY_ERR_IO;
+    if (!buf) { csv_source_fail("map", map_errno); return RAY_ERR_IO; }
 
 #ifdef __APPLE__
     madvise(buf, file_size, MADV_SEQUENTIAL);
@@ -3989,6 +4041,7 @@ ray_err_t ray_csv_save_splayed_mode(const char* path, char delimiter, bool heade
                                     const int8_t* col_types_in, int32_t n_types,
                                     const int64_t* col_names_in, int32_t n_names,
                                     const char* dir, int64_t rows_per_chunk, ray_compress_t mode) {
+    g_csv_src_fail.call = NULL;   /* this import's own failure only */
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !dir) return RAY_ERR_DOMAIN;
     char sym_path[1024];
@@ -4015,18 +4068,33 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
     bool trace = ray_env_flag("RAY_CSV_TRACE");
 
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return RAY_ERR_IO;
+    if (fd < 0) { csv_source_fail("open", errno); return RAY_ERR_IO; }
 
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    if (fstat(fd, &st) != 0) {
+        int e = errno;
         close(fd);
+        csv_source_fail("stat", e);
+        return RAY_ERR_IO;
+    }
+#ifdef S_ISDIR
+    if (S_ISDIR(st.st_mode)) {
+        close(fd);
+        csv_source_fail("directory", 0);
+        return RAY_ERR_IO;
+    }
+#endif
+    if (st.st_size <= 0) {
+        close(fd);
+        csv_source_fail("empty", 0);
         return RAY_ERR_IO;
     }
     size_t file_size = (size_t)st.st_size;
 
     char* buf = (char*)ray_vm_map_fd_ro(fd, file_size);
+    int map_errno = errno;
     close(fd);
-    if (!buf) return RAY_ERR_IO;
+    if (!buf) { csv_source_fail("map", map_errno); return RAY_ERR_IO; }
 
 #ifdef __APPLE__
     madvise(buf, file_size, MADV_SEQUENTIAL);
@@ -4293,6 +4361,7 @@ ray_err_t ray_csv_save_parted_mode(const char* path, char delimiter, bool header
                                    const int64_t* col_names, int32_t n_names,
                                    const char* root, const char* table_name,
                                    int64_t rows_per_part, ray_compress_t mode) {
+    g_csv_src_fail.call = NULL;   /* this import's own failure only */
     if (!path || !root || !*root || !table_name || !*table_name ||
         table_name[0] == '.' || strchr(table_name,'/') || strchr(table_name,'\\'))
         return RAY_ERR_DOMAIN;
@@ -4308,7 +4377,7 @@ ray_err_t ray_csv_save_parted_mode(const char* path, char delimiter, bool header
      * failed staging is retained and blocks the root, which a mistyped
      * source path must not do. */
     FILE* in = fopen(path,"rb");
-    if (!in) return RAY_ERR_IO;
+    if (!in) { csv_source_fail("open", errno); return RAY_ERR_IO; }
     fclose(in);
     /* Keep mkdir-p's parent creation, but claim the staging root exclusively.
      * A failed import remains available for diagnosis and is never reused. */
@@ -4375,17 +4444,24 @@ ray_t* ray_read_csv(const char* path) {
 
 typedef struct csv_writer_t {
     FILE*     fp;
-    int       err;  /* 0 = OK, non-zero = sticky error */
+    int       err;     /* 0 = OK, non-zero = sticky error */
+    int       errnum;  /* errno of the first failing call, 0 for none (#1883) */
 } csv_writer_t;
+
+/* The writer failed: keep the errno of the first failing call. */
+static inline void cw_fail(csv_writer_t* w, int e) {
+    if (!w->err) w->errnum = e;
+    w->err = 1;
+}
 
 static inline void cw_putc(csv_writer_t* w, int c) {
     if (w->err) return;
-    if (fputc(c, w->fp) == EOF) w->err = 1;
+    if (fputc(c, w->fp) == EOF) cw_fail(w, errno);
 }
 
 static inline void cw_write(csv_writer_t* w, const char* s, size_t len) {
     if (w->err || len == 0) return;
-    if (fwrite(s, 1, len, w->fp) != len) w->err = 1;
+    if (fwrite(s, 1, len, w->fp) != len) cw_fail(w, errno);
 }
 
 static inline void cw_puts(csv_writer_t* w, const char* s) {
@@ -4401,8 +4477,8 @@ static void cw_printf(csv_writer_t* w, const char* fmt, ...) {
     va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (n < 0) { w->err = 1; return; }
-    if ((size_t)n >= sizeof(buf)) { w->err = 1; return; }
+    if (n < 0) { cw_fail(w, 0); return; }
+    if ((size_t)n >= sizeof(buf)) { cw_fail(w, 0); return; }
     cw_write(w, buf, (size_t)n);
 }
 
@@ -4497,7 +4573,7 @@ static void csv_write_f64(csv_writer_t* w, double v) {
     if (w->err) return;
     char buf[64];
     int n = ray_snprintf_c(buf, sizeof(buf), "%.17g", v);
-    if (n < 0 || (size_t)n >= sizeof(buf)) { w->err = 1; return; }
+    if (n < 0 || (size_t)n >= sizeof(buf)) { cw_fail(w, 0); return; }
     cw_write(w, buf, (size_t)n);
 }
 
@@ -4634,6 +4710,14 @@ static void csv_write_cell(csv_writer_t* w, const csv_col_info_t* ci, int64_t r)
     }
 }
 
+/* Remove the temporary file of a failed write and leave errno as `e`, the
+ * failing call's errno saved straight after it (0 for no OS reason), so the
+ * caller names that reason whatever the cleanup calls did (#1883). */
+static void csv_remove_with_errno(const char* tmp_path, int e) {
+    remove(tmp_path);
+    errno = e;
+}
+
 ray_err_t ray_write_csv(ray_t* table, const char* path) {
     if (!table || !path || path[0] == '\0') return RAY_ERR_TYPE;
 
@@ -4645,20 +4729,22 @@ ray_err_t ray_write_csv(ray_t* table, const char* path) {
      * ray_col_save so an interrupted write never replaces the
      * destination with a partial file. */
     char tmp_path[1024];
-    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) >= (int)sizeof(tmp_path))
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) >= (int)sizeof(tmp_path)) {
+        errno = ENAMETOOLONG;
         return RAY_ERR_IO;
+    }
 
     FILE* fp = fopen(tmp_path, "wb");
     if (!fp) return RAY_ERR_IO;
 
-    csv_writer_t w = { .fp = fp, .err = 0 };
+    csv_writer_t w = { .fp = fp, .err = 0, .errnum = 0 };
 
     /* Resolve every column once (slice parent, nullability, type) so
      * the hot loop just indexes into pre-computed pointers. */
     ray_t* col_info_block = ray_alloc((size_t)ncols * sizeof(csv_col_info_t));
     if (!col_info_block || RAY_IS_ERR(col_info_block)) {
         fclose(fp);
-        remove(tmp_path);
+        csv_remove_with_errno(tmp_path, 0);
         return RAY_ERR_OOM;
     }
     csv_col_info_t* ci = (csv_col_info_t*)ray_data(col_info_block);
@@ -4669,7 +4755,7 @@ ray_err_t ray_write_csv(ray_t* table, const char* path) {
             ray_error_free(col);
             ray_free(col_info_block);
             fclose(fp);
-            remove(tmp_path);
+            csv_remove_with_errno(tmp_path, 0);
             return ce;
         }
         csv_col_info_init(&ci[c], col);
@@ -4697,24 +4783,24 @@ ray_err_t ray_write_csv(ray_t* table, const char* path) {
     ray_free(col_info_block);
 
     /* Flush user-space buffer before fsync/rename. */
-    if (fflush(fp) != 0) w.err = 1;
-    int close_err = (fclose(fp) != 0);
-    if (close_err) w.err = 1;
+    if (fflush(fp) != 0) cw_fail(&w, errno);
+    if (fclose(fp) != 0) cw_fail(&w, errno);
 
     if (w.err) {
-        remove(tmp_path);
+        csv_remove_with_errno(tmp_path, w.errnum);
         return RAY_ERR_IO;
     }
 
     /* fsync the temp file so the rename is backed by durable bytes. */
     ray_fd_t fd = ray_file_open(tmp_path, RAY_OPEN_READ | RAY_OPEN_WRITE);
-    if (fd == RAY_FD_INVALID) { remove(tmp_path); return RAY_ERR_IO; }
+    if (fd == RAY_FD_INVALID) { csv_remove_with_errno(tmp_path, errno); return RAY_ERR_IO; }
     ray_err_t sync_err = ray_file_sync(fd);
+    int sync_errno = errno;   /* before the close changes it */
     ray_file_close(fd);
-    if (sync_err != RAY_OK) { remove(tmp_path); return sync_err; }
+    if (sync_err != RAY_OK) { csv_remove_with_errno(tmp_path, sync_errno); return sync_err; }
 
     ray_err_t rn_err = ray_file_rename(tmp_path, path);
-    if (rn_err != RAY_OK) { remove(tmp_path); return rn_err; }
+    if (rn_err != RAY_OK) { csv_remove_with_errno(tmp_path, errno); return rn_err; }
 
     return RAY_OK;
 }

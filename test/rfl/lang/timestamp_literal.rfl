@@ -15,7 +15,7 @@
 (parse "2024.01.01D99:00:00.0") !- parse
 
 ;; ── but the message now names the field (was an empty "error: parse") ──
-(try (eval (parse "2024.01.01D1234")) (fn [e] (get e 'msg))) -- "timestamp literal: expected ':' after the hour"
-(try (eval (parse "2024.01.01D12:34:")) (fn [e] (get e 'msg))) -- "timestamp literal: expected two digits for the second"
-(try (eval (parse "2024.01.01D12:30:45")) (fn [e] (get e 'msg))) -- "timestamp literal: expected '.' and fractional seconds after the second"
-(try (eval (parse "2024.01.01D99:00:00.0")) (fn [e] (get e 'msg))) -- "invalid time 99:00:00"
+(try (eval (parse "2024.01.01D1234")) (fn [e] (get e 'msg))) -- "parse: timestamp literal: expected ':' after the hour at byte 13"
+(try (eval (parse "2024.01.01D12:34:")) (fn [e] (get e 'msg))) -- "parse: timestamp literal: expected two digits for the second at byte 17"
+(try (eval (parse "2024.01.01D12:30:45")) (fn [e] (get e 'msg))) -- "parse: timestamp literal: expected '.' and fractional seconds after the second at byte 19"
+(try (eval (parse "2024.01.01D99:00:00.0")) (fn [e] (get e 'msg))) -- "parse: invalid time 99:00:00 at byte 20"

@@ -568,7 +568,7 @@ not collide between two processes writing into the same table, use `guid`.
 | `.csv.write` | variadic | Write table to CSV file | `(.csv.write trades "out.csv")` |
 | [`.parquet.read`](../namespaces/parquet.md#parquet-read) | variadic | Read a Parquet file into a table; optional projection or options before the path | `(.parquet.read [id price] "trades.parquet")` |
 | [`.parquet.scan`](../namespaces/parquet.md#parquet-scan) | variadic | Reusable lazy `select` source over a Parquet file; optional options before the path | `(.parquet.scan "trades.parquet")` |
-| `read` | unary | Read file contents as string, to EOF | `(read "file.txt")` |
+| `read` | unary | Read file contents as string, to EOF. A failure raises `io` naming the operation, the path and the reason: `read "/x": No such file or directory`, `read "/d": is a directory` | `(read "file.txt")` |
 | `read-bytes` | unary | Read file contents as a `U8` byte vector, to EOF | `(read-bytes "file.bin")` |
 | `write` | binary | Write a string to a file | `(write "file.txt" "content")` |
 | `write-bytes` | binary | Write a `U8` byte vector to a file | `(write-bytes "file.bin" bytes)` |
@@ -616,7 +616,7 @@ spills exactly as it did before.
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `eval` | unary | Evaluate a parsed Rayfall expression | `(eval (parse "(+ 1 2)"))` → `3` |
-| `parse` | unary | Parse a string into a Rayfall expression tree | `(parse "(+ 1 2)")` |
+| `parse` | unary | Parse a string into a Rayfall expression tree. A source it cannot parse raises `parse` with the reason and the byte it stopped at: `parse: unterminated list (opened at byte 0): expected ')' at byte 4`. An empty source, or one of whitespace and comments only, is `parse: no expression: …` | `(parse "(+ 1 2)")` |
 | `.sys.gc` | variadic (0–1) | Trigger GC / heap flush, returns `0`; mode `1` also releases free pages now, best effort | `(.sys.gc)`, `(.sys.gc 1)` |
 | `.sys.exec` | unary | Execute a shell command; exit code, or `{code, out}` with `'out` | `(.sys.exec "ls -la")` |
 | `.sys.trust` | unary, restricted | Mark lambdas a restricted (`-U`) caller may run with the restriction lifted, isolated from the caller; returns its argument. See [`.sys.trust`](../namespaces/sys.md#sys-trust) | `(.sys.trust 'peer_count)` |
