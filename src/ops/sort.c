@@ -3611,7 +3611,10 @@ ray_t* ray_topk_table_multi(ray_t* tbl, ray_t** key_cols, uint8_t* descs,
 ray_t* topk_take_vec(ray_t* v, int64_t k, uint8_t desc) {
     if (!v) return ray_error("type", "top/bot: expected a vector, got null");
     if (ray_is_lazy(v)) v = ray_lazy_materialize(v);
-    if (!ray_is_vec(v)) return ray_error("type", "top/bot expects a vector");
+    if (!ray_is_vec(v)) {
+        if (ray_is_empty_list(v)) { ray_retain(v); return v; }   /* (list) in, (list) out (#1790) */
+        return ray_error("type", "top/bot expects a vector");
+    }
     int64_t len = ray_len(v);
     if (k <= 0) return ray_vec_new(v->type, 0);
 
@@ -4350,7 +4353,10 @@ ray_t* ray_asc_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_ASC);
 
     if (ray_is_atom(x)) { ray_retain(x); return x; }
-    if (!ray_is_vec(x)) return ray_error("type", "asc expects a vector");
+    if (!ray_is_vec(x)) {
+        if (ray_is_empty_list(x)) { ray_retain(x); return x; }   /* (list) in, (list) out (#1790) */
+        return ray_error("type", "asc expects a vector");
+    }
     int64_t n = ray_len(x);
     if (n <= 1) { ray_retain(x); return x; }
 
@@ -4377,7 +4383,10 @@ ray_t* ray_desc_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_DESC);
 
     if (ray_is_atom(x)) { ray_retain(x); return x; }
-    if (!ray_is_vec(x)) return ray_error("type", "desc expects a vector");
+    if (!ray_is_vec(x)) {
+        if (ray_is_empty_list(x)) { ray_retain(x); return x; }   /* (list) in, (list) out (#1790) */
+        return ray_error("type", "desc expects a vector");
+    }
     int64_t n = ray_len(x);
     if (n <= 1) { ray_retain(x); return x; }
 
@@ -4392,7 +4401,11 @@ ray_t* ray_desc_fn(ray_t* x) {
 /* (iasc v) — ascending sort indices */
 ray_t* ray_iasc_fn(ray_t* x) {
     if (!x || RAY_IS_ERR(x)) return x;
-    if (!ray_is_vec(x)) return ray_error("type", "iasc expects a vector");
+    if (!ray_is_vec(x)) {
+        ray_t* el_ = ray_empty_list_as(x, RAY_I64);   /* (list): as the empty I64 vector (#1790) */
+        if (el_) { ray_t* r_ = ray_iasc_fn(el_); ray_release(el_); return r_; }
+        return ray_error("type", "iasc expects a vector");
+    }
 
     int64_t n = ray_len(x);
     uint8_t desc = 0;
@@ -4402,7 +4415,11 @@ ray_t* ray_iasc_fn(ray_t* x) {
 /* (idesc v) — descending sort indices */
 ray_t* ray_idesc_fn(ray_t* x) {
     if (!x || RAY_IS_ERR(x)) return x;
-    if (!ray_is_vec(x)) return ray_error("type", "idesc expects a vector");
+    if (!ray_is_vec(x)) {
+        ray_t* el_ = ray_empty_list_as(x, RAY_I64);   /* (list): as the empty I64 vector (#1790) */
+        if (el_) { ray_t* r_ = ray_idesc_fn(el_); ray_release(el_); return r_; }
+        return ray_error("type", "idesc expects a vector");
+    }
 
     int64_t n = ray_len(x);
     uint8_t desc = 1;
@@ -4412,7 +4429,11 @@ ray_t* ray_idesc_fn(ray_t* x) {
 /* (rank v) — rank positions (inverse permutation of iasc) */
 ray_t* ray_rank_fn(ray_t* x) {
     if (!x || RAY_IS_ERR(x)) return x;
-    if (!ray_is_vec(x)) return ray_error("type", "rank expects a vector");
+    if (!ray_is_vec(x)) {
+        ray_t* el_ = ray_empty_list_as(x, RAY_I64);   /* (list): as the empty I64 vector (#1790) */
+        if (el_) { ray_t* r_ = ray_rank_fn(el_); ray_release(el_); return r_; }
+        return ray_error("type", "rank expects a vector");
+    }
 
     int64_t n = ray_len(x);
     uint8_t desc = 0;
@@ -5134,9 +5155,12 @@ ray_t* ray_xrank_fn(ray_t* n_obj, ray_t* vec) {
          n_obj->type != -RAY_I16 && n_obj->type != -RAY_U8))
         return ray_error("type", "xrank: first arg must be an integer atom, got %s",
                          n_obj ? ray_type_name(n_obj->type) : "null");
-    if (!ray_is_vec(vec))
+    if (!ray_is_vec(vec)) {
+        ray_t* el_ = ray_empty_list_as(vec, RAY_I64);   /* (list): as the empty I64 vector (#1790) */
+        if (el_) { ray_t* r_ = ray_xrank_fn(n_obj, el_); ray_release(el_); return r_; }
         return ray_error("type", "xrank: second arg must be a vector, got %s",
                          vec ? ray_type_name(vec->type) : "null");
+    }
 
     int64_t n_groups = as_i64(n_obj);
     int64_t len = ray_len(vec);

@@ -370,8 +370,11 @@ ray_t* ray_temporal_extract(ray_t* input, int field) {
 
     /* Vector input. */
     int8_t t = input->type;
-    if (t != RAY_DATE && t != RAY_TIME && t != RAY_TIMESTAMP)
+    if (t != RAY_DATE && t != RAY_TIME && t != RAY_TIMESTAMP) {
+        ray_t* el_ = ray_empty_list_as(input, RAY_DATE);   /* (list): as the empty DATE vector (#1790) */
+        if (el_) { ray_t* r_ = ray_temporal_extract(el_, field); ray_release(el_); return r_; }
         return ray_error("type", "extract: expected date/time/timestamp, got %s", ray_type_name(t));
+    }
 
     int64_t len = input->len;
     ray_t* result = ray_vec_new(RAY_I64, len);

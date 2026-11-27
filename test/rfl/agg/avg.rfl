@@ -17,8 +17,8 @@
 (avg [-5]) -- -5.0
 (avg [-10 -20 -30]) -- -20.0
 (avg [0 0 0 0]) -- 0.0
-;; empty list → domain error (line 314 in ray_avg_fn)
-(avg (list)) !- domain
+;; empty list → 0Nf, the answer for every empty vector but a TIMESPAN one (#1790)
+(identical (avg (list)) 0Nf) -- true
 ;; single-element list
 (avg (list 7)) -- 7.0
 ;; list with all nulls → typed null F64

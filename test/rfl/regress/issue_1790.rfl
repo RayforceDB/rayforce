@@ -1,0 +1,56 @@
+;; #1790: map over an empty collection answers an untyped empty LIST, and a
+;; builtin that takes a typed vector raised a type error on it.  Now it
+;; gives what it gives an empty vector when every type it takes gives the
+;; same answer, the empty LIST itself when its vector answer takes a type
+;; from its input, and avg gives 0Nf.  Each answer is judged by identity:
+;; an empty I64 vector and an empty LIST print alike.
+(set E (map (fn [x] (> x 1)) (til 0)))
+(identical E (list)) -- true
+;; the issue's case
+(identical (where E) (where (as 'B8 []))) -- true
+(identical (where (list)) (as 'I64 [])) -- true
+(where (map (fn [x] (> x 1)) [1 2 3])) -- [1 2]
+;; a non-empty LIST is still rejected
+(where (list true false)) !- type
+(iasc (list 1 2)) !- type
+(sums (list 1 2)) !- type
+;; the same answer for every type
+(identical (iasc (list)) (iasc (as 'I64 []))) -- true
+(identical (idesc (list)) (idesc (as 'SYM []))) -- true
+(identical (rank (list)) (rank (as 'F64 []))) -- true
+(identical (xrank 3 (list)) (xrank 3 (as 'I64 []))) -- true
+(identical (differ (list)) (differ (as 'I32 []))) -- true
+(identical (ratios (list)) (ratios (as 'F64 []))) -- true
+(identical (avgs (list)) (avgs (as 'I16 []))) -- true
+(identical (mcount 2 (list)) (mcount 2 (as 'F64 []))) -- true
+(identical (mvar 2 (list)) (mvar 2 (as 'I64 []))) -- true
+(identical (bin (list) 5) (bin (as 'I64 []) 5)) -- true
+(identical (binr (list) [1 2]) (binr (as 'I64 []) [1 2])) -- true
+(identical (within (list) [1 2]) (within (as 'I64 []) [1 2])) -- true
+(identical (like "ab" (list)) (like "ab" (take ["a"] 0))) -- true
+(identical (strlen (list)) (strlen (take ["a"] 0))) -- true
+(identical (sym-name (list)) (sym-name (as 'I64 []))) -- true
+(identical (yyyy (list)) (yyyy (as 'DATE []))) -- true
+(identical (ss (list)) (ss (as 'TIMESTAMP []))) -- true
+;; the other arguments are checked as before
+(mcount 0 (list)) !- range
+(within (list) [1 2 3]) !- length
+;; the empty LIST itself, where the vector answer takes its input's type
+(identical (asc (list)) (list)) -- true
+(identical (desc (list)) (list)) -- true
+(identical (sums (list)) (list)) -- true
+(identical (prds (list)) (list)) -- true
+(identical (deltas (list)) (list)) -- true
+(identical (fills (list)) (list)) -- true
+(identical (mins (list)) (list)) -- true
+(identical (lag (list)) (list)) -- true
+(identical (msum 2 (list)) (list)) -- true
+(identical (mavg 2 (list)) (list)) -- true
+(identical (top (list) 2) (list)) -- true
+(identical (upper (list)) (list)) -- true
+(identical (trim (list)) (list)) -- true
+;; avg: 0Nf, its answer for every empty vector but a TIMESPAN one
+(identical (avg (list)) 0Nf) -- true
+(identical (avg (list)) (avg (as 'I64 []))) -- true
+;; dict keys stay as they were
+(dict (list) 1) !- type

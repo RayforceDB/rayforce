@@ -50,6 +50,21 @@ static inline bool ray_vec_may_have_nulls(const ray_t* v) {
     return (v->attrs & RAY_ATTR_HAS_NULLS) != 0;
 }
 
+/* An empty untyped LIST where a builtin takes a typed vector (#1790): map
+ * over an empty collection answers one.  A builtin calls these only where it
+ * raises its vector-type error, so a typed input or a non-empty list never
+ * reaches them.  ray_empty_list_as gives the empty vector of type t (a new
+ * reference) for the builtin to answer as it answers for that vector, when
+ * every type it takes gives the same answer; NULL for any other value.  A
+ * builtin whose vector answer would depend on a type answers the empty list
+ * itself (ray_is_empty_list). */
+static inline bool ray_is_empty_list(const ray_t* x) {
+    return x && x->type == RAY_LIST && x->len == 0;
+}
+static inline ray_t* ray_empty_list_as(const ray_t* x, int8_t t) {
+    return ray_is_empty_list(x) ? ray_vec_new(t, 0) : NULL;
+}
+
 /* Exact admission check for optimizations which require null-free input.
  * Text columns cannot prove that from attrs; inspect their payload instead.
  * Keep this out of per-row loops (use may_have_nulls + is_null there). */
