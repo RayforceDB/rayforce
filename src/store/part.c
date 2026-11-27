@@ -43,6 +43,10 @@
 #include "core/numparse.h"  /* ray_parse_i64 — overflow-checked integer names */
 #include "lang/format.h"     /* ray_type_name */
 #include <string.h>
+#include <errno.h>
+#include "core/errpath.h"
+/* a path as messages show it: a long one by its tail (#1886) */
+#define EPATH(p) ray_err_path((p), (char[RAY_ERR_PATH_MAX + 1]){0})
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
@@ -780,7 +784,7 @@ void ray_parted_cache_clear(void) {
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_read_parted(const char* db_root, const char* table_name) {
-    if (!db_root || !table_name) return ray_error("io", NULL);
+    if (!db_root || !table_name) return ray_error("io", "parted load: no root or table name");
     bool trace = ray_env_flag("RAY_CSV_TRACE");
     if (trace)
         fprintf(stderr, "parted.get: root=%s table=%s\n", db_root, table_name);
@@ -788,7 +792,7 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
     /* Validate table_name: no path separators or traversal */
     if (strchr(table_name, '/') || strchr(table_name, '\\') ||
         strstr(table_name, "..") || table_name[0] == '.')
-        return ray_error("io", NULL);
+        return ray_error("io", "parted load: table name '%s' must be a plain name (no '/', '..' or leading '.')", EPATH(table_name));
 
     /* Release unused domains before opening a possibly rebuilt root. */
     ray_parted_cache_prune();
@@ -797,7 +801,7 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
     char sym_path[1024];
     int sn = snprintf(sym_path, sizeof(sym_path), "%s/.sym", db_root);
     if (sn < 0 || (size_t)sn >= sizeof(sym_path))
-        return ray_error("io", NULL);
+        return ray_error("io", "parted load \"%s\": the symfile path is too long", EPATH(db_root));
 
     /* Open root/sym ONCE as the shared FILE domain for every partition's
      * SYM columns (sym-domain spec: partitions have no own symfiles; the
@@ -1117,7 +1121,7 @@ fail_dirs:
     ray_free_raw(part_dirs);
     if (dom) ray_sym_domain_release(dom);
 
-    return part_err ? part_err : ray_error("io", NULL);
+    return part_err ? part_err : ray_error("io", "parted load \"%s\": no partition of table '%s' could be read", EPATH(db_root), table_name);
 }
 
 /* --------------------------------------------------------------------------
@@ -1227,7 +1231,7 @@ static ray_t* empty_table_like(ray_t* tmpl) {
  * Returns a sorted RAY_SYM vector suitable for ray_read_parted, or an error.
  * -------------------------------------------------------------------------- */
 ray_t* ray_parted_tables(const char* db_root) {
-    if (!db_root || !*db_root) return ray_error("io", NULL);
+    if (!db_root || !*db_root) return ray_error("io", "parted tables: no root");
 
     char** part_dirs = NULL;
     int64_t part_count = 0;
@@ -1286,7 +1290,7 @@ ray_t* ray_parted_tables(const char* db_root) {
  * (empty vector when nothing needed fixing), or an error.
  * -------------------------------------------------------------------------- */
 ray_t* ray_parted_fill(const char* db_root) {
-    if (!db_root || !*db_root) return ray_error("io", NULL);
+    if (!db_root || !*db_root) return ray_error("io", "parted fill: no root");
 
     char** part_dirs = NULL;
     int64_t part_count = 0;

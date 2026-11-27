@@ -172,7 +172,7 @@ ray_t* ray_graph_build_fn(ray_t** args, int64_t n) {
     if (src_col && RAY_IS_ERR(src_col)) return src_col;
     ray_t* dst_col = ray_table_col(tbl, dst_sym);
     if (dst_col && RAY_IS_ERR(dst_col)) return dst_col;
-    if (!src_col || !dst_col) return ray_error("name", NULL);
+    if (!src_col || !dst_col) return ray_error("name", "graph.build: the table has no %s column '%.*s'", !src_col ? "src" : "dst", (int)(ray_sym_str(!src_col ? src_sym : dst_sym) ? ray_str_len(ray_sym_str(!src_col ? src_sym : dst_sym)) : 1), ray_sym_str(!src_col ? src_sym : dst_sym) ? ray_str_ptr(ray_sym_str(!src_col ? src_sym : dst_sym)) : "?");
     if (!ray_is_vec(src_col) || !ray_is_vec(dst_col)) return ray_error("type", "graph.build: src and dst columns must be vectors, got %s and %s", ray_type_name(src_col->type), ray_type_name(dst_col->type));
     if (src_col->len != dst_col->len) return ray_error("length", "graph.build: src and dst columns must have equal length, got %lld and %lld", (long long)src_col->len, (long long)dst_col->len);
 
@@ -228,7 +228,7 @@ ray_t* ray_graph_build_fn(ray_t** args, int64_t n) {
         }
         if (!w_col || !ray_is_vec(w_col)) {
             ray_rel_free(rel); ray_release(edges);
-            return ray_error("name", NULL);
+            return ray_error("name", "graph.build: the table has no weight column '%.*s'", (int)(ray_sym_str(weight_sym) ? ray_str_len(ray_sym_str(weight_sym)) : 1), ray_sym_str(weight_sym) ? ray_str_ptr(ray_sym_str(weight_sym)) : "?");
         }
         if (w_col->len != src_col->len) {
             ray_rel_free(rel); ray_release(edges);

@@ -1872,14 +1872,14 @@ static ray_t* join_flatten_parted(ray_t* tbl) {
 
 static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_table) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "join: the plan node has no extension");
 
     int64_t left_rows = ray_table_nrows(left_table);
     int64_t right_rows = ray_table_nrows(right_table);
     /* Guard: radix path stores row indices as int32_t (widened to int64_t on gather).
      * Chained HT path uses uint32_t.  Cap at INT32_MAX for correctness. */
     if (right_rows > (int64_t)INT32_MAX || left_rows > (int64_t)INT32_MAX)
-        return ray_error("nyi", NULL);
+        return ray_error("nyi", "join: a side of more than %lld rows is not supported", (long long)INT32_MAX);
     uint32_t n_keys = ext->join.n_join_keys;
     uint8_t join_type = ext->join.join_type;
 
@@ -2891,13 +2891,13 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
 static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
                             ray_t* left_table, ray_t* right_table) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "anti-join: the plan node has no extension");
 
     int64_t left_rows  = ray_table_nrows(left_table);
     int64_t right_rows = ray_table_nrows(right_table);
 
     if (right_rows > (int64_t)INT32_MAX || left_rows > (int64_t)INT32_MAX)
-        return ray_error("nyi", NULL);
+        return ray_error("nyi", "anti-join: a side of more than %lld rows is not supported", (long long)INT32_MAX);
 
     uint32_t n_keys = ext->join.n_join_keys;
 
@@ -3234,7 +3234,7 @@ static ray_t* join_mask_flat(ray_t* left_table, ray_t* right_table,
     int64_t left_rows  = ray_table_nrows(left_table);
     int64_t right_rows = ray_table_nrows(right_table);
     if (right_rows > (int64_t)INT32_MAX || left_rows > (int64_t)INT32_MAX)
-        return ray_error("nyi", NULL);
+        return ray_error("nyi", "join mask: a side of more than %lld rows is not supported", (long long)INT32_MAX);
 
     ray_t* mask = ray_vec_new(RAY_BOOL, left_rows);
     if (!mask || RAY_IS_ERR(mask)) return mask ? mask : ray_error("oom", NULL);
@@ -4462,7 +4462,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
 static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
                                ray_t* left_table, ray_t* right_table) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "window-join: the plan node has no extension");
 
     uint32_t n_eq     = ext->asof.n_eq_keys;
     uint8_t join_type = ext->asof.join_type;
@@ -4473,7 +4473,7 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
     /* Resolve time key */
     ray_op_ext_t* time_ext = find_ext(g, ext->asof.time_key);
     if (!time_ext || time_ext->base.opcode != OP_SCAN)
-        return ray_error("nyi", NULL);
+        return ray_error("nyi", "window-join: the time key must be a column");
     int64_t time_sym = time_ext->sym;
 
     /* Resolve equality keys.
@@ -4496,7 +4496,7 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
         ray_op_ext_t* ek = find_ext(g, ext->asof.eq_keys[k]);
         if (!ek || ek->base.opcode != OP_SCAN) {
             scratch_free(eqbuf_hdr);
-            return ray_error("nyi", NULL);
+            return ray_error("nyi", "window-join: an equality key must be a column");
         }
         eq_syms[k] = ek->sym;
     }
@@ -4516,7 +4516,7 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
     }
     if (!lt_time_vec || !rt_time_vec) {
         scratch_free(eqbuf_hdr);
-        return ray_error("schema", NULL);
+        return ray_error("schema", "window-join: a time key column is missing from its table");
     }
     int8_t time_type = lt_time_vec->type;
 
@@ -4567,7 +4567,7 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
             if (lt_time_hdr) scratch_free(lt_time_hdr);
             if (rt_time_hdr) scratch_free(rt_time_hdr);
             scratch_free(eqbuf_hdr);
-            return ray_error("schema", NULL);
+            return ray_error("schema", "window-join: an equality key column is missing from its table");
         }
         lt_eq[k] = lv;
         rt_eq[k] = rv;

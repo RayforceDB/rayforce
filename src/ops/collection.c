@@ -3224,7 +3224,7 @@ ray_t* distinct_vec_eager(ray_t* x) {
  * when the column is met on its own): a NULL segment, a partition without
  * the column, then yields its rows as the type's null. */
 static ray_t* parted_to_flat_vec_c(ray_t* x, const int64_t* cnt, int64_t ncnt) {
-    if (!x || !RAY_IS_PARTED(x->type)) return ray_error("type", NULL);
+    if (!x || !RAY_IS_PARTED(x->type)) return ray_error("type", "parted: the value is not a parted column");
     int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
     ray_t** segs = (ray_t**)ray_data(x);
     int64_t total = parted_rows_counted(x, cnt, ncnt);
@@ -3297,7 +3297,7 @@ static ray_t* parted_to_flat_vec_c(ray_t* x, const int64_t* cnt, int64_t ncnt) {
                 if (!elem || RAY_IS_ERR(elem) || store_typed_elem(out, pos, elem) != 0) {
                     if (allocated && elem && !RAY_IS_ERR(elem)) ray_release(elem);
                     ray_release(out);
-                    return elem && RAY_IS_ERR(elem) ? elem : ray_error("type", NULL);
+                    return elem && RAY_IS_ERR(elem) ? elem : ray_error("type", "parted: a cell could not be read");
                 }
                 if (allocated) ray_release(elem);
             }
@@ -5166,7 +5166,7 @@ ray_t* ray_cut_fn(ray_t* vec, ray_t* idxs) {
         }
         int alloc = 0;
         ray_t* ie = collection_elem(idxs, i, &alloc);
-        if (!ie || RAY_IS_ERR(ie)) { ray_release(out); return ie ? ie : ray_error("type", NULL); }
+        if (!ie || RAY_IS_ERR(ie)) { ray_release(out); return ie ? ie : ray_error("type", "cut: an index answered no value"); }
         if (!ray_is_atom(ie) ||
             (ie->type != -RAY_I64 && ie->type != -RAY_I32 &&
              ie->type != -RAY_I16 && ie->type != -RAY_U8)) {
@@ -5234,14 +5234,14 @@ ray_t* ray_cross_fn(ray_t* a, ray_t* b) {
         }
         int alloc_a = 0;
         ray_t* ae = cross_elem(a, i, &alloc_a);
-        if (!ae || RAY_IS_ERR(ae)) { ray_release(out); return ae ? ae : ray_error("type", NULL); }
+        if (!ae || RAY_IS_ERR(ae)) { ray_release(out); return ae ? ae : ray_error("type", "cross: an element answered no value"); }
         for (int64_t j = 0; j < nb; j++) {
             int alloc_b = 0;
             ray_t* be = cross_elem(b, j, &alloc_b);
             if (!be || RAY_IS_ERR(be)) {
                 if (alloc_a) ray_release(ae);
                 ray_release(out);
-                return be ? be : ray_error("type", NULL);
+                return be ? be : ray_error("type", "cross: an element answered no value");
             }
             ray_t* pair = ray_list_new(2);
             if (!pair || RAY_IS_ERR(pair)) {

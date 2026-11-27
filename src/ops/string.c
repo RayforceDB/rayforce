@@ -2907,7 +2907,7 @@ static ray_t* concat_text_values(ray_t** args, int n_args, bool str_out) {
 /* CONCAT(a, b, ...) */
 ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "concat: the plan node has no extension");
     int64_t raw_nargs = ext->sym;
     if (raw_nargs < 2 || raw_nargs > 255) return ray_error("arity", "concat: expected 2 to 255 arguments, got %lld", (long long)raw_nargs);
     int n_args = (int)raw_nargs;

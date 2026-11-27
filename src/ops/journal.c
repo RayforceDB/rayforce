@@ -22,6 +22,7 @@
  */
 
 #include "journal.h"
+#include "core/errpath.h"
 #include "store/journal.h"
 #include "store/serde.h"
 #include "core/ipc.h"
@@ -44,10 +45,20 @@ static const char* str_to_cpath(ray_t* s, char* buf, size_t bufsz) {
 }
 
 /* Map a ray_err_t into a Rayfall error object so callers can `try` them. */
-static ray_t* err_to_ray(ray_err_t e, const char* fallback) {
+static ray_t* err_to_ray(ray_err_t e, const char* fallback, const char* op) {
     if (e == RAY_OK) return RAY_NULL_OBJ;
     const char* code = ray_err_code_str(e);
-    return ray_error(code ? code : (fallback ? fallback : "io"), NULL);
+    code = code ? code : (fallback ? fallback : "io");
+    return ray_error(code, "%s: the journal failed (%s)", op, code);   /* named (#1886) */
+}
+
+/* As err_to_ray, for a builtin given a path: it names the path too. */
+static ray_t* err_to_ray_path(ray_err_t e, const char* op, const char* path) {
+    if (e == RAY_OK) return RAY_NULL_OBJ;
+    const char* code = ray_err_code_str(e);
+    code = code ? code : "io";
+    char pbuf[RAY_ERR_PATH_MAX + 1];
+    return ray_error(code, "%s \"%s\": the journal failed (%s)", op, ray_err_path(path, pbuf), code);
 }
 
 /* (.log.open args) — args is a 2-tuple (`async; "base") or (`sync; "base").
@@ -79,7 +90,7 @@ ray_t* ray_log_open_fn(ray_t** args, int64_t n) {
         return ray_error("type", ".log.open base path too long or not a string");
 
     ray_err_t e = ray_journal_open_append(base, mode);
-    return err_to_ray(e, "io");
+    return err_to_ray_path(e, ".log.open", base);
 }
 
 /* Checked atom construction for (.log.status).  ray_bool and ray_i64 test
@@ -228,7 +239,7 @@ ray_t* ray_log_write_fn(ray_t* expr) {
     if (written != pay_size) {
         ray_sys_free(payload);
         if (owned) ray_release(expr);
-        return ray_error("io", NULL);
+        return ray_error("io", ".log.write: serialized %lld of %lld bytes", (long long)written, (long long)pay_size);
     }
 
     ray_ipc_header_t hdr = {
@@ -242,7 +253,7 @@ ray_t* ray_log_write_fn(ray_t* expr) {
     ray_err_t e = ray_journal_write_bytes(&hdr, payload, pay_size);
     ray_sys_free(payload);
     if (owned) ray_release(expr);
-    return err_to_ray(e, "io");
+    return err_to_ray(e, "io", ".log.write");
 }
 
 /* Prepare the private report BEFORE evaluating any journal entry.  A result-
@@ -340,7 +351,7 @@ ray_t* ray_log_validate_fn(ray_t* path) {
 
     int64_t chunks = 0, valid_bytes = 0;
     ray_err_t e = ray_journal_validate(p, &chunks, &valid_bytes);
-    if (e != RAY_OK) return err_to_ray(e, "io");
+    if (e != RAY_OK) return err_to_ray_path(e, ".log.validate", p);
 
     ray_t* list = ray_list_new(2);
     ray_t* a = ray_i64(chunks);
@@ -363,7 +374,7 @@ ray_t* ray_log_roll_fn(ray_t** args, int64_t n) {
     if (n != 0) return ray_error("arity", ".log.roll takes no arguments");
     if (!ray_journal_is_open())
         return ray_error("domain", ".log.roll: no journal open");
-    return err_to_ray(ray_journal_roll(), "io");
+    return err_to_ray(ray_journal_roll(), "io", ".log.roll");
 }
 
 ray_t* ray_log_snapshot_fn(ray_t** args, int64_t n) {
@@ -374,7 +385,7 @@ ray_t* ray_log_snapshot_fn(ray_t** args, int64_t n) {
     ray_err_t e = ray_journal_snapshot();
     ray_t* why = e != RAY_OK ? ray_journal_take_error() : NULL;
     if (why) return why;   /* the serializer's own code and message */
-    return err_to_ray(e, "io");
+    return err_to_ray(e, "io", ".log.snapshot");
 }
 
 /* (.log.posts [flag]) — the posts switch (#1608).  No argument reads it;
@@ -398,13 +409,13 @@ ray_t* ray_log_posts_fn(ray_t** args, int64_t n) {
 ray_t* ray_log_sync_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("arity", ".log.sync takes no arguments");
-    return err_to_ray(ray_journal_sync(), "io");
+    return err_to_ray(ray_journal_sync(), "io", ".log.sync");
 }
 
 ray_t* ray_log_close_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("arity", ".log.close takes no arguments");
-    return err_to_ray(ray_journal_close(), "io");
+    return err_to_ray(ray_journal_close(), "io", ".log.close");
 }
 
 /* (.log.purge) — close the active journal (if open) and unlink ALL files
@@ -415,5 +426,5 @@ ray_t* ray_log_close_fn(ray_t** args, int64_t n) {
 ray_t* ray_log_purge_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("arity", ".log.purge takes no arguments");
-    return err_to_ray(ray_journal_purge(), "io");
+    return err_to_ray(ray_journal_purge(), "io", ".log.purge");
 }

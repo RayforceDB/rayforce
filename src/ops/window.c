@@ -955,7 +955,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "window: the plan node has no extension");
 
     /* Frame-spec validation: the compute path honors the whole partition,
      * the running frame, and fixed trailing ROWS frames.  Other numeric
@@ -1132,7 +1132,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                                         &sort_owned[k]);
         sort_descs[k] = 0;  /* partition keys always ASC */
         if (!sort_vecs[k] || RAY_IS_ERR(sort_vecs[k])) {
-            ray_t* err = sort_vecs[k] ? sort_vecs[k] : ray_error("nyi", NULL);
+            ray_t* err = sort_vecs[k] ? sort_vecs[k] : ray_error("nyi", "window: a partition key has no value");
             for (uint32_t j = 0; j < k; j++)
                 if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
                     ray_release(sort_vecs[j]);
@@ -1146,7 +1146,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         sort_descs[n_part + k] = ext->window.order_descs[k];
         if (!sort_vecs[n_part + k] || RAY_IS_ERR(sort_vecs[n_part + k])) {
             ray_t* err = sort_vecs[n_part + k] ? sort_vecs[n_part + k]
-                                               : ray_error("nyi", NULL);
+                                               : ray_error("nyi", "window: an order key has no value");
             for (uint32_t j = 0; j < n_part + k; j++)
                 if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
                     ray_release(sort_vecs[j]);
@@ -1160,7 +1160,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         if (fi) {
             func_vecs[f] = win_resolve_vec(g, fi, tbl, &func_owned[f]);
             if (!func_vecs[f] || RAY_IS_ERR(func_vecs[f])) {
-                ray_t* err = func_vecs[f] ? func_vecs[f] : ray_error("nyi", NULL);
+                ray_t* err = func_vecs[f] ? func_vecs[f] : ray_error("nyi", "window: a function's input has no value");
                 for (uint32_t j = 0; j < f; j++)
                     if (func_owned[j] && func_vecs[j] && !RAY_IS_ERR(func_vecs[j]))
                         ray_release(func_vecs[j]);

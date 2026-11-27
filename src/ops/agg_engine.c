@@ -13773,7 +13773,7 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
         ray_t* src = ray_table_col(tbl, want[i]);
         if (src && RAY_IS_ERR(src)) { ray_release(compact); scratch_free(want_hdr); return src; }
-        if (!src) { ray_release(compact); scratch_free(want_hdr); return ray_error("nyi", NULL); }
+        if (!src) { ray_release(compact); scratch_free(want_hdr); return ray_error("nyi", "group: a column the aggregate reads is not in the table"); }
         assert(!RAY_IS_PARTED(src->type));
         gcol = gather_by_idx(src, idx, n_sel);   /* fresh, no alias */
         if (!gcol || RAY_IS_ERR(gcol)) {
@@ -13842,7 +13842,7 @@ static ray_t* exec_group_v2_once(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     const ray_group_emit_filter_t* efp = ef.enabled ? &ef : NULL;
     /* exec_group_v2_run reads g's op extensions unconditionally; a NULL
      * graph is an error here, not a request for an unfiltered run. */
-    if (!g) return ray_error("nyi", NULL);
+    if (!g) return ray_error("nyi", "group: no plan to run");
     if (!g->selection)
         return exec_group_v2_run(g, op, tbl, ray_table_nrows(tbl), NULL, NULL, 0,
                                  group_limit, efp);

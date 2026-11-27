@@ -1251,7 +1251,7 @@ ray_t* ray_tbl_col_empty(ray_t* tbl, int64_t sym) {
         if (!seg) return ray_error("nyi", "empty column of a parted column without segments");
         if (seg->type != RAY_ENCCOL) return ray_group_gather(seg, NULL, 0);
         ray_col_meta_t sm;
-        if (!ray_col_meta_of(seg, &sm)) return ray_error("schema", NULL);
+        if (!ray_col_meta_of(seg, &sm)) return ray_error("schema", "column: a segment's metadata cannot be read");
         m.type = sm.type;
         m.attrs = sm.attrs;                         /* segment 0's SYM width */
         m.enc = seg;                                /* and its domain */
@@ -7561,7 +7561,7 @@ static ray_t* key_range_bind(const key_range_plan_t* p, ray_col_src_t* srcs, ray
             if (!err) bound[k] = true;
         } else {
             plain[k] = ray_table_col(p->tbl, p->syms[k]);   /* plain, or already decoded */
-            if (!plain[k]) err = ray_error("schema", NULL);
+            if (!plain[k]) err = ray_error("schema", "key range: a key column is not in the table");
             else if (RAY_IS_ERR(plain[k])) { err = plain[k]; plain[k] = NULL; }
         }
     }
@@ -14432,7 +14432,7 @@ static ray_t* rw_eval_call(ray_t* e, rw_ctx_t* c, int depth) {
             int64_t s = ray_sym_intern(nm, (size_t)ln);
             ray_err_t berr = ray_env_set_local_rows(s, v, rows);
             ray_release(v);
-            if (berr != RAY_OK) { out = ray_error(ray_err_code_str(berr), NULL); break; }
+            if (berr != RAY_OK) { out = ray_error(ray_err_code_str(berr), "row-wise: cannot bind a local (%s)", ray_err_code_str(berr)); break; }
             hid = ray_sym(s);
             if (!hid || RAY_IS_ERR(hid)) { out = hid ? hid : ray_error("oom", NULL); break; }
             a = hid;
@@ -14525,7 +14525,7 @@ static ray_t* rw_eval_let(ray_t* e, rw_ctx_t* c, int depth) {
     if (err != RAY_OK) {
         ray_release(v);
         return err == RAY_ERR_ACCESS ? ray_error("access", "restricted")
-                                     : ray_error(ray_err_code_str(err), NULL);
+                                     : ray_error(ray_err_code_str(err), "let: cannot bind a local (%s)", ray_err_code_str(err));
     }
     return v;
 }
@@ -22247,7 +22247,7 @@ static ray_t* hoist_do_expr(ray_t* e, hoist_ctx_t* c, int depth) {
                 *c->cols = t2;
             } else {
                 ray_err_t be = ray_env_set_local_rows(hid, v, brows[k] == 1 ? 1 : 0);
-                if (be != RAY_OK) { err = ray_error(ray_err_code_str(be), NULL); break; }
+                if (be != RAY_OK) { err = ray_error(ray_err_code_str(be), "do: cannot bind a hoisted local (%s)", ray_err_code_str(be)); break; }
             }
             ren.from[ren.n] = bn[k]; ren.to[ren.n] = hid; ren.n++;
         }
@@ -25969,7 +25969,7 @@ static bool prune_stand_in_type_ok(int8_t t) {
  * `seg` — its type, SYM width and domain — read from metadata, no decode. */
 static ray_t* prune_stand_in_seg(ray_t* seg) {
     ray_col_meta_t m;
-    if (!ray_col_meta_of(seg, &m)) return ray_error("schema", NULL);
+    if (!ray_col_meta_of(seg, &m)) return ray_error("schema", "partition prune: a segment's metadata cannot be read");
     ray_t* v;
     if (m.type == RAY_SYM) {
         v = ray_sym_vec_new(m.attrs & RAY_SYM_W_MASK, 1);
@@ -26030,7 +26030,7 @@ static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name = ray_table_col_name(tbl, c);
         ray_col_meta_t m;
-        if (!ray_table_col_meta_idx(tbl, c, &m)) { ray_release(out); return ray_error("schema", NULL); }
+        if (!ray_table_col_meta_idx(tbl, c, &m)) { ray_release(out); return ray_error("schema", "partition prune: column %lld's metadata cannot be read", (long long)c); }
         ray_t* slot = NULL;
         if (m.type == RAY_MAPCOMMON) {
             ray_t* mc = ray_table_col_idx(tbl, c);              /* MAPCOMMON: plain */
@@ -26087,7 +26087,7 @@ static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n
                 } else {
                     /* shaped like any partition's segment (the pruned one may be a ragged gap) */
                     for (int64_t q = 0; !seg && q < n_parts; q++) seg = prune_seg(tbl, c, q);
-                    seg = seg ? prune_stand_in_seg(seg) : ray_error("schema", NULL);
+                    seg = seg ? prune_stand_in_seg(seg) : ray_error("schema", "partition prune: no partition has a segment of column %lld", (long long)c);
                     if (!seg || RAY_IS_ERR(seg)) {
                         ray_release(nw); ray_release(out);
                         return seg ? seg : ray_error("oom", NULL);
@@ -28100,7 +28100,7 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
         /* as the evaluator applies it: the opcode's kernel widens a narrow
          * column, a constant on either side */
         ray_binary_fn f = (ray_binary_fn)(uintptr_t)op[i]->i64;
-        ray_t* v = !bc ? ray_error("schema", NULL) : RAY_IS_ERR(bc) ? bc
+        ray_t* v = !bc ? ray_error("schema", "select: a by: key column has no value") : RAY_IS_ERR(bc) ? bc
                  : atomic_map_binary_op(f, RAY_FN_OPCODE(op[i]), cside[i] == 1 ? bc : c, cside[i] == 1 ? c : bc);
         if (v && !RAY_IS_ERR(v)) { grouped = ray_table_add_col(grouped, alias[i], v); ray_release(v); }
         else { ray_release(grouped); grouped = v ? v : ray_error("oom", NULL); }
@@ -39712,7 +39712,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 dict_vals->len = 0;
                 ray_free(dict_vals);
                 ray_release(tbl); ray_release(row_orig);
-                return ray_error("value", NULL);
+                return ray_error("value", "insert: the row's key '%.*s' is not a column of the table", (int)(ray_sym_str(dk) ? ray_str_len(ray_sym_str(dk)) : 1), ray_sym_str(dk) ? ray_str_ptr(ray_sym_str(dk)) : "?");
             }
         }
         row = dict_vals;
@@ -41283,7 +41283,7 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             for (int64_t i = 0; i < src_ncols; i++) if (ray_table_col_name(row, i) == scn) src_matches++;
             if (tbl_matches != 1 || src_matches != 1) {
                 ray_release(tbl); ray_release(key_sym); ray_release(row);
-                return ray_error("value", NULL);
+                return ray_error("value", "upsert: payload column '%.*s' must appear exactly once in the target and in the payload", (int)(ray_sym_str(scn) ? ray_str_len(ray_sym_str(scn)) : 1), ray_sym_str(scn) ? ray_str_ptr(ray_sym_str(scn)) : "?");
             }
         }
 
@@ -41320,7 +41320,7 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             if (!found) {
                 scratch_free(keynames_hdr);
                 ray_release(tbl); ray_release(key_sym); ray_release(row);
-                return ray_error("value", NULL);
+                return ray_error("value", "upsert: the payload has no key column '%.*s'", (int)(ray_sym_str(key_names[k]) ? ray_str_len(ray_sym_str(key_names[k])) : 1), ray_sym_str(key_names[k]) ? ray_str_ptr(ray_sym_str(key_names[k])) : "?");
             }
         }
         /* Key column positions in the target.  Every key name is a
@@ -44144,7 +44144,7 @@ static ray_t* asof_carry_recompute(ray_t* qtab, ray_t* template,
     if (!dict || RAY_IS_ERR(dict)) return dict ? dict : ray_error("oom", NULL);
     ray_t* raw = ray_select_impl(&dict, 1, SELECT_ALIASES_RESOLVED);
     ray_release(dict);
-    if (!raw || RAY_IS_ERR(raw)) return raw ? raw : ray_error("type", NULL);
+    if (!raw || RAY_IS_ERR(raw)) return raw ? raw : ray_error("type", "asof-join: recomputing the carried columns answered no value");
 
     /* Reorder group-by output (eq keys first, then aggs) back to `template`'s
      * column order so positional column concat stays valid next day. */
@@ -44283,7 +44283,7 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
             ray_t* day_r_seg = NULL;
             if (rseg >= 0) {
                 day_r_seg = asof_eval_select_segment(rdict, rparted, (int32_t)rseg);
-                if (!day_r_seg || RAY_IS_ERR(day_r_seg)) { err = day_r_seg ? day_r_seg : ray_error("type", NULL); break; }
+                if (!day_r_seg || RAY_IS_ERR(day_r_seg)) { err = day_r_seg ? day_r_seg : ray_error("type", "asof-join: a right partition's select answered no value"); break; }
             }
 
             /* qtab = prior carry rows PREPENDED to today's quotes.  Carry rows
@@ -44333,13 +44333,13 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
                 ray_release(sk);
                 ray_release(qtab);
                 qtab = qs;
-                if (!qtab || RAY_IS_ERR(qtab)) { err = qtab ? qtab : ray_error("type", NULL); qtab = NULL; if (day_r_seg) ray_release(day_r_seg); break; }
+                if (!qtab || RAY_IS_ERR(qtab)) { err = qtab ? qtab : ray_error("type", "asof-join: the query table answered no value"); qtab = NULL; if (day_r_seg) ray_release(day_r_seg); break; }
             }
 
             /* Emit this day's trades (if any) against the prevailing-quote view. */
             if (lseg >= 0) {
                 ray_t* day_l = asof_eval_select_segment(ldict, lparted, (int32_t)lseg);
-                if (!day_l || RAY_IS_ERR(day_l)) { err = day_l ? day_l : ray_error("type", NULL); if (qtab) ray_release(qtab); if (day_r_seg) ray_release(day_r_seg); break; }
+                if (!day_l || RAY_IS_ERR(day_l)) { err = day_l ? day_l : ray_error("type", "asof-join: a left partition's select answered no value"); if (qtab) ray_release(qtab); if (day_r_seg) ray_release(day_r_seg); break; }
 
                 ray_t* rt;
                 if (qtab) { rt = qtab; ray_retain(rt); }
@@ -44349,14 +44349,14 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
                      * first-appearance would (no stale carry slot invented). */
                     if (!empty_r) {
                         empty_r = asof_empty_right(rdict, rparted);
-                        if (!empty_r || RAY_IS_ERR(empty_r)) { err = empty_r ? empty_r : ray_error("type", NULL); empty_r = NULL; ray_release(day_l); if (day_r_seg) ray_release(day_r_seg); break; }
+                        if (!empty_r || RAY_IS_ERR(empty_r)) { err = empty_r ? empty_r : ray_error("type", "asof-join: the empty right table answered no value"); empty_r = NULL; ray_release(day_l); if (day_r_seg) ray_release(day_r_seg); break; }
                     }
                     rt = empty_r; ray_retain(rt);
                 }
 
                 ray_t* part = ray_asof_join_core(keys_vec, day_l, rt);
                 ray_release(day_l); ray_release(rt);
-                if (!part || RAY_IS_ERR(part)) { err = part ? part : ray_error("type", NULL); if (qtab) ray_release(qtab); if (day_r_seg) ray_release(day_r_seg); break; }
+                if (!part || RAY_IS_ERR(part)) { err = part ? part : ray_error("type", "asof-join: a partition's join answered no value"); if (qtab) ray_release(qtab); if (day_r_seg) ray_release(day_r_seg); break; }
 
                 /* Same positional-concat guard for the day-to-day output
                  * accumulation: every day's asof output must share the running
@@ -44379,7 +44379,7 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
              * today keeps its carried row through the group-last. */
             if (rseg >= 0) {
                 ray_t* nc = asof_carry_recompute(qtab, day_r_seg, eq_names, n_eq_c);
-                if (!nc || RAY_IS_ERR(nc)) { err = nc ? nc : ray_error("type", NULL); if (qtab) ray_release(qtab); ray_release(day_r_seg); break; }
+                if (!nc || RAY_IS_ERR(nc)) { err = nc ? nc : ray_error("type", "asof-join: recomputing the carried columns answered no value"); if (qtab) ray_release(qtab); ray_release(day_r_seg); break; }
                 if (carry) ray_release(carry);
                 carry = nc;
             }

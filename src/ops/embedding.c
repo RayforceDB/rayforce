@@ -27,6 +27,9 @@
 #include "store/embmodel.h"
 #include "core/pool.h"
 #include <stdatomic.h>
+#include "core/errpath.h"
+/* a path as messages show it: a long one by its tail (#1886) */
+#define EPATH(p) ray_err_path((p), (char[RAY_ERR_PATH_MAX + 1]){0})
 
 /* ==========================================================================
  *  Rayfall builtins — direct metrics, exact KNN, HNSW lifecycle/query
@@ -741,7 +744,7 @@ ray_t* ray_hnsw_save_fn(ray_t* path, ray_t* h) {
     memcpy(buf, p, len);
     buf[len] = '\0';
     ray_err_t err = ray_hnsw_save(idx, buf);
-    if (err != RAY_OK) return ray_error("io", NULL);
+    if (err != RAY_OK) return ray_error("io", ".emb.hnsw.set \"%s\": saving the index failed (%s)", EPATH(buf), ray_err_code_str(err));
     return RAY_NULL_OBJ;
 }
 

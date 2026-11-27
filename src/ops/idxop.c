@@ -1570,7 +1570,7 @@ ray_t* ray_dict_acc_finish(ray_dict_acc_t* a, int64_t len) {
     if (!cs) {
         ray_release(codes); ray_release(first_occ); ray_release(idx);
         ray_dict_acc_free(a);
-        return ray_error("io", NULL);
+        return ray_error("io", "dict index: the accumulator holds no codes");
     }
     codes->len = len; memcpy(ray_data(codes), cs, (size_t)len * 4);
     first_occ->len = a->n_distinct; memcpy(ray_data(first_occ), a->first_occ, (size_t)a->n_distinct * 4);

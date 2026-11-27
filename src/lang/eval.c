@@ -724,7 +724,7 @@ static ray_t* materialize_owned_args(ray_t** args, int64_t n) {
 
         args[i] = ray_lazy_materialize(args[i]); /* consumes owned ref */
         if (!args[i] || RAY_IS_ERR(args[i])) {
-            ray_t* err = args[i] ? args[i] : ray_error("type", NULL);
+            ray_t* err = args[i] ? args[i] : ray_error("type", "call: an argument answered no value");
             args[i] = NULL;
             for (int64_t j = 0; j < n; j++) {
                 if (args[j]) ray_release(args[j]);
@@ -915,11 +915,11 @@ static ray_t* try_sum_affine(ray_t* vec, ray_t* literal) {
         } else {
             ray_t* sum = ray_sum_fn(vec);
             if (!sum || RAY_IS_ERR(sum)) {
-                return sum ? sum : ray_error("type", NULL);
+                return sum ? sum : ray_error("type", "sum: answered no value");
             }
             sum = materialize_owned_value(sum);
             if (!sum || RAY_IS_ERR(sum)) {
-                return sum ? sum : ray_error("type", NULL);
+                return sum ? sum : ray_error("type", "sum: answered no value");
             }
             ce.sum_i = sum->i64;
             ray_release(sum);
@@ -981,7 +981,7 @@ ray_t* ray_raise_fn(ray_t* val) {
  * was compiled. */
 static ray_t* undefined_name_error(int64_t sym) {
     ray_t* s = ray_sym_str(sym);   /* borrowed */
-    if (!s) return ray_error("name", NULL);
+    if (!s) return ray_error("name", "name: undefined name with no text (symbol %lld)", (long long)sym);
     return ray_error("name", "'%.*s' undefined", (int)ray_str_len(s), ray_str_ptr(s));
 }
 
@@ -1614,12 +1614,12 @@ static ray_t* atomic_map_binary_parted(ray_binary_fn fn, uint16_t dag_opcode,
         ray_t* r = right_parted ? rsegs[s] : right;
         if (!l || !r) {
             ray_release(out);
-            return ray_error("type", NULL);
+            return ray_error("type", "parted: a partition has no segment for this operation");
         }
         ray_t* seg = atomic_map_binary_op(fn, dag_opcode, l, r);
         if (!seg || RAY_IS_ERR(seg)) {
             ray_release(out);
-            return seg ? seg : ray_error("domain", NULL);
+            return seg ? seg : ray_error("domain", "parted: a partition's segment answered no value");
         }
         if (!ray_is_vec(seg)) {
             int8_t st = seg->type;
@@ -2191,7 +2191,7 @@ static ray_t* map_cell_error(ray_t* left, int left_coll, ray_t* a, int la,
     if (own_a && own_b) ray_error_free(b);
     if (own_a) return a;
     if (own_b) return b;
-    return ray_error("type", NULL);
+    return ray_error("type", "map: an element's call answered no value");
 }
 
 /* Whether a cell's result is a number a typed numeric or temporal vector
@@ -3374,7 +3374,7 @@ ray_t* call_fn1(ray_t* fn, ray_t* arg) {
         if (!(fn->attrs & RAY_FN_LAZY_AWARE) && ray_is_lazy(a)) {
             ray_retain(a);               /* give materialise its own ref; arg is borrowed */
             a = ray_lazy_materialize(a); /* consumes the retain we just added */
-            if (!a || RAY_IS_ERR(a)) return a ? a : ray_error("type", NULL);
+            if (!a || RAY_IS_ERR(a)) return a ? a : ray_error("type", "call: a lazy argument answered no value");
             owned = true;
         }
         ray_t* r;
@@ -3398,7 +3398,7 @@ ray_t* call_fn1(ray_t* fn, ray_t* arg) {
             ray_t* a = arg;
             ray_retain(a);
             if (ray_is_lazy(a)) a = ray_lazy_materialize(a);   /* consumes our ref */
-            return a ? a : ray_error("type", NULL);
+            return a ? a : ray_error("type", "call: a lazy argument answered no value");
         }
         return call_vary_values(fn, &arg, 1);
     }
@@ -3420,7 +3420,7 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
             if (ray_is_lazy(la)) {
                 ray_retain(la);               /* give materialise its own ref; a is borrowed */
                 la = ray_lazy_materialize(la); /* consumes the retain we just added */
-                if (!la || RAY_IS_ERR(la)) return la ? la : ray_error("type", NULL);
+                if (!la || RAY_IS_ERR(la)) return la ? la : ray_error("type", "call: a lazy argument answered no value");
                 owned_a = true;
             }
             if (ray_is_lazy(lb)) {
@@ -3428,7 +3428,7 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
                 lb = ray_lazy_materialize(lb); /* consumes the retain we just added */
                 if (!lb || RAY_IS_ERR(lb)) {
                     if (owned_a) ray_release(la);
-                    return lb ? lb : ray_error("type", NULL);
+                    return lb ? lb : ray_error("type", "call: a lazy argument answered no value");
                 }
                 owned_b = true;
             }
@@ -3456,7 +3456,7 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
             if (ray_is_lazy(la)) {
                 ray_retain(la);
                 la = ray_lazy_materialize(la);
-                if (!la || RAY_IS_ERR(la)) return la ? la : ray_error("type", NULL);
+                if (!la || RAY_IS_ERR(la)) return la ? la : ray_error("type", "call: a lazy argument answered no value");
                 owned_a = true;
             }
             if (ray_is_lazy(lb)) {
@@ -3464,7 +3464,7 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
                 lb = ray_lazy_materialize(lb);
                 if (!lb || RAY_IS_ERR(lb)) {
                     if (owned_a) ray_release(la);
-                    return lb ? lb : ray_error("type", NULL);
+                    return lb ? lb : ray_error("type", "call: a lazy argument answered no value");
                 }
                 owned_b = true;
             }
@@ -4024,7 +4024,7 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
 ray_t* ray_key_fn(ray_t* x) {
     if (x->type == RAY_DICT) {
         ray_t* keys = ray_dict_keys(x);
-        if (!keys) return ray_error("type", NULL);
+        if (!keys) return ray_error("type", "key: the dict has no keys");
         ray_retain(keys);
         return keys;
     }
@@ -4057,7 +4057,7 @@ ray_t* ray_value_fn(ray_t* x) {
     }
     if (x->type != RAY_DICT) return ray_error("type", "value: expected a dict or table, got %s", ray_type_name(x->type));
     ray_t* vals = ray_dict_vals(x);
-    if (!vals) return ray_error("type", NULL);
+    if (!vals) return ray_error("type", "value: the dict has no values");
     ray_retain(vals);
     return vals;
 }
@@ -4087,7 +4087,7 @@ ray_t* ray_set_fn(ray_t* name_obj, ray_t* val_expr) {
     ray_err_t err = ray_env_set(name_obj->i64, val);
     if (err != RAY_OK) {
         ray_release(val);
-        return ray_error(ray_err_code_str(err), NULL);
+        return ray_error(ray_err_code_str(err), "set: cannot bind '%.*s' (%s)", (int)(ray_sym_str(name_obj->i64) ? ray_str_len(ray_sym_str(name_obj->i64)) : 1), ray_sym_str(name_obj->i64) ? ray_str_ptr(ray_sym_str(name_obj->i64)) : "?", ray_err_code_str(err));
     }
     return val;  /* set returns the value */
 }
@@ -4107,7 +4107,7 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
     if (err != RAY_OK) {
         ray_release(val);
         return err == RAY_ERR_ACCESS ? ray_error("access", "restricted")
-                                     : ray_error(ray_err_code_str(err), NULL);
+                                     : ray_error(ray_err_code_str(err), "let: cannot bind '%.*s' (%s)", (int)(ray_sym_str(name_obj->i64) ? ray_str_len(ray_sym_str(name_obj->i64)) : 1), ray_sym_str(name_obj->i64) ? ray_str_ptr(ray_sym_str(name_obj->i64)) : "?", ray_err_code_str(err));
     }
     return val;
 }
@@ -4420,7 +4420,7 @@ ray_t* ray_times_fn(ray_t** args, int64_t n) {
     ray_t* cexpr = args[0];
     if (ray_times_binding(args[0], &name, &cexpr) &&
         ray_sym_is_reserved(name) && !ray_sym_is_ipc_hook(name))
-        return ray_error(ray_err_code_str(RAY_ERR_RESERVED), NULL);
+        return ray_error(ray_err_code_str(RAY_ERR_RESERVED), "times: '%.*s' is a reserved name", (int)(ray_sym_str(name) ? ray_str_len(ray_sym_str(name)) : 1), ray_sym_str(name) ? ray_str_ptr(ray_sym_str(name)) : "?");
     ray_t* cnt = ray_eval(cexpr);
     if (RAY_IS_ERR(cnt)) return cnt;
     if (ray_is_lazy(cnt))
@@ -4438,7 +4438,7 @@ ray_t* ray_times_fn(ray_t** args, int64_t n) {
             ray_err_t e = ray_env_set_local_rows(name, idx, 0);
             ray_release(idx);
             if (e == RAY_ERR_ACCESS) return ray_error("access", "restricted");
-            if (e != RAY_OK) return ray_error(ray_err_code_str(e), NULL);
+            if (e != RAY_OK) return ray_error(ray_err_code_str(e), "times: cannot bind '%.*s' (%s)", (int)(ray_sym_str(name) ? ray_str_len(ray_sym_str(name)) : 1), ray_sym_str(name) ? ray_str_ptr(ray_sym_str(name)) : "?", ray_err_code_str(e));
         }
         for (int64_t i = 1; i < n; i++) {
             ray_t* val = ray_eval(args[i]);
@@ -5109,7 +5109,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
             if (!arg || RAY_IS_ERR(arg)) {
                 ray_env_pop_scope();
                 if (call_frame) ray_env_pop_scope();
-                return arg ? arg : ray_error("type", NULL);
+                return arg ? arg : ray_error("type", "lambda: a lazy argument answered no value");
             }
         }
         /* Parameters carry the arguments' row provenance into the body. */
@@ -5413,7 +5413,7 @@ static inline ray_t* vm_apply_unary_raw(ray_t* fn_obj, ray_t* arg) {
     ray_unary_fn fn = (ray_unary_fn)(uintptr_t)fn_obj->i64;
     if (RAY_UNLIKELY(RAY_IS_NULL(arg)))
         return (fn == (ray_unary_fn)ray_nil_fn || fn == (ray_unary_fn)ray_type_fn)
-               ? fn(arg) : ray_error("type", NULL);
+               ? fn(arg) : ray_error("type", "%s: the generic null is not an argument; only nil?, type and ser take it", ray_fn_name(fn_obj));
     if ((fn_obj->attrs & RAY_FN_ATOMIC) && arg->type >= 0)
         return atomic_map_unary(fn, arg);
     return fn(arg);
@@ -5436,17 +5436,17 @@ static ray_t* vm_call_binary_raw(ray_t* fn_obj, ray_t* left, ray_t* right,
     if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE)) {
         if (left && ray_is_lazy(left)) {
             left = ray_lazy_materialize(left);
-            if (!left || RAY_IS_ERR(left)) { ray_release(right); return left ? left : ray_error("type", NULL); }
+            if (!left || RAY_IS_ERR(left)) { ray_release(right); return left ? left : ray_error("type", "call: a lazy argument answered no value"); }
         }
         if (right && ray_is_lazy(right)) {
             right = ray_lazy_materialize(right);
-            if (!right || RAY_IS_ERR(right)) { ray_release(left); return right ? right : ray_error("type", NULL); }
+            if (!right || RAY_IS_ERR(right)) { ray_release(left); return right ? right : ray_error("type", "call: a lazy argument answered no value"); }
         }
     }
     RAY_ASSERT_VALUE(left); RAY_ASSERT_VALUE(right);
     if (RAY_UNLIKELY(RAY_IS_NULL(left) || RAY_IS_NULL(right))) {
         result = (fn == ray_identical_fn || fn == (ray_binary_fn)ray_eq_fn || fn == (ray_binary_fn)ray_neq_fn)
-                 ? fn(left, right) : ray_error("type", NULL);
+                 ? fn(left, right) : ray_error("type", "%s: the generic null is not an argument; only identical, == and != take it", ray_fn_name(fn_obj));
     } else if (fn == ray_concat_fn && (left_rows == 1 || right_rows == 1) &&
                vm_text_value(left) && vm_text_value(right) &&
                (left_rows == 1 || ray_is_atom(left)) && (right_rows == 1 || ray_is_atom(right))) {
@@ -5670,7 +5670,7 @@ op_loadenv: {
          * and then used twice: `((fn [v] (if (> v 0) v 0)) (first xs))`. */
         val = ray_lazy_materialize(val);   /* consumes the slot's ref */
         if (!val || RAY_IS_ERR(val)) {
-            vm_err_obj = val ? val : ray_error("type", NULL);
+            vm_err_obj = val ? val : ray_error("type", "lambda: a lazy local answered no value");
             LOCAL(slot) = NULL;            /* ref already consumed */
             goto vm_error;
         }
@@ -5759,7 +5759,7 @@ op_storeglobal: {
     ray_err_t err = ray_env_set(name_obj->i64, val);
     if (err != RAY_OK) {
         ray_release(POP());
-        vm_err_obj = ray_error(ray_err_code_str(err), NULL);
+        vm_err_obj = ray_error(ray_err_code_str(err), "set: cannot bind '%.*s' (%s)", (int)(ray_sym_str(name_obj->i64) ? ray_str_len(ray_sym_str(name_obj->i64)) : 1), ray_sym_str(name_obj->i64) ? ray_str_ptr(ray_sym_str(name_obj->i64)) : "?", ray_err_code_str(err));
         goto vm_error;
     }
     DISPATCH();
@@ -5778,7 +5778,7 @@ op_storeglobal_w: {
     ray_err_t err = ray_env_set(name_obj->i64, val);
     if (err != RAY_OK) {
         ray_release(POP());
-        vm_err_obj = ray_error(ray_err_code_str(err), NULL);
+        vm_err_obj = ray_error(ray_err_code_str(err), "set: cannot bind '%.*s' (%s)", (int)(ray_sym_str(name_obj->i64) ? ray_str_len(ray_sym_str(name_obj->i64)) : 1), ray_sym_str(name_obj->i64) ? ray_str_ptr(ray_sym_str(name_obj->i64)) : "?", ray_err_code_str(err));
         goto vm_error;
     }
     DISPATCH();
@@ -5892,7 +5892,7 @@ op_jmpf: {
         arg = ray_lazy_materialize(arg);                                    \
         if (!arg || RAY_IS_ERR(arg)) {                                      \
             ray_release(fn_obj);                                            \
-            vm_err_obj = arg ? arg : ray_error("type", NULL);               \
+            vm_err_obj = arg ? arg : ray_error("type", "lambda: a lazy argument answered no value");               \
             goto vm_error;                                                  \
         }                                                                   \
     }                                                                       \
@@ -6124,7 +6124,7 @@ op_callf: {
                     if (fn_args[i] && ray_is_lazy(fn_args[i])) {
                         fn_args[i] = ray_lazy_materialize(fn_args[i]);
                         if (!fn_args[i] || RAY_IS_ERR(fn_args[i])) {
-                            result = fn_args[i] ? fn_args[i] : ray_error("type", NULL);
+                            result = fn_args[i] ? fn_args[i] : ray_error("type", "call: an argument answered no value");
                             fn_args[i] = NULL;
                             ray_release(fn_args[1 - i]);
                             goto unary_done;
@@ -6143,7 +6143,7 @@ op_callf: {
              * consumes it — no extra ray_release after the call. */
             if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE) && fn_args[0] && ray_is_lazy(fn_args[0])) {
                 fn_args[0] = ray_lazy_materialize(fn_args[0]); /* consumes owned ref */
-                if (!fn_args[0] || RAY_IS_ERR(fn_args[0])) { result = fn_args[0] ? fn_args[0] : ray_error("type", NULL); fn_args[0] = NULL; break; }
+                if (!fn_args[0] || RAY_IS_ERR(fn_args[0])) { result = fn_args[0] ? fn_args[0] : ray_error("type", "call: a lazy argument answered no value"); fn_args[0] = NULL; break; }
             }
             if (RAY_UNLIKELY(fn_obj->attrs & RAY_FN_ROWWISE) &&
                 (result = rowwise_apply(RAY_UNARY, (void*)(uintptr_t)unary, fn_args, arg_rows, 1)) != NULL) {
@@ -6161,7 +6161,7 @@ op_callf: {
              * tree walker and in OP_CALL1. */
             if (RAY_UNLIKELY(RAY_IS_NULL(fn_args[0])))
                 result = (unary == (ray_unary_fn)ray_nil_fn || unary == (ray_unary_fn)ray_type_fn ||
-                          unary == (ray_unary_fn)ray_ser_fn) ? unary(fn_args[0]) : ray_error("type", NULL);
+                          unary == (ray_unary_fn)ray_ser_fn) ? unary(fn_args[0]) : ray_error("type", "%s: the generic null is not an argument; only nil?, type and ser take it", ray_fn_name(fn_obj));
             else if ((fn_obj->attrs & RAY_FN_ATOMIC) && fn_args[0] && fn_args[0]->type >= 0)
                 result = atomic_map_unary(unary, fn_args[0]);
             else
@@ -6199,11 +6199,11 @@ unary_done:
             if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE)) {
                 if (fn_args[0] && ray_is_lazy(fn_args[0])) {
                     fn_args[0] = ray_lazy_materialize(fn_args[0]); /* consumes owned ref */
-                    if (!fn_args[0] || RAY_IS_ERR(fn_args[0])) { result = fn_args[0] ? fn_args[0] : ray_error("type", NULL); fn_args[0] = NULL; ray_release(fn_args[1]); fn_args[1] = NULL; break; }
+                    if (!fn_args[0] || RAY_IS_ERR(fn_args[0])) { result = fn_args[0] ? fn_args[0] : ray_error("type", "call: a lazy argument answered no value"); fn_args[0] = NULL; ray_release(fn_args[1]); fn_args[1] = NULL; break; }
                 }
                 if (fn_args[1] && ray_is_lazy(fn_args[1])) {
                     fn_args[1] = ray_lazy_materialize(fn_args[1]); /* consumes owned ref */
-                    if (!fn_args[1] || RAY_IS_ERR(fn_args[1])) { result = fn_args[1] ? fn_args[1] : ray_error("type", NULL); ray_release(fn_args[0]); fn_args[0] = NULL; fn_args[1] = NULL; break; }
+                    if (!fn_args[1] || RAY_IS_ERR(fn_args[1])) { result = fn_args[1] ? fn_args[1] : ray_error("type", "call: a lazy argument answered no value"); ray_release(fn_args[0]); fn_args[0] = NULL; fn_args[1] = NULL; break; }
                 }
             }
             /* The same path as OP_CALL2: the elementwise map for an atomic
@@ -6496,7 +6496,7 @@ op_mkclosure: {
                 ray_release(keys); ray_release(vals); ray_release(flags);
                 lam->type = -RAY_I64; ray_release(lam);
                 ray_release(slots); ray_release(names); ray_release(tmpl);
-                vm_err_obj = v ? v : ray_error("type", NULL);
+                vm_err_obj = v ? v : ray_error("type", "lambda: a captured local answered no value");
                 goto vm_error;
             }
         }
@@ -6545,7 +6545,7 @@ op_loadenvg: {
     if (val) {
         if (ray_is_lazy(val)) {
             val = ray_lazy_materialize(val);
-            if (!val || RAY_IS_ERR(val)) { vm_err_obj = val ? val : ray_error("type", NULL); LOCAL(slot) = NULL; goto vm_error; }
+            if (!val || RAY_IS_ERR(val)) { vm_err_obj = val ? val : ray_error("type", "lambda: a lazy local answered no value"); LOCAL(slot) = NULL; goto vm_error; }
             LOCAL(slot) = val;
         }
         ray_retain(val);
@@ -6574,7 +6574,7 @@ op_force: {
     uint8_t v_rows = POPPED_ROWS();
     if (v && ray_is_lazy(v)) {
         v = ray_lazy_materialize(v);   /* consumes; concrete or error */
-        if (!v || RAY_IS_ERR(v)) { vm_err_obj = v ? v : ray_error("type", NULL); goto vm_error; }
+        if (!v || RAY_IS_ERR(v)) { vm_err_obj = v ? v : ray_error("type", "lambda: a lazy local answered no value"); goto vm_error; }
     }
     PUSHR(v, v_rows);
     DISPATCH();
@@ -6759,7 +6759,7 @@ vm_error_cleanup: {
         return vm_err_obj;
     if (vm_err_detail)
         return ray_error(vm_err_str, "%s", vm_err_detail);
-    return ray_error(vm_err_str, NULL);
+    return ray_error(vm_err_str, "lambda: %s error in compiled code", vm_err_str);
 }
 
 #undef DISPATCH
@@ -7740,19 +7740,19 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
             if (n == 3 && fn2) {
                 ray_t* left = ray_eval(elems[1]);
                 int8_t left_rows = g_eval_rows;
-                if (!left || RAY_IS_ERR(left)) { ray_release(head); ret = left ? left : ray_error("type", NULL); goto out; }
+                if (!left || RAY_IS_ERR(left)) { ray_release(head); ret = left ? left : ray_error("type", "call: an argument answered no value"); goto out; }
                 ray_t* right = ray_eval(elems[2]);
                 int8_t right_rows = g_eval_rows;
                 rows = rowwise ? rows_join(left_rows, right_rows) : 0;
                 ray_release(head);
-                if (!right || RAY_IS_ERR(right)) { ray_release(left); ret = right ? right : ray_error("type", NULL); goto out; }
+                if (!right || RAY_IS_ERR(right)) { ray_release(left); ret = right ? right : ray_error("type", "call: an argument answered no value"); goto out; }
                 if (ray_is_lazy(left)) {
                     left = ray_lazy_materialize(left);
-                    if (!left || RAY_IS_ERR(left)) { ray_release(right); ret = left ? left : ray_error("type", NULL); goto out; }
+                    if (!left || RAY_IS_ERR(left)) { ray_release(right); ret = left ? left : ray_error("type", "call: a lazy argument answered no value"); goto out; }
                 }
                 if (ray_is_lazy(right)) {
                     right = ray_lazy_materialize(right);
-                    if (!right || RAY_IS_ERR(right)) { ray_release(left); ret = right ? right : ray_error("type", NULL); goto out; }
+                    if (!right || RAY_IS_ERR(right)) { ray_release(left); ret = right ? right : ray_error("type", "call: a lazy argument answered no value"); goto out; }
                 }
                 ret = (is_collection(left) || is_collection(right))
                     ? minmax_map(fn2, left, right) : fn2(left, right);
@@ -7772,7 +7772,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                 ray_t* fast = ray_try_count_select_expr(elems[1], &handled);
                 if (handled) {
                     ray_release(head);
-                    ret = fast ? fast : ray_error("type", NULL);
+                    ret = fast ? fast : ray_error("type", "call: the fused form answered no value");
                     rows = 0; goto out;
                 }
             }
@@ -7799,7 +7799,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
              * consumes it — no extra ray_release needed after the call. */
             if (!(fn_attrs & RAY_FN_LAZY_AWARE) && arg && ray_is_lazy(arg)) {
                 arg = ray_lazy_materialize(arg); /* consumes owned ref */
-                if (!arg || RAY_IS_ERR(arg)) { ret = arg ? arg : ray_error("type", NULL); goto out; }
+                if (!arg || RAY_IS_ERR(arg)) { ret = arg ? arg : ray_error("type", "call: a lazy argument answered no value"); goto out; }
             }
             ray_t* result;
             RAY_ASSERT_VALUE(arg);
@@ -7822,7 +7822,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
             if (RAY_IS_NULL(arg)) {
                 /* Only nil?/type/ser safely handle null */
                 result = (fn == (ray_unary_fn)ray_nil_fn || fn == (ray_unary_fn)ray_type_fn ||
-                          fn == (ray_unary_fn)ray_ser_fn) ? fn(arg) : ray_error("type", NULL);
+                          fn == (ray_unary_fn)ray_ser_fn) ? fn(arg) : ray_error("type", "%s: the generic null is not an argument; only nil?, type and ser take it", nm);
             } else if ((fn_attrs & RAY_FN_ATOMIC) && is_collection(arg))
                 result = atomic_map_unary(fn, arg);
             else
@@ -7921,14 +7921,14 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                     left = ray_lazy_materialize(left); /* consumes owned ref */
                     if (!left || RAY_IS_ERR(left)) {
                         ray_release(head); if (right) ray_release(right);
-                        ret = left ? left : ray_error("type", NULL); goto out;
+                        ret = left ? left : ray_error("type", "call: an argument answered no value"); goto out;
                     }
                 }
                 if (right && ray_is_lazy(right)) {
                     right = ray_lazy_materialize(right); /* consumes owned ref */
                     if (!right || RAY_IS_ERR(right)) {
                         ray_release(head); if (left) ray_release(left);
-                        ret = right ? right : ray_error("type", NULL); goto out;
+                        ret = right ? right : ray_error("type", "call: an argument answered no value"); goto out;
                     }
                 }
             }
@@ -8022,7 +8022,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
             ray_t* stack_args[64];
             ray_t** args = stack_args;
             if (argc > 64) {
-                if ((uint64_t)argc > SIZE_MAX / sizeof(ray_t*)) { ray_release(head); ret = ray_error("limit", NULL); goto out; }
+                if ((uint64_t)argc > SIZE_MAX / sizeof(ray_t*)) { ray_release(head); ret = ray_error("limit", "call: %lld arguments overflow the argument array", (long long)argc); goto out; }
                 args = ray_alloc_raw((size_t)argc * sizeof(ray_t*));
                 if (!args) { ray_release(head); ret = ray_error("oom", NULL); goto out; }
             }
@@ -8043,7 +8043,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                 any_rows = rows_join(any_rows, g_eval_rows);
                 if (i < 64) argv_rows[i] = vrows_from(g_eval_rows);
                 if (!args[i] || RAY_IS_ERR(args[i])) {
-                    ray_t* err = (!args[i]) ? ray_error("type", NULL) : args[i];
+                    ray_t* err = (!args[i]) ? ray_error("type", "call: an argument answered no value") : args[i];
                     for (int64_t j = 0; j < i; j++) ray_release(args[j]);
                     if (args != stack_args) ray_free_raw(args);
                     ray_release(head);
@@ -8078,7 +8078,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                 args[i] = ray_eval(elems[i + 1]);
                 arg_rows[i] = g_eval_rows;
                 if (!args[i] || RAY_IS_ERR(args[i])) {
-                    ray_t* err = (!args[i]) ? ray_error("type", NULL) : args[i];
+                    ray_t* err = (!args[i]) ? ray_error("type", "call: an argument answered no value") : args[i];
                     for (int64_t j = 0; j < i; j++) ray_release(args[j]);
                     ray_release(head);
                     ret = err; goto out;

@@ -737,13 +737,13 @@ ray_t* ray_vec_concat(ray_t* a, ray_t* b) {
         for (int64_t i = 0; i < a->len; i++) {
             if (ray_vec_is_null((ray_t*)a, i)) {
                 ray_err_t err = ray_vec_set_null_checked(result, i, true);
-                if (err != RAY_OK) { ray_release(result); return ray_error(ray_err_code_str(err), NULL); }
+                if (err != RAY_OK) { ray_release(result); return ray_error(ray_err_code_str(err), "concat: cannot mark a null (%s)", ray_err_code_str(err)); }
             }
         }
         for (int64_t i = 0; i < b->len; i++) {
             if (ray_vec_is_null((ray_t*)b, i)) {
                 ray_err_t err = ray_vec_set_null_checked(result, a->len + i, true);
-                if (err != RAY_OK) { ray_release(result); return ray_error(ray_err_code_str(err), NULL); }
+                if (err != RAY_OK) { ray_release(result); return ray_error(ray_err_code_str(err), "concat: cannot mark a null (%s)", ray_err_code_str(err)); }
             }
         }
     }

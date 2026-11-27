@@ -50,6 +50,10 @@ static int64_t ser_size(ray_t* obj);   /* the size pass, below */
 #include "lang/eval.h"
 #include "lang/format.h"
 #include <string.h>
+#include <errno.h>
+#include "core/errpath.h"
+/* a path as messages show it: a long one by its tail (#1886) */
+#define EPATH(p) ray_err_path((p), (char[RAY_ERR_PATH_MAX + 1]){0})
 #include <stdio.h>
 
 /* --------------------------------------------------------------------------
@@ -2018,7 +2022,7 @@ ray_err_t ray_obj_save_ex(ray_t* obj, const char* path, ray_t** err) {
 
 ray_t* ray_obj_load(const char* path) {
     FILE* f = fopen(path, "rb");
-    if (!f) return ray_error("io", NULL);
+    if (!f) { int e = errno; return ray_error("io", "load \"%s\": %s", EPATH(path), strerror(e)); }
 
     /* Check fseek/ftell return values — silent failures here let a
      * truncated read through as "valid empty file" or worse. */

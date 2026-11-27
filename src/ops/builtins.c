@@ -1964,7 +1964,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
     /* Nullable targets preserve nulls; BOOL/U8 produce ordinary values. */
     if (ray_is_atom(val) && RAY_ATOM_IS_NULL(val)) {
         ray_t* s2 = ray_sym_str(type_sym->i64);
-        if (!s2) return ray_error("domain", NULL);
+        if (!s2) return ray_error("domain", "as: the target type symbol has no text");
         const char* tn = ray_str_ptr(s2);
         size_t tl = ray_str_len(s2);
         int8_t tt = 0;
@@ -1998,7 +1998,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         return ray_error("domain", "as: unknown target type name");
     }
     ray_t* s = ray_sym_str(type_sym->i64);
-    if (!s) return ray_error("domain", NULL);
+    if (!s) return ray_error("domain", "as: the target type symbol has no text");
     const char* tname = ray_str_ptr(s);
     size_t tlen = ray_str_len(s);
 

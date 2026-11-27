@@ -2124,7 +2124,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     }
 
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "pivot: the plan node has no extension");
 
     uint32_t n_idx  = ext->pivot.n_index;
     uint16_t agg_op = ext->pivot.agg_op;

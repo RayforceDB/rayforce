@@ -252,7 +252,7 @@ static bool rr_member_accept(int64_t node_id, void* ctx) {
 
 ray_t* exec_ann_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "ann rerank: the plan node has no extension");
     if (!src) return ray_error("type", "ann rerank: expects a table source, got null");
     if (src->type != RAY_TABLE) return ray_error("type", "ann rerank: expects a table source, got %s", ray_type_name(src->type));
 
@@ -261,7 +261,7 @@ ray_t* exec_ann_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     int32_t      dim   = ext->rerank.dim;
     int64_t      k     = ext->rerank.k;
     int32_t      ef    = ext->rerank.ef_search;
-    if (!idx || !query || dim <= 0 || k <= 0) return ray_error("schema", NULL);
+    if (!idx || !query || dim <= 0 || k <= 0) return ray_error("schema", "ann rerank: no index, query, dimension or k");
     if (dim != idx->dim) return ray_error("length", "ann rerank: query dim must match index dim %lld, got %lld", (long long)idx->dim, (long long)dim);
 
     int64_t src_rows = ray_table_nrows(src);
@@ -351,7 +351,7 @@ static int rr_found_cmp(const void* a, const void* b) {
 
 ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "knn rerank: the plan node has no extension");
     if (!src) return ray_error("type", "knn rerank: expects a table source, got null");
     if (src->type != RAY_TABLE) return ray_error("type", "knn rerank: expects a table source, got %s", ray_type_name(src->type));
 
@@ -359,7 +359,7 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     const float* query   = ext->rerank.query_vec;
     int32_t      dim     = ext->rerank.dim;
     int64_t      k       = ext->rerank.k;
-    if (col_sym <= 0 || !query || dim <= 0 || k <= 0) return ray_error("schema", NULL);
+    if (col_sym <= 0 || !query || dim <= 0 || k <= 0) return ray_error("schema", "knn rerank: no column, query, dimension or k");
 
     /* Special-case empty source: return a well-shaped empty result rather
      * than falling into the top-K code with k_eff=0. */
@@ -376,7 +376,7 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
      * doesn't correctly materialise RAY_LIST columns. */
     ray_t* col = ray_table_col(src, col_sym);
     if (col && RAY_IS_ERR(col)) return col;
-    if (!col) return ray_error("name", NULL);
+    if (!col) return ray_error("name", "knn rerank: the table has no column '%.*s'", (int)(ray_sym_str(col_sym) ? ray_str_len(ray_sym_str(col_sym)) : 1), ray_sym_str(col_sym) ? ray_str_ptr(ray_sym_str(col_sym)) : "?");
     /* a list of vectors, or the same in every partition of a parted table */
     const bool parted = RAY_IS_PARTED(col->type) && RAY_PARTED_BASETYPE(col->type) == RAY_LIST;
     if (col->type != RAY_LIST && !parted)

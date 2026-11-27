@@ -547,7 +547,7 @@ static ray_t* logic_map_c(ray_binary_fn fn, const char* name, ray_t* a, ray_t* b
         ray_t* ea = ac ? collection_elem(a, i, &la) : a;
         ray_t* eb = bc ? collection_elem(b, i, &lb) : b;
         ray_t* r = (RAY_IS_ERR(ea) || RAY_IS_ERR(eb))
-                 ? ray_error("type", NULL) : fn(ea, eb);
+                 ? ray_error("type", "logic: a cell could not be read") : fn(ea, eb);
         if (la) ray_release(ea);
         if (lb) ray_release(eb);
         if (!r || RAY_IS_ERR(r)) { ray_release(out); return r ? r : ray_error("oom", NULL); }

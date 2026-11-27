@@ -63,6 +63,9 @@ void* ray_runtime_get_sys_args(void);
 #include <time.h>
 #include <ctype.h>
 #include <errno.h>
+#include "core/errpath.h"
+/* a path as messages show it: a long one by its tail (#1886) */
+#define EPATH(p) ray_err_path((p), (char[RAY_ERR_PATH_MAX + 1]){0})
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -268,7 +271,11 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
         const char* why = ray_col_limit_msg();
         if (why) return ray_error("limit", "%s", why);
     }
-    if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
+    /* the save answers a code only, and its cleanup makes calls after the
+     * failing one: the reason is what the code says, never errno (#1886) */
+    if (err != RAY_OK)
+        return ray_error(ray_err_code_str(err), ".db.splayed.set \"%s\": the save failed (%s)",
+                         EPATH(dir), ray_err_code_str(err));
 
     ray_retain(tbl);
     return tbl;
@@ -371,7 +378,7 @@ ray_t* ray_get_parted_fn(ray_t** args, int64_t n) {
     if (!args[1] || args[1]->type != -RAY_SYM)
         return ray_error("type", ".db.parted.get expects a sym table name, got %s", ray_type_name(args[1]->type));
     ray_t* name_atom = ray_sym_str(args[1]->i64);
-    if (!name_atom) return ray_error("name", NULL);
+    if (!name_atom) return ray_error("name", ".db.parted.get: the table name symbol has no text");
 
     char name[256];
     size_t nlen = ray_str_len(name_atom);

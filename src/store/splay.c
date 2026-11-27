@@ -48,6 +48,9 @@
 #include <inttypes.h>
 #include <dirent.h>
 #include <errno.h>
+#include "core/errpath.h"
+/* a path as messages show it: a long one by its tail (#1886) */
+#define EPATH(p) ray_err_path((p), (char[RAY_ERR_PATH_MAX + 1]){0})
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
@@ -1633,11 +1636,27 @@ static ray_err_t splay_copy_link(const char* from, const char* to, const char* n
 
 static ray_t* splay_append_err(ray_splay_write_t* write, ray_err_t code, ray_t* err) {
     ray_splay_write_finish(write, code, false);
-    return err ? err : ray_error(ray_err_code_str(code), NULL);
+    return err ? err : ray_error(ray_err_code_str(code), "splayed append: the write failed (%s)", ray_err_code_str(code));
 }
 
 static ray_t* splay_append_slots(ray_t* tbl, ray_t* old, const char* cur, const char* dir,
                                  bool durable, ray_t** out, bool* sym_col);
+/* The reason of a column loader's error, without its own "column <path>: "
+ * or "column file: " lead: the loader of a table names the directory and
+ * the column already, and a path given twice could push the reason out of
+ * the 255-byte message (#1886). */
+static const char* splay_col_reason(const char* m) {
+    if (strncmp(m, "column file: ", 13) == 0) return m + 13;
+    if (strncmp(m, "column \"", 8) == 0) {
+        const char* e = strstr(m + 8, "\": ");
+        if (e) return e + 3;
+    } else if (strncmp(m, "column ", 7) == 0) {
+        const char* e = strstr(m + 7, ": ");
+        if (e) return e + 2;
+    }
+    return m;
+}
+
 static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
                                   bool use_mmap, bool col_syms);
 
@@ -1651,18 +1670,18 @@ ray_t* ray_splay_append(ray_t* tbl, const char* dir, const char* sym_path, bool 
         if (col && RAY_IS_ERR(col)) {   /* a failed decode: its code, message left in the slot */
             ray_err_t derr = ray_err_from_obj(col);
             ray_error_free(col);
-            return ray_error(ray_err_code_str(derr), NULL);
+            return ray_error(ray_err_code_str(derr), "splayed append \"%s\": a column could not be read (%s)", EPATH(dir), ray_err_code_str(derr));
         }
         if (splay_slot_parted(col))
             return ray_error("nyi", ".db.splayed.append: a parted table; write it with "
                              ".db.splayed.set, or append its partitions one at a time");
     }
     ray_err_t err = splay_validate_persisted_names(tbl);
-    if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
+    if (err != RAY_OK) return ray_error(ray_err_code_str(err), "splayed append \"%s\": a column name cannot be stored (%s)", EPATH(dir), ray_err_code_str(err));
 
     ray_splay_write_t write;
     err = ray_splay_write_begin_mode(dir, RAY_COMPRESS_ABSENT, &write);
-    if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
+    if (err != RAY_OK) return ray_error(ray_err_code_str(err), "splayed append \"%s\": cannot start the write (%s)", EPATH(dir), ray_err_code_str(err));
     write.no_auto_index = index == RAY_INDEX_OFF;
     write.keep_dict = index == RAY_INDEX_ON;
     if (!write.staged) {
@@ -1673,7 +1692,7 @@ ray_t* ray_splay_append(ray_t* tbl, const char* dir, const char* sym_path, bool 
             const char* why = ray_col_limit_msg();
             if (why) return ray_error("limit", "%s", why);
         }
-        return err == RAY_OK ? NULL : ray_error(ray_err_code_str(err), NULL);
+        return err == RAY_OK ? NULL : ray_error(ray_err_code_str(err), "splayed append \"%s\": the write failed (%s)", EPATH(dir), ray_err_code_str(err));
     }
     if (write.cur_err != RAY_OK) return splay_append_err(&write, write.cur_err, NULL);
 
@@ -1735,7 +1754,7 @@ ray_t* ray_splay_append(ray_t* tbl, const char* dir, const char* sym_path, bool 
         const char* why = ray_col_limit_msg();
         if (why) return ray_error("limit", "%s", why);
     }
-    return err == RAY_OK ? NULL : ray_error(ray_err_code_str(err), NULL);
+    return err == RAY_OK ? NULL : ray_error(ray_err_code_str(err), "splayed append \"%s\": the write failed (%s)", EPATH(dir), ray_err_code_str(err));
 }
 
 /* The table to write: each of `old`'s columns, in its order, as a
@@ -1758,7 +1777,7 @@ static ray_t* splay_append_slots(ray_t* tbl, ray_t* old, const char* cur, const 
     for (int64_t c = 0; c < on; c++) {
         int64_t name_id = ray_table_col_name(old, c);
         ray_t* na = ray_sym_str(name_id);
-        if (!na) { ray_release(comb); return ray_error("corrupt", NULL); }
+        if (!na) { ray_release(comb); return ray_error("corrupt", "splayed append: column %lld has no name", (long long)c); }
         int64_t j = 0;
         while (j < nn && ray_table_col_name(tbl, j) != name_id) j++;
         if (j == nn) {
@@ -1788,7 +1807,7 @@ static ray_t* splay_append_slots(ray_t* tbl, ray_t* old, const char* cur, const 
             own |= has; shared |= !has;
         }
         ray_err_t lerr = splay_copy_link(cur, dir, ray_str_ptr(na), ray_str_len(na), durable);
-        if (lerr != RAY_OK) { ray_release(comb); return ray_error(ray_err_code_str(lerr), NULL); }
+        if (lerr != RAY_OK) { ray_release(comb); return ray_error(ray_err_code_str(lerr), "splayed append \"%s\": cannot link column '%.*s' (%s)", EPATH(dir), (int)ray_str_len(na), ray_str_ptr(na), ray_err_code_str(lerr)); }
         ray_t* w = ray_alloc(2 * sizeof(ray_t*));
         if (!w || RAY_IS_ERR(w)) { ray_release(comb); return w ? w : ray_error("oom", NULL); }
         w->type = (int8_t)(RAY_PARTED_BASE + ot);
@@ -1849,7 +1868,7 @@ static void splay_resolve_orders(ray_t* tbl) {
 
 static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
                                   bool use_mmap, bool col_syms) {
-    if (!dir) return ray_error("io", NULL);
+    if (!dir) return ray_error("io", "splayed load: no directory");
     bool trace = ray_env_flag("RAY_CSV_TRACE");
     if (trace)
         fprintf(stderr, "splayed.get: dir=%s mmap=%d\n", dir, use_mmap ? 1 : 0);
@@ -1864,13 +1883,18 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
         if (trace)
             fprintf(stderr, "splayed.get: schema load failed path=%s err=%s\n",
                     path, schema && RAY_IS_ERR(schema) ? ray_err_code(schema) : "io");
-        /* .d failures from ray_col_load are bare (code, no message) —
-         * name the directory so a missing/corrupt table is locatable. */
+        /* the directory, then the loader's own reason (#1886) */
         char codebuf[8];
         const char* code = schema && RAY_IS_ERR(schema) ? ray_err_code(schema) : "io";
         snprintf(codebuf, sizeof(codebuf), "%s", code);
+        char why[256];
+        const char* sm = schema && RAY_IS_ERR(schema) ? ray_err_msg(schema) : NULL;
+        snprintf(why, sizeof why, "%s", sm ? splay_col_reason(sm) : "");
         ray_error_free(schema);
-        return ray_error(codebuf, "splayed %s: cannot read .d schema", dir);
+        char dbuf[RAY_ERR_PATH_MAX + 1];
+        return why[0]
+            ? ray_error(codebuf, "splayed %s: cannot read .d schema: %s", ray_err_path_n(dir, dbuf, 72), why)
+            : ray_error(codebuf, "splayed %s: cannot read .d schema", ray_err_path(dir, dbuf));
     }
 
     if (schema->type != RAY_STR) {
@@ -1981,17 +2005,22 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
                         path, col && RAY_IS_ERR(col) ? ray_err_code(col) : "io");
             ray_release(schema);
             ray_release(tbl);
-            /* Rich loader errors (the loud "sym", domain bounds, …) name
-             * the path already and propagate verbatim; only a bare code
-             * (e.g. plain "io" from a missing column file) gains the
-             * dir + column context here. */
-            if (col && ray_err_msg(col) != NULL) return col;
+            /* The table and the column, then the loader's own reason:
+             * the reader of a column file knows what is wrong but not
+             * which file it reads (#1886).  The code is the loader's. */
             char codebuf[8];
             snprintf(codebuf, sizeof(codebuf), "%s",
                      col && RAY_IS_ERR(col) ? ray_err_code(col) : "io");
+            char why[256];
+            const char* cm = col && RAY_IS_ERR(col) ? ray_err_msg(col) : NULL;
+            snprintf(why, sizeof why, "%s", cm ? splay_col_reason(cm) : "");
             ray_error_free(col);
-            return ray_error(codebuf, "splayed %s: column '%.*s' failed to load",
-                             dir, (int)name_len, name);
+            char dbuf[RAY_ERR_PATH_MAX + 1];
+            return why[0]
+                ? ray_error(codebuf, "splayed %s: column '%.*s' failed to load: %s",
+                            ray_err_path_n(dir, dbuf, 72), (int)name_len, name, why)
+                : ray_error(codebuf, "splayed %s: column '%.*s' failed to load",
+                            ray_err_path(dir, dbuf), (int)name_len, name);
         }
 
         ray_t* new_df = ray_table_add_col(tbl, name_id, col);
