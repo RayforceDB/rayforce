@@ -324,7 +324,7 @@ static int agg_numeric_flat_type(int8_t t) {
            t == RAY_I32 || t == RAY_I64 || t == RAY_F32 || t == RAY_F64;
 }
 
-static int agg_read_vec_f64(ray_t* v, int64_t i, double* out) {
+static inline __attribute__((always_inline)) int agg_read_vec_f64(ray_t* v, int64_t i, double* out) {
     void* d = ray_data(v);
     switch (v->type) {
     case RAY_F64: *out = ((double*)d)[i]; return 1;
@@ -335,6 +335,17 @@ static int agg_read_vec_f64(ray_t* v, int64_t i, double* out) {
     case RAY_U8:
     case RAY_BOOL: *out = (double)((uint8_t*)d)[i]; return 1;
     default: return 0;
+    }
+}
+
+/* An integer element (agg_numeric_flat_type's integer types). */
+static inline __attribute__((always_inline)) int64_t agg_read_vec_i64(ray_t* v, int64_t i) {
+    const void* d = ray_data(v);
+    switch (v->type) {
+    case RAY_I64: return ((const int64_t*)d)[i];
+    case RAY_I32: return ((const int32_t*)d)[i];
+    case RAY_I16: return ((const int16_t*)d)[i];
+    default:      return ((const uint8_t*)d)[i];   /* U8, BOOL */
     }
 }
 
@@ -447,17 +458,76 @@ static ray_t* agg_pair_vec(ray_t* x, ray_t* y, uint16_t op) {
     bool yn = ray_vec_may_have_nulls(y);
     int64_t cnt = 0;
     double sx = 0.0, sy = 0.0, sxx = 0.0, syy = 0.0, sxy = 0.0;
-    for (int64_t i = 0; i < x->len; i++) {
-        if ((i & 65535) == 0 && ray_interrupted())
-            return ray_error("cancel", "interrupted");
-        if ((xn && ray_vec_is_null(x, i)) || (yn && ray_vec_is_null(y, i)))
-            continue;
-        double xv = 0.0, yv = 0.0;
-        agg_read_vec_f64(x, i, &xv);
-        agg_read_vec_f64(y, i, &yv);
-        sx += xv; sy += yv; sxx += xv * xv; syy += yv * yv;
-        sxy += xv * yv;
-        cnt++;
+    /* cov and scov sum about a pivot that follows the running mean (#1847):
+     * the raw sums of large values close together cancel to noise of their
+     * size.  pearson_corr, wsum and wavg read the raw sums. */
+    bool shifted = agg_is_cov_agg(op);
+    if (shifted) {
+        /* About the first non-null pair, moved to the running mean at the
+         * due counts as every accumulator moves it (ray_comom_repivot): an
+         * integer side's differences taken in integers, per side. */
+        unsigned im = ray_comom_im(x->type, y->type);
+        bool imx = (im & RAY_COMOM_IMX) != 0, imy = (im & RAY_COMOM_IMY) != 0;
+        bool tight = x->type == y->type && !xn && !yn &&
+                     (x->type == RAY_F64 || x->type == RAY_F32 || x->type == RAY_I64);
+        double pivx = 0.0, pivy = 0.0;
+        int64_t i0 = 0;
+        while (i0 < x->len && ((xn && ray_vec_is_null(x, i0)) || (yn && ray_vec_is_null(y, i0)))) i0++;
+        if (i0 < x->len) {
+            if (imx) pivx = ray_comom_pivot_i(agg_read_vec_i64(x, i0));
+            else agg_read_vec_f64(x, i0, &pivx);
+            if (imy) pivy = ray_comom_pivot_i(agg_read_vec_i64(y, i0));
+            else agg_read_vec_f64(y, i0, &pivy);
+        }
+        #define COMOM_LOOP(T, D) do {                                            \
+            const T* xd = (const T*)ray_data(x);                                     \
+            const T* yd = (const T*)ray_data(y);                                     \
+            for (int64_t lo = 0; lo < x->len; lo += 65536) {                         \
+                if (ray_interrupted()) return ray_error("cancel", "interrupted");    \
+                int64_t hi = lo + 65536 < x->len ? lo + 65536 : x->len;              \
+                for (int64_t i = lo; i < hi; i++) {                                  \
+                    ray_comom_add(D(xd[i], pivx), D(yd[i], pivy), &sx, &sy, &sxy);             \
+                    if (RAY_UNLIKELY(ray_comom_due(i + 1)))                          \
+                        ray_comom_repivot_cold(im, (double)(i + 1), &pivx, &pivy,        \
+                                               &sx, &sy, &sxy);                        \
+                }                                                                    \
+            }                                                                        \
+            cnt = x->len;                                                            \
+        } while (0)
+        #define D_F(v, k) ((double)(v) - (k))
+        if (tight && x->type == RAY_F64) COMOM_LOOP(double, D_F);
+        else if (tight && x->type == RAY_F32) COMOM_LOOP(float, D_F);
+        else if (tight) COMOM_LOOP(int64_t, ray_comom_d_i);
+        else
+            for (int64_t i = 0; i < x->len; i++) {
+                if ((i & 65535) == 0 && ray_interrupted())
+                    return ray_error("cancel", "interrupted");
+                if ((xn && ray_vec_is_null(x, i)) || (yn && ray_vec_is_null(y, i)))
+                    continue;
+                double dx, dy, cx = 0.0, cy = 0.0;
+                if (imx) dx = ray_comom_d_i(agg_read_vec_i64(x, i), pivx);
+                else { agg_read_vec_f64(x, i, &cx); dx = cx - pivx; }
+                if (imy) dy = ray_comom_d_i(agg_read_vec_i64(y, i), pivy);
+                else { agg_read_vec_f64(y, i, &cy); dy = cy - pivy; }
+                ray_comom_add(dx, dy, &sx, &sy, &sxy);
+                if (RAY_UNLIKELY(ray_comom_due(++cnt)))
+                    ray_comom_repivot_cold(im, (double)cnt, &pivx, &pivy, &sx, &sy, &sxy);
+            }
+        #undef D_F
+        #undef COMOM_LOOP
+    } else {
+        for (int64_t i = 0; i < x->len; i++) {
+            if ((i & 65535) == 0 && ray_interrupted())
+                return ray_error("cancel", "interrupted");
+            if ((xn && ray_vec_is_null(x, i)) || (yn && ray_vec_is_null(y, i)))
+                continue;
+            double xv = 0.0, yv = 0.0;
+            agg_read_vec_f64(x, i, &xv);
+            agg_read_vec_f64(y, i, &yv);
+            sx += xv; sy += yv; sxx += xv * xv; syy += yv * yv;
+            sxy += xv * yv;
+            cnt++;
+        }
     }
 
     if (op == OP_WSUM) return ray_f64(ray_f64_fin(sxy));
@@ -468,12 +538,12 @@ static ray_t* agg_pair_vec(ray_t* x, ray_t* y, uint16_t op) {
     if (op == OP_COV) {
         if (cnt <= 0) return ray_typed_null(-RAY_F64);
         double dn = (double)cnt;
-        return ray_f64(ray_f64_fin((sxy - sx * sy / dn) / dn));
+        return ray_f64(ray_f64_fin((sxy - ray_comom_corr(sx, sy, dn)) / dn));
     }
     if (op == OP_SCOV) {
         if (cnt <= 1) return ray_typed_null(-RAY_F64);
         double dn = (double)cnt;
-        return ray_f64(ray_f64_fin((sxy - sx * sy / dn) / (dn - 1.0)));
+        return ray_f64(ray_f64_fin((sxy - ray_comom_corr(sx, sy, dn)) / (dn - 1.0)));
     }
     if (cnt < 2) return ray_typed_null(-RAY_F64);
     double dn = (double)cnt;
