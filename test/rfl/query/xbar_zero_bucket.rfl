@@ -833,7 +833,7 @@
 (at (select {from: T r: (if false (xbar v 0) v)}) 'r) -- [10 11 12 13 14]
 (at (select {from: T r: (if false (xbar v w) v)}) 'r) -- [10 11 12 13 14]
 (at (select {from: T r: (if true v (xbar v 0))}) 'r) -- [10 11 12 13 14]
-(at (select {from: T r: (cond ((> v 100) (xbar v 0)) (else v))}) 'r) -- [10 11 12 13 14]
+(at (select {from: T r: (if (> v 100) (xbar v 0) v)}) 'r) -- [10 11 12 13 14]
 (at (select {from: T r: (if (> w 0) (xbar v w) v)}) 'r) -- [9 11 12 12 12]
 (at (select {from: T r: (if (> (min v v) 100) (xbar v 0) v)}) 'r) -- [10 11 12 13 14]
 (at (select {from: T by: {k: (if (> v 100) (xbar v 0) v)} n: (count v)}) 'k) -- [10 11 12 13 14]
@@ -841,7 +841,7 @@
 (select {from: T r: (if (> v 12) (xbar v 0) v)}) !- domain
 (select {from: T r: (if true (xbar v 0) v)}) !- domain
 (select {from: T r: (if (> v 0) (xbar v w) v)}) !- domain
-(select {from: T r: (cond ((> v 12) (xbar v 0)) (else v))}) !- domain
+(select {from: T r: (if (> v 12) (xbar v 0) v)}) !- domain
 ;; the same over many morsels: one zero bucket on a dropped row in the middle
 (set N 300000)
 (set W (concat (take (+ 1 (% (til N) 5)) 150000) (concat [0] (take (+ 1 (% (til N) 5)) (- N 150001)))))

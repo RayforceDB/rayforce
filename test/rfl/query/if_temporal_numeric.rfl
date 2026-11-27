@@ -237,12 +237,12 @@
 (select {from: T r: (if (> g 0) s x) by: k}) !- type
 (update {from: T r: (if (> g 0) x s)}) !- type
 
-;; ── computed arms, atom condition, nesting, cond, a call around the if ──
+;; ── computed arms, atom condition, nesting, a call around the if ──
 (select {from: T r: (if (> g 0) (+ d 1) i)}) !- type
 (select {from: T r: (if (> g 0) e (+ p 1))}) !- type
 (select {from: T r: (if true d e)}) !- type
 (select {from: T r: (if (> g 0) (if (> e 15) d d) e)}) !- type
-(select {from: T r: (cond ((> g 0) d) (else e))}) !- type
+(select {from: T r: (if (> g 0) d e)}) !- type
 (select {from: T r: (+ 1 (if (> g 0) s e))}) !- type
 ;; keyless and per-group aggregates, a by: key, a where: predicate
 (select {from: T r: (max (if (> g 0) d i))}) !- type

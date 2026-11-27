@@ -208,10 +208,10 @@
 (R (select {from: T r: (if (> g 0) 0Np s)})) -- [0D01:00:00.000000000 0Nn 0Nn]
 (R (update {from: T r: (if (> g 0) 0N s) where: (> i 15)})) -- [0Nn 0Nn 0Nn]
 
-;; ── chains, nesting, cond, and other places an `if` sits ───────────────────
+;; ── chains, nesting, and other places an `if` sits ─────────────────────────
 (select {from: T r: (if (> g 1) d (> g 0) d p)}) !- type
 (select {from: T r: (if (> g 0) (if (> i 0) d d) p)}) !- type
-(select {from: T r: (cond ((> g 0) d) (else p))}) !- type
+(select {from: T r: (if (> g 0) d p)}) !- type
 (select {from: T r: (if (> g 0) (+ d 1) p)}) !- type
 (select {from: T r: (+ 1 (if (> g 0) d p))}) !- type
 (select {from: T r: (max (if (> g 0) d p))}) !- type
@@ -224,7 +224,7 @@
 (update {from: T d: (if (> g 0) d p)}) !- type
 (try (at (select {from: T r: (if (> g 0) s t)}) 'r) (fn [e] (at e 'msg))) -- "if: branches mix TIMESPAN and TIME"
 (R (select {from: T r: (if (> g 1) d (> g 0) d 0Np)})) -- [0Nd 2024.01.02 2024.01.03]
-(R (select {from: T r: (cond ((> g 0) p) (else p))})) -- [2024.01.01D01:00:00.000000000 2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) p p)})) -- [2024.01.01D01:00:00.000000000 2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
 
 ;; ── a temporal beside a number has no common type either (#1485) ────────────
 (select {from: T r: (if (> g 0) d i)}) !- type

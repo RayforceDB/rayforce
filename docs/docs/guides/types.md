@@ -214,7 +214,7 @@ Rayfall performs automatic type promotion in certain contexts. These coercions h
     - **f32 selection keeps f32:** `min`, `max`, `first`, `last` (also as `select` or `by:` columns), the scans `mins`, `maxs`, `mmin`, `mmax`, and `fill` return f32 for an f32 vector. `sum`, `avg`, `med`, `var`, and `dev` widen to f64.
     - **Query `if` arms:** in a `select` or `update`, the two arms of an `if` give one column. Numeric arms take the promotion table; two arms of one temporal type keep it, and a temporal arm beside a null literal keeps its own type. Two different temporal types (DATE, TIME, TIMESTAMP, TIMESPAN) have no common type: `(if c d ts)` raises `type` rather than mixing day and nanosecond counts. Neither has a temporal arm beside a numeric one: `(if c d i)` raises `type` rather than putting the date's day count among the integers. Convert one arm with `as` first, for example `(if c (as 'I64 d) i)` for the raw count.
     - **bool → 1/0:** Booleans count as 1/0 in arithmetic contexts.
-    - **i64 → bool:** In boolean contexts (if, cond), 0 is false, non-zero is true.
+    - **i64 → bool:** In boolean contexts (if, and, or), 0 is false, non-zero is true.
     - **Narrower → wider:** Comparisons across numeric types promote the narrower operand.
     - **No string coercion:** Strings never implicitly convert to numbers. Use `as` explicitly.
 

@@ -507,7 +507,7 @@ RTTime -- [09:30:00.000 10:00:00.000 11:00:00.000]
 ;; must keep working beside a text branch, in every place an `if` compiles.
 (as 'STR (at (select {k: (if (< x 2) s 0N) from: T2I64Sym}) 'k)) -- ["a" "b" "" "" "" ""]
 (as 'STR (at (select {k: (if (> x 3) 'q 0N) from: T2I64Sym}) 'k)) -- ["" "" "" "" "q" "q"]
-(as 'STR (at (select {k: (cond ((> x 4) s) (else 0N)) from: T2I64Sym}) 'k)) -- ["" "" "" "" "" "f"]
+(as 'STR (at (select {k: (if (> x 4) s 0N) from: T2I64Sym}) 'k)) -- ["" "" "" "" "" "f"]
 (count (select {c: (count x) from: T2I64Sym by: {g: (if (> x 3) s 0N)}})) -- 3
 (count (select {from: T2I64Sym where: (== (if (> x 3) s 0N) 'e)})) -- 1
 (as 'STR (at (update {s: (if (> x 3) s 0N) from: T2I64Sym}) 's)) -- ["" "" "" "" "e" "f"]

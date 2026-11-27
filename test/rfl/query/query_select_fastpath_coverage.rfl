@@ -263,7 +263,7 @@
 (count (select {from: Tdag5 where: (not-in v [3 4 5])})) -- 2
 
 ;; ──────────────────────────────────────────────────────────────────────────────
-;; §13  compile_expr_dag: lambda inline, let, cond, do, xbar, if, substr, replace
+;; §13  compile_expr_dag: lambda inline, let, do, xbar, if, substr, replace
 ;; compile_expr_dag paths: cexpr_env_push/lookup/pop for lambda beta-reduction
 ;; ──────────────────────────────────────────────────────────────────────────────
 
@@ -330,12 +330,12 @@
 (at (at (select {i: (as 'I32 v) from: Tint5}) 'i) 0) -- 1i
 
 ;; ──────────────────────────────────────────────────────────────────────────────
-;; §15  compile_expr_dag: cond expression
+;; §15  compile_expr_dag: nested if expression
 ;; ──────────────────────────────────────────────────────────────────────────────
 
 (set Tcond5 (table [v] (list [1 2 3 4 5])))
 ;; v=[1,2,3,4,5]: 1→100, 2→200, 3→200, 4→300, 5→300 = 1100
-(sum (at (select {r: (cond ((< v 2) 100) ((< v 4) 200) (else 300)) from: Tcond5}) 'r)) -- 1100
+(sum (at (select {r: (if (< v 2) 100 (if (< v 4) 200 300)) from: Tcond5}) 'r)) -- 1100
 
 ;; ──────────────────────────────────────────────────────────────────────────────
 ;; §16  unsorted_positive_take_limit

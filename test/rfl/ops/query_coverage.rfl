@@ -70,10 +70,8 @@
 ;; body with var resolved via cexpr_env_lookup.
 (sum (at (select {x: (let v (* a 3) (+ v 1)) from: TT}) 'x)) -- 175
 
-;; (cond (p1 e1) (p2 e2) ... (else en)) — query.c:784-821.  Builds
-;; a right-fold OP_IF chain.  3-clause cond exercises both the
-;; else-branch and the predicate-branch arms of the loop body.
-(sum (at (select {x: (cond ((> a 7) 100) ((> a 3) 10) (else 1)) from: TT}) 'x)) -- 343
+;; a nested if builds a right-fold OP_IF chain.
+(sum (at (select {x: (if (> a 7) 100 (if (> a 3) 10 1)) from: TT}) 'x)) -- 343
 
 ;; Lambda inlining — query.c:535-578.  An inline `((fn [x] body) arg)`
 ;; inside a select projection β-reduces at compile time.

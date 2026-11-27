@@ -79,8 +79,8 @@ beside a numeric one (BOOL, U8, I16, I32, I64, F32, F64): the temporal arm's
 raw count (days, ms or ns) is not a number of the other arm's kind. The rule
 holds on every route of a query: an arm the planner cannot compile (it is
 evaluated per row or per group), a `where:` predicate, a chain without a
-fallback (a row no condition takes is `0`, an I64) and
-`(cond (p1 e1) ... (else en))`, which is the chain `(if p1 e1 ... en)`:
+fallback (a row no condition takes is `0`, an I64) and a nested `if`,
+`(if p1 e1 (if p2 e2 en))`:
 
 ```lisp
 ‣ (set t (table [g d p] (list [0 1] [2024.01.01 2024.01.02] [2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000])))
@@ -93,7 +93,7 @@ error: type: if: branches mix DATE and I64
 ```
 
 Text arms keep the type of the text. String literals (`(if c "a" "b")`, the
-same chain, or `(cond ((> n 2) "a") (else "b"))`) give a string (`STR`)
+same chain, or a nested `(if (> n 2) "a" (if (> n 1) "b" "c"))`) give a string (`STR`)
 column, as a string literal standing alone in a select does, so the two
 compare. A symbol arm, such as a symbol column or a `'b` literal, makes the
 column symbols (`SYM`). Use string arms when the column is compared with
