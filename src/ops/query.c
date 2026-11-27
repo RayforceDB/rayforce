@@ -18928,6 +18928,17 @@ static bool lit_call_sees_all(ray_t** el, int64_t len) {
  * the literal does not name.  A head computed at run time declines in the
  * walk itself. */
 static bool sym_lit_reads_named_only(int64_t id, ray_t* tbl) {
+    /* A quoted dotted symbol, 'x.y or a ticker such as 'XAMPLE.B, is data:
+     * the evaluator reads no column and no path through it (only a bare
+     * dotted name is a path read, judged in the walk), and under the call
+     * rule nothing resolves it either.  Its first segment is judged as the
+     * bare name is, so one holding a lambda or a container (a dictionary,
+     * a namespace root such as .sys) still declines (#1781). */
+    if (ray_sym_is_dotted(id)) {
+        const int64_t* segs;
+        if (ray_sym_segs(id, &segs) < 1) return false;
+        id = segs[0];
+    }
     ray_t bare = { 0 };
     bare.type = -RAY_SYM;
     bare.i64 = id;
@@ -19141,17 +19152,27 @@ static int64_t count_syms(ray_t* e) {
  * reads the column of its name), the symbol of a (quote x), every element
  * of a SYM vector.  A name that is no column costs nothing in a keep set.
  * count_sym_lits over-counts them for proj_keep_bound. */
+/* Add the symbol literal `s` to out[0..n), and for a dotted one its first
+ * segment as well, so 'col.month keeps col too (#1781). */
+static int sym_lit_add(int64_t* out, int max, int n, int64_t s) {
+    for (int k = 0; k < 2 && n < max; k++) {
+        bool dup = false;
+        for (int q = 0; q < n && !dup; q++) dup = out[q] == s;
+        if (!dup) out[n++] = s;
+        const int64_t* segs;
+        if (!ray_sym_is_dotted(s) || ray_sym_segs(s, &segs) < 1) break;
+        s = segs[0];
+    }
+    return n;
+}
+
 static int collect_sym_lits(ray_t* e, int64_t* out, int max, int n) {
     if (!e || n >= max) return n;
     int64_t one = -1;
     if (e->type == -RAY_SYM && (e->attrs & ATTR_QUOTED)) one = e->i64;
     else if (e->type == RAY_SYM) {
-        for (int64_t i = 0; i < ray_len(e) && n < max; i++) {
-            int64_t s = ray_read_sym(ray_data(e), i, RAY_SYM, e->attrs);
-            bool dup = false;
-            for (int q = 0; q < n && !dup; q++) dup = out[q] == s;
-            if (!dup) out[n++] = s;
-        }
+        for (int64_t i = 0; i < ray_len(e) && n < max; i++)
+            n = sym_lit_add(out, max, n, ray_read_sym(ray_data(e), i, RAY_SYM, e->attrs));
         return n;
     } else if (e->type == RAY_LIST) {
         ray_t** el = (ray_t**)ray_data(e);
@@ -19170,22 +19191,19 @@ static int collect_sym_lits(ray_t* e, int64_t* out, int max, int n) {
             for (int64_t i = 0; i < ray_len(vals) && n < max; i++) n = collect_sym_lits(v[i], out, max, n);
         }
     }
-    if (one >= 0 && n < max) {
-        bool dup = false;
-        for (int q = 0; q < n && !dup; q++) dup = out[q] == one;
-        if (!dup) out[n++] = one;
-    }
+    if (one >= 0) n = sym_lit_add(out, max, n, one);
     return n;
 }
 
+/* Two per name: the name and, for a dotted one, its first segment. */
 static int64_t count_sym_lits(ray_t* e) {
     if (!e) return 0;
-    if (e->type == -RAY_SYM) return (e->attrs & ATTR_QUOTED) ? 1 : 0;
-    if (e->type == RAY_SYM) return ray_len(e);
+    if (e->type == -RAY_SYM) return (e->attrs & ATTR_QUOTED) ? 2 : 0;
+    if (e->type == RAY_SYM) return 2 * ray_len(e);
     int64_t c = 0;
     if (e->type == RAY_LIST) {
         ray_t** el = (ray_t**)ray_data(e);
-        for (int64_t i = 0; i < ray_len(e); i++) c += count_sym_lits(el[i]) + 1;   /* + a (quote x)'s symbol */
+        for (int64_t i = 0; i < ray_len(e); i++) c += count_sym_lits(el[i]) + 2;   /* + a (quote x)'s symbol */
     } else if (e->type == RAY_DICT) {
         ray_t* vals = ray_dict_vals(e);
         if (vals && vals->type == RAY_LIST) {
