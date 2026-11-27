@@ -627,20 +627,19 @@ static void heap_unlock(void* p, size_t size) {
  * and the pages released plainly. */
 static void heap_release_block(ray_heap_t* h, int pidx, ray_t* blk, size_t bsize) {
     if (pidx < 0) {   /* a pool h does not track: its lock unknown */
-        (void)ray_vm_release_block_any(blk, bsize, false);
+        (void)ray_vm_release_block_any(blk, bsize);
         return;
     }
     ray_pool_entry_t* pe = &h->pools[pidx];
-    bool hp = pe->hugepage != 0;
-    if (!pe->locked) { ray_vm_release_block(blk, bsize, hp); return; }
-    int r = ray_vm_release_block_locked(blk, bsize, hp);
+    if (!pe->locked) { ray_vm_release_block(blk, bsize); return; }
+    int r = ray_vm_release_block_locked(blk, bsize);
     if (r == 0) return;
 #if defined(RAY_OS_LINUX)
     atomic_fetch_add_explicit(&g_lock_failed, 1, memory_order_relaxed);
 #endif
     heap_unlock(pe->base, BSIZEOF(pe->pool_order));
     pe->locked = 0;
-    if (r < 0) ray_vm_release_block(blk, bsize, hp);
+    if (r < 0) ray_vm_release_block(blk, bsize);
 }
 
 static void direct_cache_unlock_all(void);
@@ -1154,17 +1153,6 @@ refused:
     if (!mem) return false;
 #endif /* RAY_HEAP_FILE_SPILL */
 
-    /* Enable transparent huge pages on anon pools (Linux).  Self-aligned
-     * 32MB pools are 2MB-aligned, hence THP-eligible.  Never on file-backed
-     * swap mappings.  Env RAY_HEAP_HUGEPAGE=0 disables (THP-jitter-averse
-     * deployments). */
-    uint8_t pool_hugepage = 0;
-    if (swap_fd < 0) {  /* anon pool only */
-        const char* hp = getenv("RAY_HEAP_HUGEPAGE");
-        if (!(hp && hp[0] == '0'))
-            pool_hugepage = ray_vm_hugepage(mem, pool_size) ? 1 : 0;
-    }
-
     /* --- Write pool header at offset 0 --- */
     ray_t* hdr_block = (ray_t*)mem;
     memset(hdr_block, 0, BSIZEOF(RAY_ORDER_MIN));
@@ -1194,7 +1182,6 @@ refused:
         .base       = mem,
         .pool_order = pool_order,
         .backed     = (swap_fd >= 0) ? 1 : 0,
-        .hugepage   = pool_hugepage,
         .swap_fd    = swap_fd,
         .swap_path  = swap_path,  /* NULL when not backed */
     };
@@ -3658,10 +3645,7 @@ void ray_heap_gc(void) {
         /* Pass 4: Reclaim empty pools larger than the standard size.
          * Standard pools (pool_order == RAY_HEAP_POOL_ORDER) are never
          * munmapped — physical pages released via madvise (phase 5)
-         * re-fault cheaply on next query.  (On THP-backed pools, phase 5
-         * only releases the 2MB-aligned interior of a free block, so
-         * sub-2MB free blocks keep their pages resident — the deliberate
-         * no-shatter tradeoff; disable per-deployment with RAY_HEAP_HUGEPAGE=0.)
+         * re-fault cheaply on next query.
          * Only larger pools (pool_order > RAY_HEAP_POOL_ORDER) are
          * candidates: the one-off pool of an oversized block, and the grown
          * pools of a heap past its first 64 (heap_add_pool) — a peak of

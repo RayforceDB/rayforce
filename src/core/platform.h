@@ -236,10 +236,9 @@ bool  ray_vm_resident(const void* ptr, size_t size);
  * queried. */
 size_t ray_vm_resident_end(const void* ptr, size_t size);
 void  ray_vm_release(void* ptr, size_t size);
-/* Release physical pages for a free block.  When hugepage is true, only the
- * 2MB-aligned interior is released so a partial MADV_DONTNEED does not
- * shatter the transparent huge page. */
-void ray_vm_release_block(void* blk, size_t bsize, bool hugepage);
+/* Release the physical pages of a free block, but for its first page, which
+ * holds the free-list links. */
+void ray_vm_release_block(void* blk, size_t bsize);
 void* ray_vm_alloc_aligned(size_t size, size_t alignment);
 /* Hint the kernel to back [ptr, ptr+size) with huge pages.  Returns true
  * if the hint was issued (Linux THP); false where unsupported (macOS, WASM,
@@ -257,10 +256,10 @@ void    ray_vm_unlock(void* ptr, size_t size);
  * release and lock again.  0: released, still locked; 1: released, left
  * unlocked (the lock again failed); -1: nothing released. */
 int     ray_vm_release_locked(void* ptr, size_t size);
-int     ray_vm_release_block_locked(void* blk, size_t bsize, bool hugepage);
+int     ray_vm_release_block_locked(void* blk, size_t bsize);
 /* For a block whose lock is not known: MADV_DONTNEED, and where that is
  * refused for a lock, as ray_vm_release_block_locked.  Same returns. */
-int     ray_vm_release_block_any(void* blk, size_t bsize, bool hugepage);
+int     ray_vm_release_block_any(void* blk, size_t bsize);
 /* Whether this process holds CAP_IPC_LOCK, past RLIMIT_MEMLOCK (Linux). */
 bool    ray_os_has_ipc_lock(void);
 /* Bytes of this process's locked mappings (VmLck); 0 where unknown. */

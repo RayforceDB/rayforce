@@ -587,7 +587,6 @@ typedef struct {
     int      swap_fd;      /* fd when backed=1; -1 otherwise */
     uint8_t  pool_order;   /* pool order for munmap sizing */
     uint8_t  backed;       /* 0 = anon mmap, 1 = file-backed swap */
-    uint8_t  hugepage;     /* 1 = THP hint issued (Linux); 0 otherwise */
     uint8_t  parked    : 1;  /* empty, its blocks off the freelists
                               * (heap_park_empty_pools) */
     uint8_t  discarded : 1;  /* parked spill pool whose pages were discarded
