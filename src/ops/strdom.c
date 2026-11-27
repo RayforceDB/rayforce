@@ -145,11 +145,24 @@ typedef struct {
     ray_enc_vview_t*  vv;       /* the build's view (on the builder's stack) */
     int64_t           vv_at;    /* the segment-local vector vv describes, -1 none */
     bool              vv_codes; /* vv_at is a STR_DICT view (else read by range) */
+    ray_col_src_t*    src;      /* the source, for point reads of a few cells */
+    int64_t*          kept;     /* the selected rows' ids, in row order, else NULL (parts) */
+    int64_t           kept_n;   /* ids written into kept */
+    ray_enc_cellbuf_t cb;       /* a point read's cell (on the builder's stack, else heap) */
 } sd_build_t;
 
+/* A vector holding at most this many of the selected rows has each of
+ * their cells read alone, as a gather does (GATHER_STR_POINT_ROWS,
+ * ops/colgather.c): a decode of the vector expands every one of its
+ * RAY_ENC_VEC strings to reach them. */
+#define SD_STR_POINT_ROWS (RAY_ENC_VEC / 32)
+
 /* Row r's id slot; r moves forward, or back inside a morsel (its
- * unselected rows are zeroed before its selected ones are read). */
-static inline int64_t* sd_slot(sd_build_t* b, int64_t r) {
+ * unselected rows are zeroed before its selected ones are read).  Into
+ * kept (`kept`, a constant of each instance of sd_rows): the next one, as
+ * each selected row is read once, in row order. */
+static inline __attribute__((always_inline)) int64_t* sd_slot(sd_build_t* b, int64_t r, const bool kept) {
+    if (kept) return &b->kept[b->kept_n++];
     while (r < b->part_off[b->p]) b->p--;
     while (r >= b->part_off[b->p + 1]) b->p++;
     return &b->part_dst[b->p][r - b->part_off[b->p]];
@@ -229,7 +242,12 @@ static int sd_view(sd_build_t* b, int64_t v, int64_t vrows, ray_t** err) {
 }
 
 /* Intern rows [lo, hi) (idx NULL) or rows lo + idx[0..n_idx) (ascending). */
-static ray_t* sd_rows(sd_build_t* b, int64_t lo, int64_t hi, const uint16_t* idx, int64_t n_idx) {
+/* One body, two instances (sd_rows_parts, sd_rows_kept): `kept` is a
+ * constant, so the build into parts pays nothing for the kept rows' slots
+ * or their point reads. */
+static inline __attribute__((always_inline)) ray_t* sd_rows_impl(sd_build_t* b, int64_t lo, int64_t hi,
+                                                                 const uint16_t* idx, int64_t n_idx,
+                                                                 const bool kept) {
     int64_t j = 0;
     for (int64_t r = idx ? lo + idx[0] : lo; idx ? j < n_idx : r < hi; ) {
         ray_t* err = b->segv ? sd_seg(b, r) : NULL;
@@ -256,7 +274,7 @@ static ray_t* sd_rows(sd_build_t* b, int64_t lo, int64_t hi, const uint16_t* idx
                     /* the arena may have moved: the last string is this one */
                     b->lid = id; b->ln = n; b->lp = n ? b->d->arena + b->d->ent[id].off : p;   /* "": maybe no arena yet */
                 }
-                *sd_slot(b, r) = id;
+                *sd_slot(b, r, kept) = id;
                 if (idx) { if (++j >= n_idx) return NULL; r = lo + idx[j]; }
                 else if (++r >= hi) return NULL;
             }
@@ -286,11 +304,45 @@ static ray_t* sd_rows(sd_build_t* b, int64_t lo, int64_t hi, const uint16_t* idx
                         /* the arena may have moved: the last string is this one */
                         b->lid = id; b->ln = n; b->lp = n ? b->d->arena + b->d->ent[id].off : p;   /* "": maybe no arena yet */
                     }
-                    *sd_slot(b, r) = id;
+                    *sd_slot(b, r, kept) = id;
                     if (idx) { if (++j >= n_idx) return NULL; r = lo + idx[j]; }
                     else if (++r >= hi) return NULL;
                 }
                 continue;
+            }
+        }
+        /* few selected rows of an encoded vector: each cell read where the
+         * file has it (ray_col_src_str_point), as a gather of those rows
+         * reads them, not the vector decoded to reach them; a declined
+         * cell leaves the vector to the cursor from that row on.  The
+         * kept rows' build only: the build into parts reads as before. */
+        int64_t plo, phi;
+        if (kept && idx && ray_col_src_vec_span(b->src, r, &plo, &phi)) {
+            int64_t k = j + 1;
+            while (k < n_idx && k - j <= SD_STR_POINT_ROWS && lo + idx[k] < phi) k++;
+            if (k - j <= SD_STR_POINT_ROWS) {
+                int64_t q = j;
+                for (; q < k; q++) {
+                    const int64_t row = lo + idx[q];
+                    const char* p; uint32_t n;
+                    const int pr = ray_col_src_str_point(b->src, row, &b->cb, &p, &n, &err);
+                    if (pr < 0) return err;
+                    if (pr == 0) break;
+                    if (!n) p = "";
+                    int64_t id = 0;
+                    if (b->lid >= 0 && n == b->ln && memcmp(p, b->lp, n) == 0) id = b->lid;
+                    else {
+                        err = sd_intern(b->d, p, n, ray_str_bytes_hash(n ? p : NULL, n), &id);
+                        if (err) return err;
+                        /* p lasts until the cell buffer is next used: the arena's copy */
+                        b->lid = id; b->ln = n; b->lp = n ? b->d->arena + b->d->ent[id].off : "";
+                    }
+                    *sd_slot(b, row, kept) = id;
+                }
+                j = q;
+                if (j >= n_idx) return NULL;
+                r = lo + idx[j];
+                if (q == k) continue;
             }
         }
         const ray_col_range_t* v;
@@ -309,7 +361,7 @@ static ray_t* sd_rows(sd_build_t* b, int64_t lo, int64_t hi, const uint16_t* idx
                 if (err) return err;
                 b->lid = id; b->ln = n; b->lp = n ? b->d->arena + b->d->ent[id].off : p;   /* "": maybe no arena yet */
             }
-            *sd_slot(b, r) = id;
+            *sd_slot(b, r, kept) = id;
             if (idx) { if (++j >= n_idx) return NULL; r = lo + idx[j]; }
             else if (++r >= hi) return NULL;
         }
@@ -317,17 +369,33 @@ static ray_t* sd_rows(sd_build_t* b, int64_t lo, int64_t hi, const uint16_t* idx
     return NULL;
 }
 
-ray_t* ray_strdom_build_parts(ray_col_src_t* src, ray_t* sel, int64_t n_parts, const int64_t* part_off,
-                              int64_t* const* part_dst, ray_strdom_t** dom_out) {
+static ray_t* sd_rows_parts(sd_build_t* b, int64_t lo, int64_t hi, const uint16_t* idx, int64_t n_idx) {
+    return sd_rows_impl(b, lo, hi, idx, n_idx, false);
+}
+
+static ray_t* sd_rows_kept(sd_build_t* b, int64_t lo, int64_t hi, const uint16_t* idx, int64_t n_idx) {
+    return sd_rows_impl(b, lo, hi, idx, n_idx, true);
+}
+
+/* The build into parts (kept NULL) or into kept, the selected rows' ids in
+ * row order (sel, over the source's rows, not NULL). */
+static ray_t* sd_build(ray_col_src_t* src, ray_t* sel, int64_t n_parts, const int64_t* part_off,
+                       int64_t* const* part_dst, int64_t* kept, ray_strdom_t** dom_out) {
     *dom_out = NULL;
     if (!src || !src->obj || src->type != RAY_STR)
         return ray_error("type", "string domain: not a STR source");
     int64_t len = src->len;
-    if (n_parts < 0 || (n_parts == 0 ? len != 0 : (part_off[0] != 0 || part_off[n_parts] != len)))
+    if (!kept && (n_parts < 0 || (n_parts == 0 ? len != 0 : (part_off[0] != 0 || part_off[n_parts] != len))))
         return ray_error("range", "string domain: parts do not cover the source");
-    if (sel && ray_rowsel_meta(sel)->nrows != len) sel = NULL;   /* not this source's: read every row */
+    if (sel && ray_rowsel_meta(sel)->nrows != len) {
+        if (kept) return ray_error("range", "string domain: a selection of another source");
+        sel = NULL;   /* not this source's: read every row */
+    }
     sd_build_t b;
     memset(&b, 0, sizeof b);
+    uint8_t cb_stack[512];
+    b.cb.p = cb_stack; b.cb.cap = sizeof cb_stack; b.cb.heap = false;
+    b.src = src; b.kept = kept;
     b.d = (ray_strdom_t*)ray_calloc_raw(sizeof *b.d);
     if (!b.d) return ray_error("oom", NULL);
     ray_t* err = sd_rehash(b.d, 1024);
@@ -351,7 +419,8 @@ ray_t* ray_strdom_build_parts(ray_col_src_t* src, ray_t* sel, int64_t n_parts, c
      * interning is the walk's shared state. */
     ray_col_fixed_t fixed;
     ray_col_cursor_init_lent(&b.cur, src, &fixed);
-    if (!sel) err = len > 0 ? sd_rows(&b, 0, len, NULL, 0) : NULL;
+    ray_t* (*rows)(sd_build_t*, int64_t, int64_t, const uint16_t*, int64_t) = kept ? sd_rows_kept : sd_rows_parts;
+    if (!sel) err = len > 0 ? rows(&b, 0, len, NULL, 0) : NULL;
     else {
         /* the selected rows only, by morsel: the ids are first-occurrence
          * over the selection; an unselected row (never grouped) gets 0 and
@@ -363,18 +432,33 @@ ray_t* ray_strdom_build_parts(ray_col_src_t* src, ray_t* sel, int64_t n_parts, c
         for (uint32_t m = 0; m < ns && !err; m++) {
             int64_t lo = (int64_t)m * RAY_MORSEL_ELEMS;
             int64_t hi = lo + RAY_MORSEL_ELEMS < len ? lo + RAY_MORSEL_ELEMS : len;
-            if (fl[m] != RAY_SEL_ALL)
-                for (int64_t r = lo; r < hi; r++) *sd_slot(&b, r) = 0;
-            if (fl[m] == RAY_SEL_ALL) err = sd_rows(&b, lo, hi, NULL, 0);
+            if (fl[m] != RAY_SEL_ALL && !kept)
+                for (int64_t r = lo; r < hi; r++) *sd_slot(&b, r, false) = 0;
+            if (fl[m] == RAY_SEL_ALL) err = rows(&b, lo, hi, NULL, 0);
             else if (fl[m] == RAY_SEL_MIX && so[m + 1] > so[m])
-                err = sd_rows(&b, lo, hi, ix + so[m], (int64_t)(so[m + 1] - so[m]));
+                err = rows(&b, lo, hi, ix + so[m], (int64_t)(so[m + 1] - so[m]));
         }
     }
     ray_col_cursor_free(&b.cur);
     ray_free_raw(b.remap);
+    if (b.cb.heap) ray_free_raw(b.cb.p);
+    if (!err && kept && b.kept_n != ray_rowsel_meta(sel)->total_pass)
+        err = ray_error("corrupt", "string domain: %lld ids for %lld selected rows",
+                        (long long)b.kept_n, (long long)ray_rowsel_meta(sel)->total_pass);
     if (err) { ray_strdom_free(b.d); return err; }
     *dom_out = b.d;
     return NULL;
+}
+
+ray_t* ray_strdom_build_parts(ray_col_src_t* src, ray_t* sel, int64_t n_parts, const int64_t* part_off,
+                              int64_t* const* part_dst, ray_strdom_t** dom_out) {
+    return sd_build(src, sel, n_parts, part_off, part_dst, NULL, dom_out);
+}
+
+ray_t* ray_strdom_build_kept(ray_col_src_t* src, ray_t* sel, int64_t* kept, ray_strdom_t** dom_out) {
+    *dom_out = NULL;
+    if (!sel || !kept) return ray_error("domain", "string domain: kept rows without a selection");
+    return sd_build(src, sel, 0, NULL, NULL, kept, dom_out);
 }
 
 ray_t* ray_strdom_build(ray_col_src_t* src, ray_strdom_t** dom_out, ray_t** ids_out) {

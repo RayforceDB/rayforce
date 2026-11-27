@@ -1,0 +1,53 @@
+;; #1784: a group under a where: over compressed partitions by a STR key
+;; swapped its key for string-domain ids over every row of every segment,
+;; decoding each morsel that held a kept row, before the group gathered the
+;; kept rows (#1748): with a where: keeping 1 row in 100 it peaked at 7.5
+;; times gathering the kept rows first.  The ids are now built for the kept
+;; rows only, a few kept cells of a vector read alone, beside the kept rows
+;; of the other columns, and the group costs about what gathering first
+;; costs.  The key mixes inline, longer and empty text.
+(.sys.exec "rm -rf /tmp/rf_issue_1784 && mkdir -p /tmp/rf_issue_1784/c /tmp/rf_issue_1784/p") -- 0
+(set n 65536)
+(set txt (fn [v] (map (fn [i] (if (== 0 (% i 97)) "" (if (== 0 (% i 3)) (format "k%" i) (if (== 1 (% i 3)) (format "a longer text value number % here" i) (format "mid-%-x" i))))) v)))
+(set mk (fn [p] (table [k g t u c] (list (+ (* p n) (til n)) (% (til n) 100) (txt (+ (* p n) (til n))) (txt (% (til n) 5)) (* 2 (til n))))))
+(map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1784/c/%/t" (+ 2024.01.01 p)) (mk p) "/tmp/rf_issue_1784/c/.sym" {compress: true})) (til 4))
+(map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1784/p/%/t" (+ 2024.01.01 p)) (mk p) "/tmp/rf_issue_1784/p/.sym")) (til 4))
+(set P (.db.parted.get "/tmp/rf_issue_1784/c/" 't))
+(set Q (.db.parted.get "/tmp/rf_issue_1784/p/" 't))
+;; the answers, in their order, are the plain partitions' and gathering first's
+(select {from: P where: (== g 0) by: t n: (count k)}) -- (select {from: Q where: (== g 0) by: t n: (count k)})
+(xasc (select {from: P where: (== g 0) by: t n: (count k)}) 't) -- (xasc (select {from: (select {from: P where: (== g 0) t: t k: k}) by: t n: (count k)}) 't)
+(select {from: P where: (< g 10) by: t n: (count k) s: (sum c) f: (first k) l: (last c)}) -- (select {from: Q where: (< g 10) by: t n: (count k) s: (sum c) f: (first k) l: (last c)})
+(select {from: P where: (> g 0) by: u n: (count k) m: (max c)}) -- (select {from: Q where: (> g 0) by: u n: (count k) m: (max c)})
+(select {from: P where: (== t "") by: t n: (count t)}) -- (select {from: Q where: (== t "") by: t n: (count t)})
+(select {from: P where: (in k [3 70000 196609]) by: t n: (count k)}) -- (select {from: Q where: (in k [3 70000 196609]) by: t n: (count k)})
+(count (select {from: P where: (== g 999) by: t n: (count k)})) -- 0
+;; two keys keep the parted route's order
+(select {from: P where: (> g 0) by: [g u] n: (count k)}) -- (select {from: Q where: (> g 0) by: [g u] n: (count k)})
+;; control: an I64 key over the same compressed partitions
+(set twok (at (.mem.ts (select {from: (select {from: P where: (== g 0) t: t k: k}) by: k n: (count t)})) 'peak-live-bytes))
+(set onek (at (.mem.ts (select {from: P where: (== g 0) by: k n: (count t)})) 'peak-live-bytes))
+(<= onek (* 2 twok)) -- true
+;; a near-unique and a low-cardinality STR key cost about what gathering first costs
+(set two (at (.mem.ts (select {from: (select {from: P where: (== g 0) t: t k: k}) by: t n: (count k)})) 'peak-live-bytes))
+(set one (at (.mem.ts (select {from: P where: (== g 0) by: t n: (count k)})) 'peak-live-bytes))
+(<= one (* 2 two)) -- true
+(set twou (at (.mem.ts (select {from: (select {from: P where: (== g 0) u: u k: k}) by: u n: (count k)})) 'peak-live-bytes))
+(set oneu (at (.mem.ts (select {from: P where: (== g 0) by: u n: (count k)})) 'peak-live-bytes))
+(<= oneu (* 2 twou)) -- true
+;; an aggregate whose bits follow the order of reduction keeps the parted
+;; route, which reduces each partition and merges the partials: a sum of
+;; 1e16, 1.0 and -1e16 keeps what follows the last -1e16 of each partition
+;; (1.1 here, 4.4 over four), where one pass over the gathered rows would
+;; keep 7.1 (the exact sum is 302).  The answers are dev's, to the bit.
+(.sys.exec "rm -rf /tmp/rf_issue_1784/f && mkdir -p /tmp/rf_issue_1784/f") -- 0
+(set TF (table [g t f] (list (% (til n) 100) (take [""] n) (take [1e16 1.0 -1e16 0Nf 0.1 -0.3 1e-300] n))))
+(map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1784/f/%/t" (+ 2024.01.01 p)) TF "/tmp/rf_issue_1784/f/.sym" {compress: true})) (til 4))
+(set PF (.db.parted.get "/tmp/rf_issue_1784/f/" 't))
+(set RF (select {from: PF where: (== g 0) by: t r: (sum f) a: (avg f) v: (var f) d: (dev f) n: (count f)}))
+(repr (at RF 'r)) -- "[4.4]"
+(repr (at RF 'a)) -- "[0.0019538188277087036]"
+(repr (at RF 'v)) -- "[3.3407374500221693e+31]"
+(repr (at RF 'd)) -- "[5778627861739808.0]"
+(at RF 'n) -- [2624]
+(.sys.exec "rm -rf /tmp/rf_issue_1784") -- 0

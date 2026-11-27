@@ -312,9 +312,18 @@
 (count TFs) -- 20000
 
 ;; (g1) bare STR key — the reported shape (count, desc, take)
+;;      The route is asserted over a copy kept generation 0 ({compress:
+;;      false}, under the equivalence pass too): a generation-2 STR key is
+;;      grouped on its kept rows' string-domain ids instead (#1784), and Ps
+;;      checks the answers either way.
+(.sys.exec "rm -rf /tmp/rfl_pgwh_str0")
+(map (fn [p] (.db.splayed.set (format "/tmp/rfl_pgwh_str0/%/t/" p) PS {compress: false})) ["01" "02" "03" "04" "05" "06" "07" "08" "09" "10"])
+(set Ps0 (.db.parted.get "/tmp/rfl_pgwh_str0/" 't))
 (set Be1 (at (.sys.mem) 'group-perpart-runs))
-(set RPe1 (select {from: Ps where: (== (% v 200) 7) by: r n: (count r) desc: n take: 12}))
+(set RPe1 (select {from: Ps0 where: (== (% v 200) 7) by: r n: (count r) desc: n take: 12}))
 (> (at (.sys.mem) 'group-perpart-runs) Be1) -- true
+(select {from: Ps where: (== (% v 200) 7) by: r n: (count r) desc: n take: 12}) -- RPe1
+(.sys.exec "rm -rf /tmp/rfl_pgwh_str0")
 (set RPe1 (select {from: Ps where: (== (% v 200) 7) by: r n: (count r) asc: r}))
 (set RFe1 (select {from: TFs where: (== (% v 200) 7) by: r n: (count r) asc: r}))
 (at RPe1 'r) -- ["" "a_rather_long_reason_text_value" "another_long_reason_string_here" "mid_size_str" "short" "x" "yy"]

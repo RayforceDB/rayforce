@@ -53,6 +53,13 @@ ray_t* ray_strdom_build(ray_col_src_t* src, ray_strdom_t** dom_out, ray_t** ids_
  * never grouped).  NULL with *dom_out owned, or an owned error. */
 ray_t* ray_strdom_build_parts(ray_col_src_t* src, ray_t* sel, int64_t n_parts, const int64_t* part_off,
                               int64_t* const* part_dst, ray_strdom_t** dom_out);
+/* ray_strdom_build_parts reading the rows `sel` selects (over the source's
+ * rows: `range` otherwise), each selected row's id written in row order
+ * into kept[0 .. sel's count), as a gather of those rows lays them out:
+ * nothing for an unselected row.  The ids are first-occurrence over the
+ * selection, as with the parts.  NULL with *dom_out owned, or an owned
+ * error. */
+ray_t* ray_strdom_build_kept(ray_col_src_t* src, ray_t* sel, int64_t* kept, ray_strdom_t** dom_out);
 /* The strings of ids[0..n) as a new STR vector (the group keys' output); an
  * id outside the domain (none a group emits) reads as "".  NULL with *out
  * owned, or an owned error with *out NULL. */
