@@ -654,7 +654,7 @@ ray_t* ray_parse_builtin_fn(ray_t* x) {
     const char* src = ray_str_ptr(x);
     if (!src) return ray_error("domain", "parse: empty or invalid source string");
     ray_t* parsed = ray_parse(src);
-    return parsed ? parsed : ray_error("parse", NULL);
+    return parsed ? parsed : ray_error("parse", "parse: no result at byte 0");
 }
 
 /* (print val) -- print without newline, return the value */

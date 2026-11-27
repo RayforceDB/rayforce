@@ -102,4 +102,10 @@ ray_err_t ray_csv_save_splayed_mode(const char* path, char delimiter, bool heade
                                     const char* dir, int64_t rows_per_chunk, ray_compress_t mode);
 ray_err_t ray_write_csv(ray_t* table, const char* path);
 
+/* After a failed ray_csv_save_splayed_mode / ray_csv_save_parted_mode: the
+ * call on the source that failed ("open", "stat", "map", "directory", or "empty"
+ * for an empty file) and its errno, saved at that call; false when the source was
+ * read and the import failed past it. */
+bool ray_csv_source_failure(const char** call, int* errnum);
+
 #endif /* RAY_CSV_H */

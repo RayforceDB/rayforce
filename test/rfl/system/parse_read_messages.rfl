@@ -1,0 +1,73 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; parse and read raise errors that say what went wrong and where (#1883):
+;; parse names the reason and the byte offset it stopped at, read the
+;; operation, the path and the OS reason.  Codes are as before.
+(set pm (fn [s] (try (parse s) (fn [e] (list (get e 'code) (get e 'msg))))))
+;; no expression: (parse "") and a source of whitespace and comments only
+(pm "") -- (list 'parse "parse: no expression: the source is empty or only whitespace and comments at byte 0")
+(pm "  ;; c") -- (list 'parse "parse: no expression: the source is empty or only whitespace and comments at byte 6")
+;; unterminated list, string, dict, vector
+(pm "(+ 1") -- (list 'parse "parse: unterminated list (opened at byte 0): expected ')' at byte 4")
+(pm "(+ 1 2) (+ 3") -- (list 'parse "parse: unterminated list (opened at byte 8): expected ')' at byte 12")
+(pm "\"abc") -- (list 'parse "parse: unterminated string (opened at byte 0): expected a closing '\"' at byte 4")
+(pm "{a: 1") -- (list 'parse "parse: unterminated dict (opened at byte 0): expected '}' at byte 5")
+(pm "[1 2") -- (list 'parse "parse: unterminated vector (opened at byte 0): expected ']' at byte 4")
+;; a bad token
+(pm ")") -- (list 'parse "parse: unexpected ')' with no list open at byte 0")
+(pm "]") -- (list 'parse "parse: unexpected ']' with no vector open at byte 0")
+(pm "}") -- (list 'parse "parse: unexpected '}' with no dict open at byte 0")
+(pm "{a 1}") -- (list 'parse "parse: dict: expected ':' after a key at byte 3")
+(pm "{: 1}") -- (list 'parse "parse: dict: expected a key, a name or a string at byte 1")
+;; a bad number
+(pm "0x") -- (list 'parse "parse: a hex literal needs digits after 0x at byte 2")
+(pm "2024.13.40") -- (list 'parse "parse: invalid date 2024.13.40: month must be 1-12, day 1-31 at byte 10")
+;; a parse that works is unchanged
+(pm "(+ 1 2)") -- (parse "(+ 1 2)")
+
+;; read and its neighbours: the operation, the path, the OS reason
+(set rm (fn [f] (try (f) (fn [e] (list (get e 'code) (get e 'msg))))))
+(.sys.exec "rm -rf /tmp/rftest_prm; mkdir -p /tmp/rftest_prm/d; printf '' > /tmp/rftest_prm/empty.csv") -- 0
+(at (rm (fn [] (read "/tmp/rftest_prm/missing"))) 0) -- 'io
+(like (at (rm (fn [] (read "/tmp/rftest_prm/missing"))) 1) "read \"*/missing\": No such file*") -- true
+(at (rm (fn [] (read "/tmp/rftest_prm/d"))) 0) -- 'io
+(like (at (rm (fn [] (read "/tmp/rftest_prm/d"))) 1) "read \"*/d\": is a directory") -- true
+(like (at (rm (fn [] (read-bytes "/tmp/rftest_prm/missing"))) 1) "read-bytes \"*/missing\": No such file*") -- true
+(at (rm (fn [] (write "/tmp/rftest_prm/missing/x" "a"))) 0) -- 'io
+(like (at (rm (fn [] (write "/tmp/rftest_prm/missing/x" "a"))) 1) "write \"*/missing/x\": No such file*") -- true
+(like (at (rm (fn [] (.csv.read "/tmp/rftest_prm/missing.csv"))) 1) ".csv.read \"*/missing.csv\": No such file*") -- true
+(at (rm (fn [] (.csv.read "/tmp/rftest_prm/empty.csv"))) 0) -- 'io
+(like (at (rm (fn [] (.csv.read "/tmp/rftest_prm/empty.csv"))) 1) ".csv.read \"*/empty.csv\": the file is empty") -- true
+(at (rm (fn [] (.csv.read "/tmp/rftest_prm/d"))) 0) -- 'io
+(like (at (rm (fn [] (.csv.read "/tmp/rftest_prm/d"))) 1) ".csv.read \"*/d\": is a directory") -- true
+(at (rm (fn [] (.csv.write (table [a] (list [1])) "/tmp/rftest_prm/missing/x.csv"))) 0) -- 'io
+(like (at (rm (fn [] (.csv.write (table [a] (list [1])) "/tmp/rftest_prm/missing/x.csv"))) 1) ".csv.write \"*/missing/x.csv\": *") -- true
+;; a CSV import names the cause it met on its source, and a failure past
+;; it by what its code says (review of #1884).  Paths are matched by their
+;; file name: a long temp root shows a path by its tail.
+(.sys.exec "printf 'a\\n1\\n' > /tmp/rftest_prm/one.csv") -- 0
+(at (rm (fn [] (.csv.splayed [I64] "/tmp/rftest_prm/empty.csv" "/tmp/rftest_prm/o1"))) 0) -- 'io
+(like (at (rm (fn [] (.csv.splayed [I64] "/tmp/rftest_prm/empty.csv" "/tmp/rftest_prm/o1"))) 1) ".csv.splayed \"*/empty.csv\": the file is empty") -- true
+(like (at (rm (fn [] (.csv.splayed [I64] "/tmp/rftest_prm/missing.csv" "/tmp/rftest_prm/o2"))) 1) ".csv.splayed \"*/missing.csv\": No such file*") -- true
+(at (rm (fn [] (.csv.splayed [I64 I64] "/tmp/rftest_prm/one.csv" "/tmp/rftest_prm/o3"))) 0) -- 'length
+(like (at (rm (fn [] (.csv.splayed [I64 I64] "/tmp/rftest_prm/one.csv" "/tmp/rftest_prm/o3"))) 1) ".csv.splayed: the types do not match the file's columns (length): \"*/one.csv\" into \"*/o3\"") -- true
+(at (rm (fn [] (.csv.parted [I64] "/tmp/rftest_prm/empty.csv" "/tmp/rftest_prm/p1" 't))) 0) -- 'io
+(like (at (rm (fn [] (.csv.parted [I64] "/tmp/rftest_prm/empty.csv" "/tmp/rftest_prm/p1" 't))) 1) ".csv.parted \"*/empty.csv\": the file is empty") -- true
+;; a long path is shown by its tail, so the operation and the reason fit
+(set long (concat "/tmp/rftest_prm/" (take "x" 300)))
+(set lm (at (rm (fn [] (read long))) 1))
+(like lm "read \"...xxx*\": File name too long") -- true
+(< (count lm) 256) -- true
+(set deep (concat "/tmp/rftest_prm/missing/" (concat (take "y" 100) (concat "/" (concat (take "z" 100) (concat "/" (take "w" 100)))))))
+(like (at (rm (fn [] (read deep))) 1) "read \"...*wwww\": No such file*") -- true
+(like (at (rm (fn [] (read-bytes deep))) 1) "read-bytes \"...*wwww\": No such file*") -- true
+(like (at (rm (fn [] (write deep "a"))) 1) "write \"...*wwww\": No such file*") -- true
+(like (at (rm (fn [] (.csv.read deep))) 1) ".csv.read \"...*wwww\": No such file*") -- true
+(like (at (rm (fn [] (.csv.write (table [a] (list [1])) deep))) 1) ".csv.write \"...*wwww\": No such file*") -- true
+(like (at (rm (fn [] (.csv.splayed [I64] deep "/tmp/rftest_prm/o4"))) 1) ".csv.splayed \"...*wwww\": No such file*") -- true
+;; an import whose target is invalid keeps its code, the target being
+;; checked first as it always was (second review of #1884)
+(at (rm (fn [] (.csv.splayed "/tmp/rftest_prm/missing.csv" (take "z" 1019)))) 0) -- 'range
+(at (rm (fn [] (.csv.splayed "/tmp/rftest_prm/empty.csv" (take "z" 1019)))) 0) -- 'range
+;; an empty output path is named as one, with its code
+(rm (fn [] (.csv.write (table [a] (list [1])) ""))) -- (list 'type ".csv.write: empty path")
+(.sys.exec "rm -rf /tmp/rftest_prm; true") -- 0

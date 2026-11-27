@@ -1051,7 +1051,7 @@ Printing, file I/O, CSV loading, and script execution.
 | `format` | variadic | — | Format value to string (% as placeholder); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit`; in a query element-wise: one string per row of a column, on every route | `(format "val=%" 42)` → `"val=42"` |
 | `.csv.read` | variadic | restricted | Load CSV file into table (mmap, parallel parse) | `(.csv.read "data.csv")` |
 | `.csv.write` | variadic | restricted | Write table to CSV file | `(.csv.write trades "out.csv")` |
-| `read` | unary | restricted | Read file contents as string, to EOF | `(read "/proc/self/cmdline")` |
+| `read` | unary | restricted | Read file contents as string, to EOF. A failure raises `io` naming the operation, the path and the reason: `read "/x": No such file or directory`, `read "/d": is a directory` | `(read "/proc/self/cmdline")` |
 | `read-bytes` | unary | restricted | Read file contents as a `U8` byte vector, to EOF | `(read-bytes "file.bin")` |
 | `write` | binary | restricted | Write a string to a file | `(write "file.txt" "content")` |
 | `write-bytes` | binary | restricted | Write a `U8` byte vector to a file | `(write-bytes "file.bin" bytes)` |
@@ -1079,7 +1079,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `eval` | unary | — | Evaluate a parsed Rayfall expression | `(eval (parse "(+ 1 2)"))` → `3` |
-| `parse` | unary | — | Parse a string into a Rayfall expression tree | `(parse "(+ 1 2)")` |
+| `parse` | unary | — | Parse a string into a Rayfall expression tree. A source it cannot parse raises `parse` with the reason and the byte it stopped at: `parse: unterminated list (opened at byte 0): expected ')' at byte 4`. An empty source, or one of whitespace and comments only, is `parse: no expression: …` | `(parse "(+ 1 2)")` |
 | `.sys.gc` | variadic (0–1) | — | Trigger GC / heap flush, returns `0`; mode `1` also releases free pages now, best effort | `(.sys.gc)`, `(.sys.gc 1)` |
 | `.mem.objsize` | unary | — | Logical bytes retained by an object graph; shared children count once | `(.mem.objsize value)` |
 | `.mem.ts` | special form | — | Evaluate once and return result, time, allocation, peak-memory, result-size, and worker statistics as a dict | `(.mem.ts (select {from: trades}))` |
