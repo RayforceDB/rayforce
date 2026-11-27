@@ -165,9 +165,9 @@ ray_t* ray_log_status_fn(ray_t** args, int64_t n) {
             return ray_error("oom", NULL);
         }
         ray_t* nk = ray_vec_append(keys, &k);
-        if (RAY_IS_ERR(nk)) {   /* append consumed keys */
+        if (RAY_IS_ERR(nk)) {   /* a failed append leaves keys, which is ours (#1857) */
             if (v != RAY_NULL_OBJ) ray_release(v);
-            ray_release(vals);
+            ray_release(keys); ray_release(vals);
             return nk;
         }
         keys = nk;

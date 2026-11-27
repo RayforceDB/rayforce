@@ -23,6 +23,7 @@
 
 #include "list.h"
 #include "mem/heap.h"
+#include "mem/cow.h"   /* ray_cow_abandon */
 #include "vec/growth.h"
 #include "lang/format.h"  /* ray_type_name */
 #include <string.h>
@@ -76,7 +77,7 @@ ray_t* ray_list_append(ray_t* list, ray_t* item) {
 
     ray_t* original = list;
     list = ray_cow(list);
-    if (!list || RAY_IS_ERR(list)) return list;
+    if (!list || RAY_IS_ERR(list)) return list ? list : ray_error("oom", NULL);   /* a failed copy: the input untouched, never C NULL */
 
     int64_t cap = list_capacity(list);
 
@@ -84,7 +85,7 @@ ray_t* ray_list_append(ray_t* list, ray_t* item) {
     if (list->len >= cap) {
         ray_t* new_list = ray_cell_grow_one(list, sizeof(ray_t*));
         if (!new_list || RAY_IS_ERR(new_list)) {
-            if (list != original) ray_release(list);
+            ray_cow_abandon(list, original);   /* the caller keeps its list (#1857) */
             return new_list ? new_list : ray_error("oom", NULL);
         }
         list = new_list;
@@ -123,7 +124,7 @@ ray_t* ray_list_set(ray_t* list, int64_t idx, ray_t* item) {
 
     /* COW if shared */
     list = ray_cow(list);
-    if (!list || RAY_IS_ERR(list)) return list;
+    if (!list || RAY_IS_ERR(list)) return list ? list : ray_error("oom", NULL);   /* a failed copy: the input untouched, never C NULL */
 
     ray_t** slots = (ray_t**)ray_data(list);
 
@@ -153,14 +154,14 @@ ray_t* ray_list_insert_at(ray_t* list, int64_t idx, ray_t* item) {
 
     ray_t* original = list;
     list = ray_cow(list);
-    if (!list || RAY_IS_ERR(list)) return list;
+    if (!list || RAY_IS_ERR(list)) return list ? list : ray_error("oom", NULL);   /* a failed copy: the input untouched, never C NULL */
 
     int64_t cap = list_capacity(list);
 
     if (list->len >= cap) {
         ray_t* new_list = ray_cell_grow_one(list, sizeof(ray_t*));
         if (!new_list || RAY_IS_ERR(new_list)) {
-            if (list != original) ray_release(list);
+            ray_cow_abandon(list, original);   /* the caller keeps its list (#1857) */
             return new_list ? new_list : ray_error("oom", NULL);
         }
         list = new_list;

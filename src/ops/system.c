@@ -2038,6 +2038,11 @@ ray_t* ray_sys_args_fn(ray_t** args, int64_t n) {
     } else {
         keys = ray_sym_vec_new(RAY_SYM_W64, 1);
         vals = ray_list_new(1);
+        if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {   /* each ours: a value released, an error freed */
+            if (keys && RAY_IS_ERR(keys)) ray_error_free(keys); else ray_release(keys);
+            if (vals && RAY_IS_ERR(vals)) ray_error_free(vals); else ray_release(vals);
+            return ray_error("oom", NULL);
+        }
     }
     ray_t* nfo = ray_eval_get_nfo();
     ray_t* src = (nfo && !RAY_IS_ERR(nfo)) ? NFO_FILENAME(nfo) : NULL;
@@ -2046,10 +2051,14 @@ ray_t* ray_sys_args_fn(ray_t** args, int64_t n) {
                      memcmp(ray_str_ptr(src), RAY_NFO_REPL_NAME, ray_str_len(src)) == 0);
     ray_t* sv = is_file ? (ray_retain(src), src) : ray_str("", 0);
     int64_t k = ray_sym_intern("source", 6);
-    keys = ray_vec_append(keys, &k);
-    if (RAY_IS_ERR(keys)) { ray_release(vals); ray_release(sv); return keys; }
-    vals = ray_list_append(vals, sv); ray_release(sv);
-    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    /* keys and vals are ours (retained above, or new); a failed append
+     * leaves its input with our reference (#1857), released here */
+    ray_t* nk = ray_vec_append(keys, &k);
+    if (!nk || RAY_IS_ERR(nk)) { ray_release(keys); ray_release(vals); ray_release(sv); return nk ? nk : ray_error("oom", NULL); }
+    keys = nk;
+    ray_t* nv = ray_list_append(vals, sv); ray_release(sv);
+    if (!nv || RAY_IS_ERR(nv)) { ray_release(keys); ray_release(vals); return nv ? nv : ray_error("oom", NULL); }
+    vals = nv;
     return ray_dict_new(keys, vals);
 }
 
