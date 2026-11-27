@@ -5202,31 +5202,45 @@ static const char* kind_name(ray_idx_kind_t k) {
 
 static ray_t* dict_append_sym_i64(ray_t** keys, ray_t** vals, const char* k, int64_t n) {
     int64_t kid = ray_sym_intern(k, strlen(k));
-    *keys = ray_vec_append(*keys, &kid);
+    *keys = ray_vec_append_take(*keys, &kid);   /* *keys is the caller's sole local (#1864) */
     if (RAY_IS_ERR(*keys)) return *keys;
     ray_t* nv = ray_i64(n);
-    *vals = ray_list_append(*vals, nv);
+    if (!nv || RAY_IS_ERR(nv)) return nv ? nv : ray_error("oom", NULL);   /* the caller frees it at fail: */
+    *vals = ray_list_append_take(*vals, nv);
     ray_release(nv);
+    return *vals;
+}
+
+static ray_t* dict_append_sym_f64(ray_t** keys, ray_t** vals, const char* k, double x) {
+    int64_t kid = ray_sym_intern(k, strlen(k));
+    *keys = ray_vec_append_take(*keys, &kid);   /* *keys is the caller's sole local (#1864) */
+    if (RAY_IS_ERR(*keys)) return *keys;
+    ray_t* fv = ray_f64(x);
+    if (!fv || RAY_IS_ERR(fv)) return fv ? fv : ray_error("oom", NULL);   /* the caller frees it at fail: */
+    *vals = ray_list_append_take(*vals, fv);
+    ray_release(fv);
     return *vals;
 }
 
 static ray_t* dict_append_sym_sym(ray_t** keys, ray_t** vals, const char* k, const char* s) {
     int64_t kid = ray_sym_intern(k, strlen(k));
-    *keys = ray_vec_append(*keys, &kid);
+    *keys = ray_vec_append_take(*keys, &kid);   /* *keys is the caller's sole local (#1864) */
     if (RAY_IS_ERR(*keys)) return *keys;
     int64_t sid = ray_sym_intern(s, strlen(s));
     ray_t* sv = ray_sym(sid);
-    *vals = ray_list_append(*vals, sv);
+    if (!sv || RAY_IS_ERR(sv)) return sv ? sv : ray_error("oom", NULL);   /* the caller frees it at fail: */
+    *vals = ray_list_append_take(*vals, sv);
     ray_release(sv);
     return *vals;
 }
 
 static ray_t* dict_append_sym_bool(ray_t** keys, ray_t** vals, const char* k, bool b) {
     int64_t kid = ray_sym_intern(k, strlen(k));
-    *keys = ray_vec_append(*keys, &kid);
+    *keys = ray_vec_append_take(*keys, &kid);   /* *keys is the caller's sole local (#1864) */
     if (RAY_IS_ERR(*keys)) return *keys;
     ray_t* bv = ray_bool(b ? 1 : 0);
-    *vals = ray_list_append(*vals, bv);
+    if (!bv || RAY_IS_ERR(bv)) return bv ? bv : ray_error("oom", NULL);   /* the caller frees it at fail: */
+    *vals = ray_list_append_take(*vals, bv);
     ray_release(bv);
     return *vals;
 }
@@ -5234,9 +5248,9 @@ static ray_t* dict_append_sym_bool(ray_t** keys, ray_t** vals, const char* k, bo
 /* Appends `nested` (borrowed) under k. */
 static ray_t* dict_append_sym_obj(ray_t** keys, ray_t** vals, const char* k, ray_t* nested) {
     int64_t kid = ray_sym_intern(k, strlen(k));
-    *keys = ray_vec_append(*keys, &kid);
+    *keys = ray_vec_append_take(*keys, &kid);   /* *keys is the caller's sole local (#1864) */
     if (RAY_IS_ERR(*keys)) return *keys;
-    *vals = ray_list_append(*vals, nested);
+    *vals = ray_list_append_take(*vals, nested);
     return *vals;
 }
 
@@ -5272,14 +5286,10 @@ ray_t* ray_index_info(ray_t* v) {
         break;
     case RAY_IDX_ZONE:
         if (ix->parent_type == RAY_F32 || ix->parent_type == RAY_F64) {
-            int64_t kmin = ray_sym_intern("min", 3);
-            keys = ray_vec_append_take(keys, &kmin);
-            ray_t* mn = ray_f64(ix->u.zone.min_f);
-            vals = ray_list_append_take(vals, mn); ray_release(mn);
-            int64_t kmax = ray_sym_intern("max", 3);
-            keys = ray_vec_append_take(keys, &kmax);
-            ray_t* mx = ray_f64(ix->u.zone.max_f);
-            vals = ray_list_append_take(vals, mx); ray_release(mx);
+            r = dict_append_sym_f64(&keys, &vals, "min", ix->u.zone.min_f);
+            if (RAY_IS_ERR(r)) goto fail;
+            r = dict_append_sym_f64(&keys, &vals, "max", ix->u.zone.max_f);
+            if (RAY_IS_ERR(r)) goto fail;
         } else {
             r = dict_append_sym_i64(&keys, &vals, "min", ix->u.zone.min_i);
             if (RAY_IS_ERR(r)) goto fail;
@@ -5338,8 +5348,9 @@ ray_t* ray_index_info(ray_t* v) {
     return ray_dict_new(keys, vals);
 
 fail:
-    if (!RAY_IS_ERR(keys)) ray_release(keys);
-    if (!RAY_IS_ERR(vals)) ray_release(vals);
+    /* r is the error answered; any other error here is ours to free */
+    if (RAY_IS_ERR(keys)) { if (keys != r) ray_error_free(keys); } else ray_release(keys);
+    if (RAY_IS_ERR(vals)) { if (vals != r) ray_error_free(vals); } else ray_release(vals);
     return r;
 }
 

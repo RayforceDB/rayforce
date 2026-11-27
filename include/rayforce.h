@@ -688,7 +688,22 @@ ray_t* ray_sym_vec_new(uint8_t sym_width, int64_t capacity);  /* RAY_SYM with ad
  * loses nothing.  They are ray_vec_append_take, ray_vec_append_raw_take,
  * ray_vec_insert_at_take, ray_str_vec_append_take, ray_str_vec_set_take,
  * ray_list_append_take and ray_list_insert_at_take; ray_table_add_col,
- * ray_dict_upsert and ray_dict_remove consume their input the same way. */
+ * ray_dict_upsert and ray_dict_remove consume their input the same way.
+ *
+ * A consuming write is right only where `v` holds the only live reference
+ * to the input on the failure path: a failure releases it, so any other
+ * name that reaches the same block (a table or list slot, a struct field,
+ * an out-parameter, a value the cleanup reads again) is left pointing at
+ * a freed block.  Where the input is reachable another way, keep the plain
+ * write and its untouched input, marked `plain:` (ray_insert's in-place
+ * loop, whose column is also the table's slot, is one).  The check used to
+ * convert the sites (#1864) proves this by rule for a `v` that is a local,
+ * not a parameter, never has its address taken, is never copied into
+ * another name and is assigned only from calls.  It cannot see a borrowed
+ * pointer: a `v` taken from a getter (ray_table_col_idx, ray_list_get,
+ * ray_dict_vals and the like) passes those rules but is not the caller's
+ * to release.  Read such a site by hand; it keeps the plain write, or
+ * retains first. */
 ray_t* ray_vec_append(ray_t* vec, const void* elem);
 ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count);  /* one reserve + one memcpy */
 ray_t* ray_vec_set(ray_t* vec, int64_t idx, const void* elem);
