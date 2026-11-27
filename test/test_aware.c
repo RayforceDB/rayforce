@@ -3664,6 +3664,70 @@ static test_result_t test_topk_cancel_at_dispatch(void) {
     PASS();
 }
 
+/* #1782: the walkers that call a function per element, and the serial
+ * hash build of `in` over a long I64 set, poll for a cancel once per
+ * 65,536 elements (ray_cancel_poll).  The seam raises the cancel at the
+ * nth poll: each n the walk reaches answers `cancel` with no block left
+ * behind; past its polls it answers in full.  140,000 elements: a walk
+ * from 0 polls at 0, 65,536 and 131,072 (3 polls), one from 1 at the last
+ * two (2).  On a walker that never polls the seam never fires and every n
+ * answers in full. */
+static test_result_t test_walk_cancel(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    aw_eval_ok("(set V (til 140000))");
+    aw_eval_ok("(set W (reverse V))");
+    aw_eval_ok("(set f (fn [x] (+ x 1)))");
+    aw_eval_ok("(set g (fn [a b] (+ a b)))");
+    static const struct { const char* q; uint32_t polls; } ws[] = {
+        { "(map f V)", 3 },
+        { "(map g 1 V)", 3 },
+        { "(map-left g V 1)", 3 },
+        { "(map-right g 1 V)", 3 },
+        { "(apply g V W)", 3 },
+        { "(fold g V)", 2 },
+        { "(fold g 0 V)", 3 },
+        { "(fold-right g V)", 3 },
+        { "(fold-while (fn [a] true) g 0 V)", 3 },
+        { "(scan g V)", 2 },
+        { "(scan-right g V)", 3 },
+        { "(prior g V)", 3 },
+        { "(in V W)", 3 },
+    };
+    for (size_t k = 0; k < sizeof ws / sizeof *ws; k++) {
+        char setq[200];
+        snprintf(setq, sizeof setq, "(set R0 %s)", ws[k].q);
+        aw_eval_ok(setq);
+        for (uint32_t n = 1; n <= ws[k].polls + 1; n++) {
+            ray_heap_gc();
+            int64_t live0 = aw_live_blocks();
+            ray_test_cancel_at_poll(n);
+            ray_t* got = aw_eval(ws[k].q);
+            ray_test_cancel_at_poll(0);
+            ray_clear_interrupt();
+            TEST_ASSERT_NOT_NULL(got);
+            if (n <= ws[k].polls) {
+                bool is_cancel = RAY_IS_ERR(got) && strcmp(ray_err_code(got), "cancel") == 0;
+                if (RAY_IS_ERR(got)) ray_error_free(got); else ray_release(got);
+                TEST_ASSERT_FMT(is_cancel, "%s, cancel at poll %u: no cancel", ws[k].q, n);
+                ray_heap_gc();
+                int64_t live = aw_live_blocks() - live0;
+                TEST_ASSERT_FMT(live <= 0, "%s, cancel at poll %u: %lld blocks left", ws[k].q, n, (long long)live);
+                continue;
+            }
+            TEST_ASSERT_FMT(!RAY_IS_ERR(got), "%s: an error past its polls", ws[k].q);
+            ray_env_set(ray_sym_intern("Q", 1), got);
+            ray_release(got);
+            ray_t* v = ray_eval_str("(and (== (count (ser Q)) (count (ser R0))) (all (== (ser Q) (ser R0))))");
+            bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+            if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+            TEST_ASSERT_FMT(ok, "%s: not the answer", ws[k].q);
+        }
+    }
+    aw_eval_ok("(set Q 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set V 0)"); aw_eval_ok("(set W 0)");
+    PASS();
+}
+
 /* #1747: a distinct over a STR column, flat or parted, polls for a cancel
  * while it copies the parted column and while it dedups, once per 65,536
  * rows (ray_cancel_poll), so a cancel landing in either loop stops it
@@ -6569,6 +6633,7 @@ const test_entry_t aware_entries[] = {
     { "aware/sel_compact_cancel_at_dispatch", test_sel_compact_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/distinct_str_cancel", test_distinct_str_cancel, aw_setup, aw_teardown },
     { "aware/group_keys_only_cancel", test_group_keys_only_cancel, aw_setup, aw_teardown },
+    { "aware/walk_cancel", test_walk_cancel, aw_setup, aw_teardown },
     { "aware/topk_inplace", test_topk_inplace, aw_setup, aw_teardown },
     { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
     { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },

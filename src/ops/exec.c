@@ -965,9 +965,11 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
  * to its own sink.  Assumes the column is non-empty (callers short-circuit
  * empty cols).  svf_stack/svi_stack are caller-owned 32-element buffers used
  * when the set has ≤32 live elements; otherwise *sv_hdr_out is heap-allocated
- * and must be ray_free'd after the dispatch.  Returns a tri-state status so
- * the bool path can surface nyi/oom while the fused path falls back. */
-typedef enum { IN_CTX_UNSUPPORTED = 0, IN_CTX_OK = 1, IN_CTX_OOM = 2 } in_ctx_status_t;
+ * and must be ray_free'd after the dispatch.  Returns a status so the bool
+ * path can surface nyi/oom while the fused path falls back, and every path
+ * answers `cancel` for IN_CTX_CANCEL: the serial loops over the set poll
+ * once per RAY_CANCEL_ROWS elements (#1782), and nothing is left built. */
+typedef enum { IN_CTX_UNSUPPORTED = 0, IN_CTX_OK = 1, IN_CTX_OOM = 2, IN_CTX_CANCEL = 3 } in_ctx_status_t;
 
 /* A TIMESPAN against a TIME or a TIMESTAMP (element types). */
 static inline bool in_span_point_pair(int8_t ct, int8_t st) {
@@ -1023,6 +1025,20 @@ static int64_t in_set_widen_f64(double* dst, ray_t* set, int8_t st, int64_t n,
     return k;
 }
 #undef IN_WIDEN
+
+/* Insert n needles into the I64 probe table (INT64_MIN marks an empty
+ * slot): true when one of them is INT64_MIN itself, kept apart. */
+static bool in_hti_insert(int64_t* t, int64_t ht_mask, const int64_t* svi, int64_t n) {
+    bool has_min = false;
+    for (int64_t j = 0; j < n; j++) {
+        int64_t v = svi[j];
+        if (v == INT64_MIN) { has_min = true; continue; }
+        int64_t sl = (int64_t)(ray_hash_i64(v) & (uint64_t)ht_mask);
+        for (int64_t k = t[sl]; k != INT64_MIN && k != v; k = t[sl]) sl = (sl + 1) & ht_mask;
+        t[sl] = v;
+    }
+    return has_min;
+}
 
 /* The body shared by in_build_worker_ctx (a column vector or atom) and
  * in_build_worker_ctx_meta (a bound source read by range), over the
@@ -1152,6 +1168,10 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
     } else if (sym_of_str) {
         struct ray_sym_domain_s* cd = (!atom && dom) ? dom : ray_sym_runtime_domain();
         for (int64_t i = 0; i < set_len; i++) {
+            if ((i & (RAY_CANCEL_ROWS - 1)) == 0 && ray_cancel_poll()) {
+                if (sv_hdr) ray_free(sv_hdr);
+                return IN_CTX_CANCEL;
+            }
             size_t l = 0;
             const char* p;
             if (ray_is_atom(set)) { p = ray_str_ptr(set); l = ray_str_len(set); }
@@ -1185,6 +1205,10 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
                 int64_t nv = sv_len;
                 sv_len = 0;
                 for (int64_t i = 0; i < nv; i++) {
+                    if ((i & (RAY_CANCEL_ROWS - 1)) == 0 && ray_cancel_poll()) {
+                        if (sv_hdr) ray_free(sv_hdr);
+                        return IN_CTX_CANCEL;
+                    }
                     ray_t* s = ray_sym_domain_str(in_set_dom, svi[i]);
                     int64_t xid = s ? ray_sym_domain_find(in_col_dom,
                                           ray_str_ptr(s), ray_str_len(s)) : -1;
@@ -1236,28 +1260,38 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
         ray_t* hh = ray_alloc((size_t)cap * sizeof(int64_t));
         if (hh) {
             ht_mask = cap - 1;
+            /* The inserts run in blocks of RAY_CANCEL_ROWS needles, a cancel
+             * poll before each: the loop per needle is the one it was. */
+            bool cancelled = false;
             if (use_double) {
                 uint64_t* t = (uint64_t*)ray_data(hh);
                 for (int64_t k = 0; k < cap; k++) t[k] = IN_HTF_EMPTY;
-                for (int64_t j = 0; j < sv_len; j++) {
-                    if (svf[j] != svf[j]) continue;  /* NaN matches nothing */
-                    uint64_t b = in_f64_key(svf[j]);
-                    int64_t sl = (int64_t)(ray_hash_i64((int64_t)b) & (uint64_t)ht_mask);
-                    while (t[sl] != IN_HTF_EMPTY && t[sl] != b) sl = (sl + 1) & ht_mask;
-                    t[sl] = b;
+                for (int64_t b0 = 0; b0 < sv_len; b0 += RAY_CANCEL_ROWS) {
+                    if (ray_cancel_poll()) { cancelled = true; break; }
+                    int64_t e = sv_len - b0 > RAY_CANCEL_ROWS ? b0 + RAY_CANCEL_ROWS : sv_len;
+                    for (int64_t j = b0; j < e; j++) {
+                        if (svf[j] != svf[j]) continue;  /* NaN matches nothing */
+                        uint64_t b = in_f64_key(svf[j]);
+                        int64_t sl = (int64_t)(ray_hash_i64((int64_t)b) & (uint64_t)ht_mask);
+                        while (t[sl] != IN_HTF_EMPTY && t[sl] != b) sl = (sl + 1) & ht_mask;
+                        t[sl] = b;
+                    }
                 }
                 htf = t;
             } else {
                 int64_t* t = (int64_t*)ray_data(hh);
                 for (int64_t k = 0; k < cap; k++) t[k] = INT64_MIN;
-                for (int64_t j = 0; j < sv_len; j++) {
-                    int64_t v = svi[j];
-                    if (v == INT64_MIN) { ht_has_min = true; continue; }
-                    int64_t sl = (int64_t)(ray_hash_i64(v) & (uint64_t)ht_mask);
-                    while (t[sl] != INT64_MIN && t[sl] != v) sl = (sl + 1) & ht_mask;
-                    t[sl] = v;
+                for (int64_t b0 = 0; b0 < sv_len; b0 += RAY_CANCEL_ROWS) {
+                    if (ray_cancel_poll()) { cancelled = true; break; }
+                    int64_t e = sv_len - b0 > RAY_CANCEL_ROWS ? b0 + RAY_CANCEL_ROWS : sv_len;
+                    ht_has_min |= in_hti_insert(t, ht_mask, svi + b0, e - b0);
                 }
                 hti = t;
+            }
+            if (cancelled) {
+                ray_free(hh);
+                if (sv_hdr) ray_free(sv_hdr);
+                return IN_CTX_CANCEL;
             }
             *lut_hdr_out = hh;  /* freed by every caller with the LUT */
         }
@@ -1347,6 +1381,7 @@ ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
     in_ctx_status_t st = in_build_worker_ctx(col, set, negate,
                                              svf_stack, svi_stack,
                                              &in_ctx, &sv_hdr, &lut_hdr);
+    if (st == IN_CTX_CANCEL) return ray_error("cancel", "interrupted");
     if (st != IN_CTX_OK) return NULL;   /* unsupported / OOM: caller falls back */
 
     ray_t* out = ray_vec_new(RAY_BOOL, col_len);
@@ -1359,12 +1394,13 @@ ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
     in_ctx.ob = (uint8_t*)ray_data(out);
     in_ctx.ob_base = 0;
     ray_pool_t* pool = ray_pool_get();
-    if (pool && col_len >= RAY_PARALLEL_THRESHOLD && !ray_is_atom(col))
-        ray_pool_dispatch(pool, exec_in_worker, &in_ctx, col_len);
-    else
-        exec_in_worker(&in_ctx, 0, 0, col_len);
+    bool par = pool && col_len >= RAY_PARALLEL_THRESHOLD && !ray_is_atom(col);
+    if (par) ray_pool_dispatch(pool, exec_in_worker, &in_ctx, col_len);
+    else     exec_in_worker(&in_ctx, 0, 0, col_len);
     if (sv_hdr) ray_free(sv_hdr);
     if (lut_hdr) ray_free(lut_hdr);
+    /* A cancelled dispatch skips tasks, leaving their rows unwritten. */
+    if (par && pool_cancelled(pool)) { ray_release(out); return ray_error("cancel", "interrupted"); }
     return out;
 }
 
@@ -1567,6 +1603,8 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
     }
     if (st == IN_CTX_OOM)
         return ray_error("oom", NULL);
+    if (st == IN_CTX_CANCEL)
+        return ray_error("cancel", "interrupted");
 
     ray_t* out = ray_vec_new(RAY_BOOL, col_len);
     if (!out || RAY_IS_ERR(out)) {
@@ -1579,13 +1617,14 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
     in_ctx.ob_base = 0;
 
     ray_pool_t* pool = ray_pool_get();
-    if (pool && col_len >= RAY_PARALLEL_THRESHOLD && !ray_is_atom(col))
-        ray_pool_dispatch(pool, exec_in_worker, &in_ctx, col_len);
-    else
-        exec_in_worker(&in_ctx, 0, 0, col_len);
+    bool par = pool && col_len >= RAY_PARALLEL_THRESHOLD && !ray_is_atom(col);
+    if (par) ray_pool_dispatch(pool, exec_in_worker, &in_ctx, col_len);
+    else     exec_in_worker(&in_ctx, 0, 0, col_len);
 
     if (sv_hdr) ray_free(sv_hdr);
     if (lut_hdr) ray_free(lut_hdr);
+    /* A cancelled dispatch skips tasks, leaving their rows unwritten. */
+    if (par && pool_cancelled(pool)) { ray_release(out); return ray_error("cancel", "interrupted"); }
     return out;
 }
 
@@ -2453,7 +2492,10 @@ static ray_t* in_sel_parted(ray_col_src_t* src, ray_t* set_lit, bool negate, int
                 ray_col_src_advise(&s->src, 0, s->src.len);
             }
         }
-        if (st != IN_CTX_OK) { s->ready = true; in_seg_sel_free(segs, ns); return NULL; }   /* STR / GUID / OOM */
+        if (st != IN_CTX_OK) {   /* STR / GUID / OOM: the bool path; a cancel answers */
+            s->ready = true; in_seg_sel_free(segs, ns);
+            return st == IN_CTX_CANCEL ? ray_error("cancel", "interrupted") : NULL;
+        }
     }
     in_sel_parted_ctx_t pc = { segs, off, ns, NULL, NULL, NULL };
     if (within) {
@@ -2486,11 +2528,12 @@ static ray_t* in_sel_single_within(ray_col_src_t* src, ray_t* set_lit, bool nega
     in_seg_sel_t* seg = (in_seg_sel_t*)ray_calloc_raw(sizeof(in_seg_sel_t));
     if (!seg) return NULL;
     ray_scan_fail_t fail; ray_scan_fail_init(&fail);
-    if (in_build_worker_ctx_meta(src->type, src->attrs, src->may_null, src->dom, set_lit, negate,
-                                 seg->svf_stack, seg->svi_stack, &seg->ic, &seg->sv_hdr, &seg->lut_hdr) != IN_CTX_OK) {
+    in_ctx_status_t st = in_build_worker_ctx_meta(src->type, src->attrs, src->may_null, src->dom, set_lit, negate,
+                                 seg->svf_stack, seg->svi_stack, &seg->ic, &seg->sv_hdr, &seg->lut_hdr);
+    if (st != IN_CTX_OK) {
         seg->ready = true;                         /* nothing set up to free but the headers */
         in_seg_sel_free(seg, 1);
-        return NULL;
+        return st == IN_CTX_CANCEL ? ray_error("cancel", "interrupted") : NULL;
     }
     in_rfill_setup(&seg->rf, &seg->ic, src, &fail, negate, seg->kstack, seg->fstack);
     ray_col_src_advise(src, 0, nrows);
@@ -2549,15 +2592,19 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
     ray_t* col = ray_col_src_ready(src);
     if (col) {
         if (ray_is_atom(col) || RAY_IS_PARTED(col->type)) return NULL;
-        if (in_build_worker_ctx(col, set_lit, negate, svf_stack, svi_stack,
-                                &ic, &sv_hdr, &lut_hdr) != IN_CTX_OK)
+        in_ctx_status_t st = in_build_worker_ctx(col, set_lit, negate, svf_stack, svi_stack,
+                                                 &ic, &sv_hdr, &lut_hdr);
+        if (st == IN_CTX_CANCEL) return ray_error("cancel", "interrupted");
+        if (st != IN_CTX_OK)
             return NULL;  /* STR / OOM → bool-path fallback */
         in_sel_fill_ctx_t fctx = { &ic };
         sel = pred_sel_drive(nrows, in_sel_fill, &fctx, &fail, all_pass);
     } else {
-        if (in_build_worker_ctx_meta(src->type, src->attrs, src->may_null, src->dom,
-                                     set_lit, negate, svf_stack, svi_stack,
-                                     &ic, &sv_hdr, &lut_hdr) != IN_CTX_OK)
+        in_ctx_status_t st = in_build_worker_ctx_meta(src->type, src->attrs, src->may_null, src->dom,
+                                                      set_lit, negate, svf_stack, svi_stack,
+                                                      &ic, &sv_hdr, &lut_hdr);
+        if (st == IN_CTX_CANCEL) return ray_error("cancel", "interrupted");
+        if (st != IN_CTX_OK)
             return NULL;  /* STR / GUID / OOM → bool-path fallback */
         ray_col_src_advise(src, 0, nrows);
         in_sel_rfill_ctx_t fctx;

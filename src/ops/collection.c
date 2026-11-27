@@ -1139,6 +1139,15 @@ static ray_t* map_collect(ray_t** pres, ray_t* value, int64_t i, int64_t len,
  * passed whole on every call, whatever it is (so it is the same as map-right).
  * Also supports (map fn vec) for unary mapping.  Any other argument count is
  * an error: the extra arguments would be dropped without a word. */
+/* The walkers below call a function per element and poll for a cancel
+ * once per RAY_CANCEL_ROWS elements (#1782): a cancel answers `cancel`
+ * and frees what the walk built, as its error path does.  One mask test
+ * per element beside a call, in a statement of its own before the element
+ * is read, so the read compiles as it did. */
+#define WALK_CANCELLED(i) \
+    (RAY_UNLIKELY(((i) & (RAY_CANCEL_ROWS - 1)) == 0) && ray_cancel_poll())
+#define WALK_CANCEL_ERR() ray_error("cancel", "interrupted")
+
 /* map's loop over elements [i, end) of `coll`, `len` elements long, into
  * *pres: NULL when every element was collected, else the error (an
  * element's, the callback's, or the collector's), *pres then released or
@@ -1146,6 +1155,7 @@ static ray_t* map_collect(ray_t** pres, ray_t* value, int64_t i, int64_t len,
 static ray_t* map_walk(ray_t* fn, ray_t* val, ray_t* coll, int64_t i, int64_t end, int64_t len,
                        ray_t** pres, ray_dup_copy_t* dup) {
     for (; i < end; i++) {
+        if (WALK_CANCELLED(i)) { ray_release(*pres); *pres = NULL; return WALK_CANCEL_ERR(); }
         int owned = 0;
         ray_t* elem = iter_elem(coll, i, &owned);
         ray_t* value;
@@ -1471,6 +1481,7 @@ ray_t* ray_fold_fn(ray_t** args, int64_t n) {
         start = 0;
     }
     for (int64_t i = start; i < len; i++) {
+        if (WALK_CANCELLED(i)) { ray_release(acc); return WALK_CANCEL_ERR(); }
         int owned = 0;
         ray_t* elem = iter_elem(coll, i, &owned);
         ray_t* next = RAY_IS_ERR(elem) ? elem : call_fn2(fn, acc, elem);
@@ -1700,7 +1711,8 @@ ray_t* ray_prior_fn(ray_t** args, int64_t n) {
     ray_t** out = (ray_t**)ray_data(result);
     ray_t** elems = (ray_t**)ray_data(vec);
     for (int64_t i = 0; i < len; i++) {
-        out[i] = call_fn2(fn, elems[i], elems[i > 0 ? i - 1 : 0]);
+        out[i] = WALK_CANCELLED(i) ? WALK_CANCEL_ERR()
+                                   : call_fn2(fn, elems[i], elems[i > 0 ? i - 1 : 0]);
         if (RAY_IS_ERR(out[i])) {
             for (int64_t j = 0; j < i; j++) ray_release(out[j]);
             result->len = 0; ray_release(result); if (_bx) ray_release(_bx);
@@ -1738,6 +1750,7 @@ ray_t* ray_scan_fn(ray_t** args, int64_t n) {
     if (RAY_IS_ERR(out[0])) { ray_t* err = out[0]; ray_release(result); return err; }
     result->len = 1;
     for (int64_t i = 1; i < len; i++) {
+        if (WALK_CANCELLED(i)) { ray_release(result); return WALK_CANCEL_ERR(); }
         int owned = 0;
         ray_t* elem = iter_elem(coll, i, &owned);
         ray_t* next = RAY_IS_ERR(elem) ? elem : call_fn2(fn, out[i - 1], elem);
@@ -1918,6 +1931,7 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n) {
     ray_dup_copy_t dup;
     ray_dup_copy_begin(&dup);
     for (int64_t i = 0; i < len; i++) {
+        if (WALK_CANCELLED(i)) { ray_dup_copy_end(&dup); ray_release(result); return WALK_CANCEL_ERR(); }
         int owned_a = 0, owned_b = 0;
         ray_t* ea = iter_elem(a, i, &owned_a);
         ray_t* eb = RAY_IS_ERR(ea) ? ea : iter_elem(b, i, &owned_b);
@@ -8426,13 +8440,17 @@ static ray_t* map_iterate(ray_t* fn, ray_t* fixed, ray_t* vec, int fixed_is_left
     }
 
     for (int64_t i = 0; i < vn; i++) {
-        int alloc = 0;
-        ray_t* elem = collection_elem(vec, i, &alloc);
-        if (fixed_is_left)
-            results[i] = call_fn2(fn, fixed, elem);
-        else
-            results[i] = call_fn2(fn, elem, fixed);
-        if (alloc) ray_release(elem);
+        if (WALK_CANCELLED(i)) {
+            results[i] = WALK_CANCEL_ERR();
+        } else {
+            int alloc = 0;
+            ray_t* elem = collection_elem(vec, i, &alloc);
+            if (fixed_is_left)
+                results[i] = call_fn2(fn, fixed, elem);
+            else
+                results[i] = call_fn2(fn, elem, fixed);
+            if (alloc) ray_release(elem);
+        }
         if (RAY_IS_ERR(results[i])) {
             ray_t* err = results[i];
             for (int64_t j = 0; j < i; j++) ray_release(results[j]);
@@ -8508,6 +8526,7 @@ ray_t* ray_fold_while_fn(ray_t** args, int64_t n) {
     ray_t* acc = args[2];
     int64_t len = ray_len(coll);
     for (int64_t i = 0; i < len; i++) {
+        if (WALK_CANCELLED(i)) { ray_release(acc); return WALK_CANCEL_ERR(); }
         ray_t* keep = call_fn1(pred, acc);
         if (ray_is_lazy(keep)) keep = ray_lazy_materialize(keep);
         if (RAY_IS_ERR(keep)) { ray_release(acc); return keep; }
@@ -8552,6 +8571,7 @@ ray_t* ray_fold_right_fn(ray_t** args, int64_t n) {
         start = len - 1;
     }
     for (int64_t i = start; i >= 0; i--) {
+        if (WALK_CANCELLED(i)) { ray_release(acc); return WALK_CANCEL_ERR(); }
         int owned = 0;
         ray_t* elem = iter_elem(coll, i, &owned);
         ray_t* next = RAY_IS_ERR(elem) ? elem : call_fn2(fn, elem, acc);
@@ -8591,6 +8611,11 @@ ray_t* ray_scan_right_fn(ray_t** args, int64_t n) {
     out[len - 1] = iter_elem_owned(coll, len - 1);
     if (RAY_IS_ERR(out[len - 1])) { ray_t* err = out[len - 1]; ray_release(result); return err; }
     for (int64_t i = len - 2; i >= 0; i--) {
+        if (WALK_CANCELLED(i)) {
+            for (int64_t j = i + 1; j < len; j++) ray_release(out[j]);
+            ray_release(result);
+            return WALK_CANCEL_ERR();
+        }
         int owned = 0;
         ray_t* elem = iter_elem(coll, i, &owned);
         ray_t* next = RAY_IS_ERR(elem) ? elem : call_fn2(fn, elem, out[i + 1]);
