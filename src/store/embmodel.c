@@ -391,7 +391,11 @@ static ray_t* emb_file(const char* dir, const char* name) {
     ray_t* s = ray_read_file_fn(p);
     ray_release(p);
     if (!s) return ray_error("io", ".emb.model.get: cannot read %s", path);
-    if (RAY_IS_ERR(s)) { ray_release(s); return ray_error("io", ".emb.model.get: cannot read %s", path); }
+    if (RAY_IS_ERR(s)) {   /* the read's error, owned here: freed (ray_release leaves it, #1854) */
+        bool oom = strcmp(ray_err_code(s), "oom") == 0;
+        ray_error_free(s);
+        return oom ? ray_error("oom", NULL) : ray_error("io", ".emb.model.get: cannot read %s", path);
+    }
     return s;
 }
 
@@ -437,7 +441,7 @@ static int64_t emb_int(ray_t* doc, const char* path, ray_t* limits, int64_t miss
         if (v->type == -RAY_I64) out = v->i64;
         else if (v->type == -RAY_F64 && v->f64 == (double)(int64_t)v->f64) out = (int64_t)v->f64;
     }
-    if (v) ray_release(v);
+    if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);   /* owned here; ray_release leaves an error (#1854) */
     return out;
 }
 
@@ -618,7 +622,12 @@ static emb_tok_t* emb_read_tokenizer(const char* dir, ray_t* limits, ray_t** err
         EMB_FAIL("domain", ".emb.model.get: tokenizer.json holds a tokenizer of another kind than Unigram, which is the one kind read");
     /* The table of replacements is the normalizer itself, or one of a sequence of them. */
     norm = emb_field(doc, "normalizer", limits);
-    if (norm && RAY_IS_ERR(norm)) { ray_release(norm); norm = NULL; }
+    if (norm && RAY_IS_ERR(norm)) {
+        /* an oom is the failure, never "no normalizer"; any other error
+         * is read as no normalizer, as before.  Owned here (#1854). */
+        if (strcmp(ray_err_code(norm), "oom") == 0) { *err = norm; norm = NULL; goto done; }
+        ray_error_free(norm); norm = NULL;
+    }
     ray_release(doc); doc = NULL;
     map = emb_member(norm, "precompiled_charsmap");
     if (!map) {
