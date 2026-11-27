@@ -1379,10 +1379,9 @@ static ray_t* atomic_collapse_wide(ray_t* list) {
  * probe types the same way it would, cell by cell in the result's width,
  * and decline (NULL) every other shape, which keeps its boxed route:
  *
- *   fill   an int-family or F64 vector with a non-null int-family or
- *          float replacement, when the first cell is not null or the
- *          replacement has the vector's type (the probe types the result
- *          from its first cell);
+ *   fill   an int-family or F64 vector with a non-null replacement of
+ *          the vector's type (one of another type is cast to it first,
+ *          fill_other_type);
  *   min/max  int-family cells (I64 I32 I16 DATE TIME TIMESTAMP) against
  *          int-family cells of the same or a promotable type, or F64
  *          against F64 / an integer, as a vector against an atom or two
@@ -1436,13 +1435,11 @@ static ray_t* fastmap_fill(ray_t* r, ray_t* v) {
     if (!r || !v || r->type >= 0 || !ray_is_vec(v) || v->len == 0) return NULL;
     if (RAY_ATOM_IS_NULL(r)) return NULL;
     int8_t vt = v->type, rt = (int8_t)-r->type;
+    /* another type is cast to the vector's first (fill_other_type) */
+    if (rt != vt) return NULL;
     int64_t n = v->len;
     const void* src = ray_data(v);
-    bool first_null;
     if (fastmap_int_type(vt)) {
-        if (!fastmap_int_type(rt)) return NULL;
-        (void)fastmap_read_i64(src, vt, 0, &first_null);
-        if (first_null && rt != vt) return NULL;   /* the result takes r's type */
         int64_t rv = elem_as_i64(r);
         ray_t* out = ray_vec_new(vt, n);
         if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
@@ -1470,11 +1467,8 @@ static ray_t* fastmap_fill(ray_t* r, ray_t* v) {
         return out;
     }
     if (vt == RAY_F64) {
-        bool r_float = rt == RAY_F64 || rt == RAY_F32;
-        if (!r_float && rt != RAY_I64 && rt != RAY_I32 && rt != RAY_I16) return NULL;
         const double* s = (const double*)src;
-        if (s[0] != s[0] && rt != RAY_F64) return NULL;
-        double rv = r_float ? r->f64 : (double)elem_as_i64(r);
+        double rv = r->f64;
         ray_t* out = ray_vec_new(RAY_F64, n);
         if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
         out->len = n;
@@ -2201,6 +2195,94 @@ static inline bool map_cell_is_number(ray_t* x) {
     }
 }
 
+/* The numeric and temporal types: a value of one casts to any other. */
+static inline bool fill_num_type(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME:
+    case RAY_TIMESTAMP: case RAY_TIMESPAN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* fill_cast_replacement's answer for a cast `as` refuses (a TIMESPAN and a
+ * DATE, TIME or TIMESTAMP): not an object, never released. */
+static ray_t g_fill_cast_refused;
+
+/* fill's replacement cast to the type of the vector it fills, when both are
+ * numeric or temporal and of different types: (as 'T replacement).  NULL
+ * when there is nothing to cast, &g_fill_cast_refused when `as` refuses the
+ * cast; an allocation failure is its error. */
+static ray_t* fill_cast_replacement(ray_t* r, ray_t* v) {
+    if (!r || !v || RAY_IS_ERR(r) || RAY_IS_ERR(v) || !ray_is_vec(v)) return NULL;
+    int8_t vt = v->type;
+    int8_t rt = ray_is_vec(r) ? r->type : r->type < 0 ? (int8_t)-r->type : 0;
+    if (rt == vt || !fill_num_type(vt) || !fill_num_type(rt)) return NULL;
+    const char* tn = ray_type_name(vt);
+    ray_t* tsym = ray_sym(ray_sym_intern(tn, strlen(tn)));
+    if (!tsym || RAY_IS_ERR(tsym)) return tsym ? tsym : ray_error("oom", NULL);
+    ray_t* c = ray_cast_fn(tsym, r);
+    ray_release(tsym);
+    if (!c) return NULL;
+    if (RAY_IS_ERR(c)) {
+        if (strcmp(ray_err_code(c), "oom") == 0) return c;
+        ray_error_free(c);
+        ray_error_clear();
+        return &g_fill_cast_refused;
+    }
+    int8_t ct = ray_is_vec(c) ? c->type : (int8_t)-c->type;
+    if (ct != vt) { ray_release(c); return &g_fill_cast_refused; }
+    return c;
+}
+
+/* whether fill's replacement and vector are of different types: the cheap
+ * test before fill_other_type */
+static inline bool fill_types_differ(ray_t* r, ray_t* v) {
+    /* an atom of the vector's type has the negated tag, a vector its tag */
+    return r->type != -v->type && r->type != v->type;
+}
+
+/* fill over a vector with a replacement of another type (the rule above
+ * atomic_map_binary_op_c's call); NULL when the general path answers. */
+static __attribute__((noinline)) ray_t* fill_other_type(uint16_t dag_opcode, ray_t* left, ray_t* right) {
+    ray_binary_fn fn = ray_fill_fn;
+
+    ray_t* cast = fill_cast_replacement(left, right);
+    if (cast == &g_fill_cast_refused) {
+        /* the LIST of each cell, null or not first: the vector's cells
+         * mapped as a list's.  With no null nothing is replaced, and
+         * the vector answers as itself below. */
+        bool any_null = false;
+        for (int64_t i = 0; i < right->len && !any_null; i++)
+            any_null = ray_vec_is_null(right, i);
+        if (any_null) {
+            ray_t* cells = ray_list_new(right->len);
+            for (int64_t i = 0; i < right->len && cells && !RAY_IS_ERR(cells); i++) {
+                int a = 0;
+                ray_t* e = collection_elem(right, i, &a);
+                if (RAY_IS_ERR(e)) { ray_release(cells); return e; }
+                cells = ray_list_append(cells, e);
+                if (a) ray_release(e);
+            }
+            if (!cells || RAY_IS_ERR(cells)) return cells ? cells : ray_error("oom", NULL);
+            ray_t* r = atomic_map_binary_op(fn, dag_opcode, left, cells);
+            ray_release(cells);
+            return r;
+        }
+        return NULL;
+    }
+    if (cast) {
+        if (RAY_IS_ERR(cast)) return cast;
+        ray_t* r = atomic_map_binary_op(fn, dag_opcode, cast, right);
+        ray_release(cast);
+        return r;
+    }
+    return NULL;
+}
+
+
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
     if (RAY_UNLIKELY(map_memo_wanted(left) || map_memo_wanted(right)))
         return atomic_map_binary_op_memo(fn, dag_opcode, left, right);
@@ -2215,12 +2297,21 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_b
         (right && !RAY_IS_ERR(right) && RAY_IS_PARTED(right->type)))
         return atomic_map_binary_parted(fn, dag_opcode, left, right);
 
+    /* fill of a numeric or temporal vector with a replacement of another
+     * such type: the replacement is cast to the vector's type, as (as 'T r)
+     * would, so the result is the vector's type whichever cell comes first
+     * (#1778).  A replacement the cast refuses keeps the LIST of each cell
+     * (#1777). */
     /* fill / dyadic min / max over a fixed-width vector: one typed pass
      * (fastmap_fill, fastmap_minmax); NULL keeps the shape on the mapper */
     if (fn == ray_fill_fn || fn == ray_min2_fn || fn == ray_max2_fn) {
         ray_t* r = fn == ray_fill_fn ? fastmap_fill(left, right)
                                      : fastmap_minmax(fn == ray_min2_fn, left, right);
         if (r) return r;
+        if (fn == ray_fill_fn && fill_types_differ(left, right)) {
+            r = fill_other_type(dag_opcode, left, right);
+            if (r) return r;
+        }
     }
 
     bool duration_binary = fn == ray_add_fn || fn == ray_sub_fn || fn == ray_mul_fn ||

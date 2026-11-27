@@ -232,6 +232,7 @@ Rayfall performs automatic type promotion in certain contexts. These coercions h
 (type (sum (as 'F32 [1.5 2.5])))                    ; 'f64
 (mins (as 'F32 [2.5 -3.5 0Nf 1.25]))                ; [2.5e -3.5e -3.5e -3.5e]
 (fill 0.0 (as 'F32 [2.5 0Nf]))                      ; [2.5e 0.0e]
+(fill 3 [0Nf 1.5])                                  ; [3.0 1.5]: fill keeps the vector's type
 
 ; The wider type wins, whichever side it is on
 (type (+ [1h 2h] [3i 4i]))  ; 'I32
