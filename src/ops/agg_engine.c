@@ -11680,7 +11680,13 @@ static void agg_index_vectors_run(void* raw, uint32_t wid, int64_t start, int64_
     (void)wid; agg_index_vectors_t* c = raw;
     for (int64_t g = start; g < end && !agg_cancelled(); g++) {
         ray_t* value = ray_vec_new(RAY_I64, c->counts[g]);
-        if (!value || RAY_IS_ERR(value)) { ray_release(value); atomic_store(&c->failed, true); return; }
+        if (!value || RAY_IS_ERR(value)) {
+            /* the failed vector's error, made on this task and owned here;
+             * ray_release leaves an error object (#1848) */
+            ray_error_free(value);
+            atomic_store(&c->failed, true);
+            return;
+        }
         value->len = c->counts[g];
         memcpy(ray_data(value), c->rows + c->offsets[g], (size_t)value->len * sizeof(int64_t));
         c->values[g] = value;
@@ -11727,7 +11733,11 @@ ray_t* agg_group_indices(ray_t* source) {
     result = ray_dict_new(keys, values);
     keys = values = NULL;
 failed:
-    ray_release(keys); ray_release(values); ray_free_raw(scratch); agg_groups_free(&groups);
+    /* keys and values are owned here until the dict takes them; a failed
+     * one is an error object, which ray_release leaves (#1848) */
+    if (keys && RAY_IS_ERR(keys)) ray_error_free(keys); else ray_release(keys);
+    if (values && RAY_IS_ERR(values)) ray_error_free(values); else ray_release(values);
+    ray_free_raw(scratch); agg_groups_free(&groups);
     return result ? result : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
 }
 

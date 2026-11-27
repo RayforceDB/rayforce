@@ -16181,6 +16181,110 @@ static test_result_t test_eval_part_skip_date_part(void) {
     return r;
 }
 
+#ifdef DEBUG
+/* One query of the #1848 sweep: the nth allocation of its parsed
+ * evaluation fails, for every n it reaches.  Each run answers the
+ * unfailed answer or `oom`, keeping nothing either way.  Returns the oom
+ * count, or -1 after a failure (reported). */
+static int group_indices_sweep_one(const char* q) {
+    ray_t* ref = ray_eval_str(q);
+    if (!ref || RAY_IS_ERR(ref)) { fprintf(stderr, "  %s: no reference\n", q); return -1; }
+    ray_t* rf = ray_fmt(ref, 1);
+    ray_release(ref);
+    ray_t* parsed = ray_parse(q);
+    if (!rf || RAY_IS_ERR(rf) || !parsed || RAY_IS_ERR(parsed)) { fprintf(stderr, "  %s: no fmt or parse\n", q); return -1; }
+    int ooms = 0;
+    for (int64_t n = 1; n <= 20000; n++) {
+        ray_heap_gc();
+        bool traced = ray_mem_trace_begin();
+        ray_clear_error_trace();
+        ray_raise_clear();
+        ray_alloc_fail_set_for_test(n, 1);
+        ray_t* got = ray_eval(parsed);
+        ray_eval_request_end();
+        if (got && !RAY_IS_ERR(got) && ray_is_lazy(got)) got = ray_lazy_materialize(got);
+        bool fired = ray_alloc_fail_armed_for_test() == 0;
+        ray_alloc_fail_set_for_test(0, 0);
+        ray_clear_error_trace();
+        bool ok;
+        if (got && RAY_IS_ERR(got)) {
+            ok = strcmp(ray_err_code(got), "oom") == 0;
+            if (!ok) fprintf(stderr, "  %s, allocation %lld fails: %s, not oom\n", q, (long long)n, ray_err_code(got));
+            ray_error_free(got);
+            ooms++;
+        } else {
+            ray_t* gf = got ? ray_fmt(got, 1) : NULL;
+            ok = gf && !RAY_IS_ERR(gf) && ray_str_len(gf) == ray_str_len(rf) &&
+                 memcmp(ray_str_ptr(gf), ray_str_ptr(rf), ray_str_len(rf)) == 0;
+            if (!ok) fprintf(stderr, "  %s, allocation %lld fails: an answer, not the reference\n", q, (long long)n);
+            if (gf && RAY_IS_ERR(gf)) ray_error_free(gf); else if (gf) ray_release(gf);
+            if (got) ray_release(got);
+        }
+        ray_heap_gc();
+        ray_mem_trace_t tr = {0};
+        if (traced) ray_mem_trace_end(&tr);
+        if (ok && tr.net_bytes != 0) {
+            fprintf(stderr, "  %s, allocation %lld fails: %lld bytes kept\n", q, (long long)n, (long long)tr.net_bytes);
+            ok = false;
+        }
+        if (!ok) { ray_release(rf); ray_release(parsed); return -1; }
+        if (!fired) break;
+    }
+    ray_release(rf);
+    ray_release(parsed);
+    if (ooms == 0) fprintf(stderr, "  %s: no allocation failure answered oom\n", q);
+    return ooms;
+}
+
+/* #1848: building the group indices (`group`, a grouped update, the
+ * by: routes that group a key column) under an allocation failure, on
+ * the serial route and then, with 4 pool workers and 65,536 rows or more,
+ * on the parallel one (agg_group_indices).  A failed index vector was
+ * stored as the group's rows, and the grouped update read the error
+ * object as row numbers; on the parallel route a failed one's error was
+ * kept. */
+static test_result_t test_group_indices_alloc_fail(void) {
+    static const char* const setup[] = {
+        "(set G1848 (table [j v] (list (% (til 2000) 5) (til 2000))))",
+        "(set U1848 (guid 3))",
+        "(set U1848 (concat U1848 U1848))",   /* two rows of each guid */
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT(r && !RAY_IS_ERR(r), "setup");
+        ray_release(r);
+    }
+    static const char* const qs[] = {
+        "(update {v: (+ (sum v) 0) from: G1848 by: j})",
+        "(group (% (til 3000) 1500))",                              /* past the first 1024 groups */
+        "(group (concat (% (as 'F64 (til 40)) 3.0) (/ 0.0 0.0)))",  /* a NaN row */
+        "(group (concat (% (til 40) 3) 0Nl))",                      /* a null row */
+        "(group ['a 'b 'a])",
+        "(group [\"abcdefghijklmnopq\" \"bcdefghijklmnopqr\" \"abcdefghijklmnopq\"])",
+        "(group U1848)",
+        "(group (list 1 \"a\" 1 'x))",
+    };
+    for (size_t q = 0; q < sizeof qs / sizeof *qs; q++)
+        TEST_ASSERT_FMT(group_indices_sweep_one(qs[q]) > 0, "%s: an allocation failure answered other than the answer or oom keeping nothing", qs[q]);
+
+    /* the parallel route: 4 workers, 65,536 rows or more */
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* b = ray_eval_str("(set B1848 (table [j v] (list (% (til 66000) 20) (til 66000))))");
+    TEST_ASSERT(b && !RAY_IS_ERR(b), "setup");
+    ray_release(b);
+    static const char* const pqs[] = {
+        "(group (% (til 66000) 20))",
+        "(update {w: (sum v) from: B1848 by: j})",
+    };
+    for (size_t q = 0; q < sizeof pqs / sizeof *pqs; q++)
+        TEST_ASSERT_FMT(group_indices_sweep_one(pqs[q]) > 0, "%s: an allocation failure answered other than the answer or oom keeping nothing", pqs[q]);
+    ray_t* z = ray_eval_str("(do (set G1848 0) (set U1848 0) (set B1848 0))");
+    if (z && !RAY_IS_ERR(z)) ray_release(z);
+    PASS();
+}
+#endif
+
 const test_entry_t lang_entries[] = {
     { "lang/query/group_wide_null_masks", test_group_wide_null_masks, lang_setup, lang_teardown },
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
@@ -16724,6 +16828,9 @@ const test_entry_t lang_entries[] = {
     { "lang/col_private_sym_cell", test_col_private_sym_cell, lang_setup, lang_teardown },
     { "lang/capture_skips_private", test_capture_skips_private, lang_setup, lang_teardown },
     { "lang/row_arg_any_position", test_row_arg_any_position, lang_setup, lang_teardown },
+#ifdef DEBUG
+    { "lang/group_indices_alloc_fail", test_group_indices_alloc_fail, lang_setup, lang_teardown },
+#endif
 
     { "lang/eval/part_skip_date_part", test_eval_part_skip_date_part, lang_setup, lang_teardown },
     { NULL, NULL, NULL, NULL },

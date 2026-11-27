@@ -4440,7 +4440,9 @@ static void topk_wide_run(void* raw, uint32_t wid, int64_t start, int64_t end) {
         if (!cell || RAY_IS_ERR(cell)) {
             if (cell) {
                 ray_t* expected = NULL;
-                if (!atomic_compare_exchange_strong(&c->error, &expected, cell)) ray_release(cell);
+                /* another task's error is the answer: this one, owned here, is
+                 * freed (ray_release leaves an error object) */
+                if (!atomic_compare_exchange_strong(&c->error, &expected, cell)) ray_error_free(cell);
             }
             atomic_store(&c->oom, true); break;
         }
