@@ -176,6 +176,11 @@ collapses duplicates, `where` keeps the positions of the true rows):
 (select {price: (asc price) from: t})   ; ascending column
 ```
 
+The verb is the builtin the name holds, whatever it is spelled: a global
+alias `(set rv reverse)`, a lambda parameter or a `let` holding `reverse`
+reverses the column as `(reverse price)` does, and a name holding any other
+function keeps its row-by-row call (#1810).
+
 A `where:` clause is applied first, so the verb only sees the surviving rows.
 The positions `where` returns count those rows, not the table's:
 
