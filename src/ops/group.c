@@ -6544,7 +6544,11 @@ static void group_ht_rehash(group_ht_t* ht, const int8_t* key_types) {
     if (tgt > new_cap) new_cap = tgt;
     ray_t* new_h = NULL;
     uint32_t* new_slots = (uint32_t*)scratch_alloc(&new_h, (size_t)new_cap * sizeof(uint32_t));
-    if (!new_slots) return; /* OOM: keep old HT, it still works (just slower) */
+    /* OOM: the old table stays, but it fills; marked oom, it takes no more
+     * groups (the probes check it before inserting one), so it never fills
+     * (a full table has no empty slot to end a probe: it looped forever),
+     * and the caller answers `oom` (#1811). */
+    if (!new_slots) { ht->oom = 1; return; }
     scratch_free(ht->_h_slots);
     ht->_h_slots = new_h;
     ht->slots = new_slots;
@@ -7202,7 +7206,19 @@ static inline uint32_t group_probe_entry(group_ht_t* ht,
     for (;;) {
         uint32_t sv = ht->slots[slot];
         if (sv == HT_EMPTY) {
-            /* New group */
+            /* New group.  The slot table doubles before the insert that
+             * would take it past half full, and the probe starts again in
+             * the new table: a rehash that fails then leaves it at most
+             * half full, never full (a full table has no empty slot to end
+             * a probe), and the table takes no more groups (oom). */
+            if (RAY_UNLIKELY(ht->oom)) return mask;
+            if ((ht->grp_count + 1) * 2 > ht->ht_cap) {
+                group_ht_rehash(ht, key_types);
+                if (RAY_UNLIKELY(ht->oom)) return mask;
+                mask = ht->ht_cap - 1;
+                slot = (uint32_t)(hash & mask);
+                continue;
+            }
             if (ht->grp_count >= ht->grp_cap) {
                 if (!group_ht_grow(ht)) { ht->oom = 1; return mask; }
             }
@@ -7218,10 +7234,6 @@ static inline uint32_t group_probe_entry(group_ht_t* ht,
             /* Accumulator initialization clears the row-state region. */
             memcpy(row + ly->off_group_first, &entry_row, 8);
             ht->slots[slot] = HT_PACK(salt, gid);
-            if (ht->grp_count * 2 > ht->ht_cap) {
-                group_ht_rehash(ht, key_types);
-                mask = ht->ht_cap - 1;
-            }
             return mask;
         }
         if (HT_SALT_V(sv) == salt) {
@@ -8709,6 +8721,16 @@ static inline uint32_t group_merge_row(group_ht_t* ht,
     for (;;) {
         uint32_t sv = ht->slots[slot];
         if (sv == HT_EMPTY) {
+            /* as group_probe_entry: rehash before the insert that would
+             * pass half full, then probe again */
+            if (RAY_UNLIKELY(ht->oom)) return mask;
+            if ((ht->grp_count + 1) * 2 > ht->ht_cap) {
+                group_ht_rehash(ht, key_types);
+                if (RAY_UNLIKELY(ht->oom)) return mask;
+                mask = ht->ht_cap - 1;
+                slot = (uint32_t)(h & mask);
+                continue;
+            }
             if (ht->grp_count >= ht->grp_cap) {
                 if (!group_ht_grow(ht)) { ht->oom = 1; return mask; }
             }
@@ -8717,10 +8739,6 @@ static inline uint32_t group_merge_row(group_ht_t* ht,
             /* Whole-row copy: count + keys/null_mask + aggregator state. */
             memcpy(row, src_row, ly->row_stride);
             ht->slots[slot] = HT_PACK(salt, gid);
-            if (ht->grp_count * 2 > ht->ht_cap) {
-                group_ht_rehash(ht, key_types);
-                mask = ht->ht_cap - 1;
-            }
             return mask;
         }
         if (HT_SALT_V(sv) == salt) {
@@ -9689,7 +9707,13 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
         ray_t* new_col = out_type == RAY_LIST
             ? ray_list_new((int64_t)grp_count)
             : ray_vec_new(out_type, (int64_t)grp_count);
-        if (!new_col || RAY_IS_ERR(new_col)) continue;
+        if (!new_col || RAY_IS_ERR(new_col)) {
+            /* a column it cannot allocate is the answer's failure, never a
+             * column short: *result becomes the error (#1811) */
+            ray_release(*result);
+            *result = new_col ? new_col : ray_error("oom", NULL);
+            return;
+        }
         /* SYM MIN/MAX/FIRST/LAST: the emitted values are RAW cell ids
          * accumulated from ONE source column — the output resolves over
          * that column's dictionary (no-op while runtime-domain). */
@@ -15241,6 +15265,13 @@ static bool group_firstn_where_ok(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int6
 /* Test seam (ray_group_alloc_fail_for_test): the nth allocation of the
  * calling thread's own code (not the pool tasks it runs) while the
  * outermost group runs fails. */
+/* ray_group_test_radix_bufs_fail: the radix route's buffer table fails to
+ * allocate, as a failed calloc does, so the route takes its sequential
+ * fallback. */
+static _Atomic bool g_radix_bufs_fail_for_test;
+static _Atomic int64_t g_radix_bufs_forced;
+void ray_group_test_radix_bufs_fail(bool on) { atomic_store(&g_radix_bufs_fail_for_test, on); }
+int64_t ray_group_test_radix_bufs_forced(void) { return atomic_load(&g_radix_bufs_forced); }
 static _Thread_local int64_t g_group_fail_nth;
 static _Thread_local bool    g_group_fail_fired;
 static _Thread_local int64_t g_group_fail_left;
@@ -18922,6 +18953,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * #1780; an allocation), is the answer: the columns it left are the
          * integer default, not the aggregate. */
         ray_t* recompute_err = NULL;
+        if (RAY_IS_ERR(result)) { recompute_err = result; result = NULL; }   /* emit_agg_columns failed */
         for (uint32_t a = 0; a < n_aggs && !recompute_err; a++) {
             uint16_t aop = ext->agg_ops[a];
             if (!(agg_vecs[a] &&
@@ -20097,13 +20129,25 @@ da_path:;
                 return result ? result : ray_error("oom", NULL);
             }
 
+            /* A column or buffer the emit cannot allocate is the answer's
+             * failure (da_emit_err), never a column short or a write through NULL
+             * (#1811): the scratch below is declared first so its exit can
+             * free it. */
+            ray_t* da_emit_err = NULL;
+            ray_t *_h_dsum = NULL, *_h_dmin = NULL, *_h_dmax = NULL;
+            ray_t *_h_dsq = NULL, *_h_dcnt = NULL, *_h_dnn = NULL;
+            ray_t *_h_dsy = NULL, *_h_dsqy = NULL, *_h_dxy = NULL, *_h_dshi = NULL, *_h_dvk = NULL;
+
             /* Key columns — decompose composite slot back to per-key values */
             for (uint32_t k = 0; k < n_keys; k++) {
                 ray_t* src_col = da_key_cols[k];   /* the column or its stand-in */
                 if (!src_col) continue;
                 ray_t* key_col = col_vec_new(src_col, (int64_t)grp_count);
+                if (!key_col || RAY_IS_ERR(key_col)) {
+                    da_emit_err = key_col ? key_col : ray_error("oom", NULL);
+                    goto da_emit_done;
+                }
                 out_col_adopt_str_pool(key_col, src_col);
-                if (!key_col || RAY_IS_ERR(key_col)) continue;
                 /* group keys are RAW cell ids reconstructed from the DA
                  * slot — the output resolves over the source column's
                  * dictionary (no-op while runtime-domain). */
@@ -20123,13 +20167,11 @@ da_path:;
                 int64_t name_id = key_ext ? key_ext->sym : (int64_t)k;
                 result = ray_table_add_col(result, name_id, key_col);
                 ray_release(key_col);
+                if (RAY_IS_ERR(result)) { da_emit_err = result; result = NULL; goto da_emit_done; }
             }
 
             /* Agg columns — compact sparse DA arrays into dense, then emit */
             size_t dense_total = (size_t)grp_count * n_aggs;
-            ray_t *_h_dsum = NULL, *_h_dmin = NULL, *_h_dmax = NULL;
-            ray_t *_h_dsq = NULL, *_h_dcnt = NULL, *_h_dnn = NULL;
-            ray_t *_h_dsy = NULL, *_h_dsqy = NULL, *_h_dxy = NULL, *_h_dshi = NULL, *_h_dvk = NULL;
             int64_t*  dense_var_k   = merged->var_k ? (int64_t*)scratch_alloc(&_h_dvk, dense_total * sizeof(int64_t)) : NULL;
             da_val_t* dense_sum     = da_sum     ? (da_val_t*)scratch_alloc(&_h_dsum, dense_total * sizeof(da_val_t)) : NULL;
             int64_t*  dense_sum_hi  = da_sum_hi  ? (int64_t*)scratch_alloc(&_h_dshi, dense_total * sizeof(int64_t)) : NULL;
@@ -20146,6 +20188,17 @@ da_path:;
             int64_t*  dense_nn_counts = ((da_nn_count || da_sl_null) && grp_count)
                 ? (int64_t*)scratch_alloc(&_h_dnn, dense_total * sizeof(int64_t))
                 : NULL;
+            /* every buffer asked for above must be there (dense_total > 0) */
+            if (grp_count && n_aggs &&
+                ((merged->var_k && !dense_var_k) || (da_sum && !dense_sum) ||
+                 (da_sum_hi && !dense_sum_hi) || (da_min_val && !dense_min_val) ||
+                 (da_max_val && !dense_max_val) || (da_sumsq && !dense_sumsq) ||
+                 (da_sum_y && !dense_sum_y) || (da_sumsq_y && !dense_sumsq_y) ||
+                 (da_sumxy && !dense_sumxy) || ((da_nn_count || da_sl_null) && !dense_nn_counts))) {
+                da_emit_err = ray_error("oom", NULL);
+                goto da_emit_done;
+            }
+            if (grp_count && !dense_counts) { da_emit_err = ray_error("oom", NULL); goto da_emit_done; }
 
             uint32_t gi = 0;
             for (uint32_t s = 0; s < n_slots; s++) {
@@ -20181,6 +20234,8 @@ da_path:;
                              dense_counts, agg_affine, agg_prod, dense_sumsq,
                              dense_nn_counts, dense_sum_y, dense_sumsq_y, dense_sumxy, dense_var_k);
 
+        da_emit_done:
+            if (da_emit_err) { ray_release(result); result = da_emit_err; }
             scratch_free(_h_dsum); scratch_free(_h_dmin);
             scratch_free(_h_dmax);
             scratch_free(_h_dsq); scratch_free(_h_dcnt);
@@ -21540,6 +21595,13 @@ v2_done:;
         size_t n_bufs = (size_t)n_total * radix_n_parts;
         radix_bufs = (radix_buf_t*)scratch_calloc(&radix_bufs_hdr,
             n_bufs * sizeof(radix_buf_t));
+#ifdef DEBUG
+        if (radix_bufs && g_radix_bufs_fail_for_test) {   /* as a failed calloc */
+            atomic_fetch_add(&g_radix_bufs_forced, 1);
+            scratch_free(radix_bufs_hdr);
+            radix_bufs = NULL; radix_bufs_hdr = NULL;
+        }
+#endif
         if (!radix_bufs) goto sequential_fallback;
 
         /* Buffers start empty and grow from observed partition demand. */
@@ -22548,8 +22610,12 @@ v2_emit:;
     }
 
 sequential_fallback:;
-    /* Sequential path using row-layout HT */
+    /* Sequential path using row-layout HT.  An init that fails part-way
+     * keeps what it allocated (its slots): zeroed first, it is freed here,
+     * since cleanup frees single_ht only once it is final_ht (#1811). */
+    memset(&single_ht, 0, sizeof single_ht);
     if (!group_ht_init(&single_ht, ht_cap, &ght_layout)) {
+        group_ht_free(&single_ht);
         result = ray_error("oom", NULL);
         goto cleanup;
     }
@@ -22593,7 +22659,12 @@ sequential_fallback:;
         int8_t kt = src_col->type;
 
         ray_t* new_col = col_vec_new(src_col, (int64_t)grp_count);
-        if (!new_col || RAY_IS_ERR(new_col)) continue;
+        if (!new_col || RAY_IS_ERR(new_col)) {
+            /* the answer's failure, never a column short (#1811) */
+            ray_release(result);
+            result = new_col ? new_col : ray_error("oom", NULL);
+            goto cleanup;
+        }
         out_col_adopt_str_pool(new_col, src_col);
         /* HT rows hold RAW key cell ids copied from src_col — the
          * output resolves over its dictionary (no-op while runtime). */
@@ -22866,7 +22937,18 @@ sequential_fallback:;
             continue;
         } else {
             new_col = ray_vec_new(out_type, (int64_t)grp_count);
-            if (!new_col || RAY_IS_ERR(new_col)) continue;
+            if (!new_col || RAY_IS_ERR(new_col)) {
+                /* the answer's failure, never a column short (#1811): the
+                 * holistic columns not yet attached go with the result */
+                if (med_out) {
+                    for (uint32_t b = 0; b < n_aggs; b++)
+                        if (med_out[b] && !RAY_IS_ERR(med_out[b])) ray_release(med_out[b]);
+                    scratch_free(med_hdr);
+                }
+                ray_release(result);
+                result = new_col ? new_col : ray_error("oom", NULL);
+                goto cleanup;
+            }
             /* SYM MIN/MAX/FIRST/LAST emit RAW cell ids accumulated from
              * agg_col — the output resolves over its dictionary. */
             if (out_type == RAY_SYM)
