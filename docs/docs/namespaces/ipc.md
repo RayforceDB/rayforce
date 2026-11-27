@@ -105,6 +105,20 @@ While waiting for its response, `.ipc.send` keeps servicing the connection: an a
 
 For async fire-and-forget, see `.ipc.post` below. See [IPC & Serialization](../storage/ipc.md) for the wire format and message-type byte.
 
+### Remote assignments { #remote-assignments }
+
+The reply to `.ipc.send` is the value of the expression the peer evaluated, and `set` and `let` evaluate to the value they bind. So `(.ipc.send h "(set x expr)")` sends the whole value of `expr` back to the caller. That costs the transfer and the memory on both sides. Past the 256 MiB decoded payload limit ([IPC & Serialization](../storage/ipc.md)), the call fails for the caller with an `io` error, although the assignment succeeded on the server.
+
+To assign without receiving the value, make the expression return `null`: `(do (set x expr) null)`. Only a null crosses the wire, and an error raised on the server still comes back as the reply. `.ipc.post` sends no reply at all, so it avoids the transfer too, but it also drops a server error.
+
+```text
+(set h (.ipc.open "127.0.0.1:5078"))
+(.ipc.send h "(set e1 (til 50000000))")            ;; a 400 MB vector
+;; => io error: IPC result exceeds the 256 MiB decoded payload limit
+(.ipc.send h "(do (set e2 (til 50000000)) null)")  ;; => null
+(.ipc.send h "(list (count e1) (count e2))")       ;; => [50000000 50000000]
+```
+
 ## `.ipc.post` { #ipc-post }
 
 Signature: `(.ipc.post h msg)`. Sends `msg` asynchronously — fire-and-forget. Unlike `.ipc.send`, it does **not** wait for a reply: the peer runs the message through its `.ipc.on.async` hook (or default evaluation) and sends nothing back.

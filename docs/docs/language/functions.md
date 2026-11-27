@@ -597,8 +597,8 @@ spills exactly as it did before.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `set` | binary, special | Bind value to global variable | `(set x 42)` |
-| `let` | binary, special | Bind value to local variable (lexical scope); at the top level it binds a global, refused for a restricted caller | `(let y (+ x 1))` |
+| `set` | binary, special | Bind value to global variable. Returns the value it binds, so a large value assigned through `.ipc.send` comes back whole as the reply: `(.ipc.send h "(do (set x expr) null)")` assigns it and replies `null` (see [Remote assignments](../namespaces/ipc.md#remote-assignments)) | `(set x 42)` |
+| `let` | binary, special | Bind value to local variable (lexical scope); at the top level it binds a global, refused for a restricted caller. Returns the value it binds, as `set` does: sent through `.ipc.send`, that value is the reply (see [Remote assignments](../namespaces/ipc.md#remote-assignments)) | `(let y (+ x 1))` |
 | `if` | variadic, special | Conditional: (if c1 r1 c2 r2 ... else?) — first truthy condition wins. A boolean-vector condition chooses per row between the two arms, as in a query: both arms are always evaluated (their side effects happen, and an arm that raises raises), arms are vectors of its length or atoms, and a length-1 vector gives a 1-element vector. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types (DATE, TIME, TIMESTAMP, TIMESPAN) or a temporal beside a number raise `type` ([control flow](../language/control-flow.md#conditionals-if)) | `(if (> x 0) "pos" "neg")`, `(if [true false] [1 2] [3 4])` → `[1 4]` |
 | `do` | variadic, special | Sequential execution, returns last value. Inside a query the earlier forms run once per query, over the selected rows, and the last form is planned as if alone, seeing their `let`s ([`do` inside a query](../language/control-flow.md#do-inside-a-query)) | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |

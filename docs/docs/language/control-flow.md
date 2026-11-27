@@ -358,6 +358,8 @@ exists only to be counted.
 
 The variable `y` is not visible outside the `do` block.
 
+Both return the value they bind, as the `42` above shows. Sent to another process through `.ipc.send`, that value is the reply: see [Remote assignments](../namespaces/ipc.md#remote-assignments) for assigning a large value without receiving it back.
+
 ## Lambda Functions: fn
 
 Create anonymous functions with `fn`. Parameters are listed in square brackets:
