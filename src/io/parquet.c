@@ -1618,6 +1618,12 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
             if (!c->chunk_left && c->chunk.p != c->chunk.end) return "excess column pages";
         }
     }
+    /* A FLOAT or DOUBLE infinity is the float null (#1769), whatever page
+     * encoding wrote it; under strict import it collides with the null, as
+     * a NaN does. */
+    if ((s->physical == 4 || s->physical == 5) && *out &&
+        ray_vec_float_noinf(*out, 0, rows) && s->strict)
+        return PQ_PUT_FAIL;
     return NULL;
 }
 static const char* pq_discard(pq_column* c, pq_schema* s, int64_t rows) {

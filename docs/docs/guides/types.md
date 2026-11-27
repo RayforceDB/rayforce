@@ -52,7 +52,11 @@ print with the suffix so parsing the output preserves the element type;
 the configured display precision still controls decimal rounding.
 
 F64 and F32 values have a null sentinel but no positive or negative infinity
-value. Non-finite arithmetic results are returned as null (`0Nf`, `0Ne`), so an
+value; an infinity arriving through `de`, IPC or the Parquet reader is read as
+the null, and only a splayed or parted column (a LIST column's float cells
+included) written by an older build can still hold one (see
+[Float infinity compatibility](../storage/index.md#float-infinity-compatibility)).
+Non-finite arithmetic results are returned as null (`0Nf`, `0Ne`), so an
 overflowed result is treated as missing by null-aware operations such as `fill`
 and aggregates, except where a vector kernel does not flag the null it produces:
 `(sums [1e308 1e308])` ends in a null that `fill` replaces but `nil?` does not

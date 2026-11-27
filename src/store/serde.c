@@ -1345,7 +1345,8 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         case RAY_F32:
             if (*len < 4) return ray_error("domain", "deserialize atom: truncated f32, need 4 bytes");
             { float v; memcpy(&v, buf, 4); *len -= 4;
-              return is_null ? ray_typed_null(-RAY_F32)
+              /* a raw infinity is the float null (#1769) */
+              return is_null || __builtin_isinf(v) ? ray_typed_null(-RAY_F32)
                              : ray_f32(v); }
         case RAY_I64:
             if (*len < 8) return ray_error("domain", "deserialize atom: truncated i64, need 8 bytes");
@@ -1358,7 +1359,8 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         case RAY_F64:
             if (*len < 8) return ray_error("domain", "deserialize atom: truncated f64, need 8 bytes");
             { double v; memcpy(&v, buf, 8); *len -= 8;
-              return is_null ? ray_typed_null(type) : ray_f64(v); }
+              /* a raw infinity is the float null (#1769) */
+              return is_null || __builtin_isinf(v) ? ray_typed_null(type) : ray_f64(v); }
         case RAY_GUID:
             if (*len < 16) return ray_error("domain", "deserialize atom: truncated guid, need 16 bytes");
             *len -= 16;
@@ -1424,6 +1426,8 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         *len -= data_bytes;
 
         if (attrs & RAY_ATTR_HAS_NULLS) vec->attrs |= RAY_ATTR_HAS_NULLS;
+        /* a raw infinity from the wire or a file is the float null (#1769) */
+        if (type == RAY_F64 || type == RAY_F32) ray_vec_float_noinf(vec, 0, l);
         return vec;
     }
 

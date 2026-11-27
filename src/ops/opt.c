@@ -404,13 +404,13 @@ static bool fold_unary_const(ray_graph_t* g, ray_op_t* node) {
             folded = ray_bool(is_f64 ? vf == 0.0 : vi == 0);
             break;
         case OP_SQRT:
-            folded = ray_f64(sqrt(is_f64 ? vf : (double)vi));
+            folded = ray_f64(opt_f64_fin(sqrt(is_f64 ? vf : (double)vi)));
             break;
         case OP_LOG:
-            folded = ray_f64(log(is_f64 ? vf : (double)vi));
+            folded = ray_f64(opt_f64_fin(log(is_f64 ? vf : (double)vi)));
             break;
         case OP_EXP:
-            folded = ray_f64(exp(is_f64 ? vf : (double)vi));
+            folded = ray_f64(opt_f64_fin(exp(is_f64 ? vf : (double)vi)));
             break;
         case OP_SIN:
             folded = ray_f64(opt_f64_fin(sin(is_f64 ? vf : (double)vi)));

@@ -50,9 +50,25 @@ F64 and F32 have no infinity values or infinity literals. Non-finite results
 (positive or negative infinity and NaN) become the floating null, `0Nf` or
 `0Ne`; for atoms and the element-wise vector kernels `nil?` reports true for
 them. For example, `(/ 1 0)` and `(exp 1000)` both return `0Nf`, and
-`(+ 3e38e 3e38e)` returns `0Ne`. An overflow therefore cannot be distinguished
+`(+ 3e38e 3e38e)` returns `0Ne`. The same holds for a constant output of a
+`select` or `update`: `(select {r: (log 0.0) from: t})` gives a column of
+`0Nf`. An aggregate whose answer overflows although its inputs are finite
+gives the null too, in a direct call and in a `select` alike:
+`(med [1e308 1e308])` and `(quantile [-1e308 1e308] 0.5)` are `0Nf`. An overflow therefore cannot be distinguished
 from missing data after the operation. Check inputs or bounds before the
 operation if that distinction matters.
+
+An infinity that arrives from outside becomes the null where it enters: in `de`
+and everything that reads serialized data (an IPC message, the journal, an
+object file), and in the Parquet reader (`.parquet.read`, `.parquet.scan`,
+`.parquet.each` and the `.parquet.splayed` / `.parquet.parted` imports). F64
+gives `0Nf`, F32 `0Ne`, and the vector is flagged as holding nulls. CSV import
+and casts from text already read `inf` and an out-of-range number as the null.
+Splayed and parted column files, LIST columns included, are read as stored,
+so one written by an older build can still hold an infinity: a direct call
+and a `select` over it see the infinity. Re-importing or rewriting the table
+cleans it (see
+[Float infinity compatibility](../storage/index.md#float-infinity-compatibility)).
 
 One exception: not every vector kernel flags the null it produces.
 `(sums [1e308 1e308])` prints `[1.00e+308 nan]` and

@@ -590,3 +590,34 @@ generation-2 storage, or save the column without its index
 (`.idx.drop`). Hash indexes on other column types, including one an
 append extended, keep the format older readers read. Existing column
 tags and format generations retain their meanings.
+
+## Float infinity compatibility
+
+An F64 or F32 infinity now becomes the null where float data enters the
+engine: in the deserializer (`de`, an IPC message, the journal, an object
+file) and in the Parquet reader, including the `.parquet.splayed` and
+`.parquet.parted` imports (see [Floats](../language/syntax.md#floats)).
+
+Splayed and parted column files are not such a door: a column is read as it
+is stored, mapped or copied, and nothing is converted when a table is mounted
+or loaded. That holds for every column type. A LIST column is included: its
+F64 and F32 cells are rebuilt by the column reader, not by the deserializer.
+
+Builds before this change could write raw infinities into such files, for
+example by importing a Parquet file that held one with `.parquet.splayed`, or
+by saving with `.db.splayed.set` a vector read through `de` or
+`.parquet.read`, or a `select` whose output was a constant such as
+`(log 0.0)`. A column written that way, or a LIST column whose float cells
+hold one, keeps its infinities when it is loaded:
+
+- a direct call and a `select` over it both see the infinity (`(neg c)` is
+  `-inf` for an `inf` cell);
+- a cell taken as an atom (`(first c)`) is the infinity too, but the same atom
+  read through the deserializer (`(de (ser (first c)))`) is the null, and so
+  is a builtin's answer for it (`(neg (first c))` is `0Nf`).
+
+To clean a table, re-import it from its source, or read it through a door and
+write it again, for example `(.db.splayed.set dir (de (ser t)))` for a loaded
+table `t`. This build writes an infinity into a column file only when it
+copies one from such an old column.
+

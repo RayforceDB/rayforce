@@ -92,4 +92,11 @@ ray_err_t ray_str_pool_reserve(ray_t** pool, size_t len, int64_t* off);
  * the same length. Internal helper. */
 ray_err_t ray_vec_copy_nulls(ray_t* dst, const ray_t* src);
 
+/* A raw infinity in cells [off, off+n) of an F64 or F32 vector becomes the
+ * type's null, as the engine has no infinity value (#1769); HAS_NULLS is set
+ * when one did.  Called where float data enters: the deserializer (de, IPC,
+ * the journal, object files) and the Parquet reader.  Every other cell keeps
+ * its bits.  Returns whether one was found.  Other types: no-op. */
+bool ray_vec_float_noinf(ray_t* v, int64_t off, int64_t n);
+
 #endif /* RAY_VEC_H */

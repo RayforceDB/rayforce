@@ -1726,3 +1726,43 @@ ray_err_t ray_vec_copy_nulls(ray_t* dst, const ray_t* src) {
     }
     return RAY_OK;
 }
+
+bool ray_vec_float_noinf(ray_t* v, int64_t off, int64_t n) {
+    /* Blocks of 512 cells: a read-only test the compiler vectorises (the
+     * bits as integers, sign cleared, are exactly the exponent mask for an
+     * infinity), and a rewrite only of a block that holds one, so data
+     * with no infinity is read and never written. */
+    bool any = false;
+    if (v->type == RAY_F64) {
+        int64_t* d = (int64_t*)ray_data(v) + off;
+        const double nd = NULL_F64;
+        int64_t nb; memcpy(&nb, &nd, 8);
+        for (int64_t b = 0; b < n; b += 512) {
+            int64_t e = n - b < 512 ? n : b + 512, hit = 0;
+            for (int64_t i = b; i < e; i++)
+                hit |= (d[i] & INT64_C(0x7fffffffffffffff)) == INT64_C(0x7ff0000000000000);
+            if (RAY_LIKELY(!hit)) continue;
+            any = true;
+            for (int64_t i = b; i < e; i++)
+                if ((d[i] & INT64_C(0x7fffffffffffffff)) == INT64_C(0x7ff0000000000000)) d[i] = nb;
+        }
+    } else if (v->type == RAY_F32) {
+        int32_t* d = (int32_t*)ray_data(v) + off;
+        const float nf = NULL_F32;
+        int32_t nb; memcpy(&nb, &nf, 4);
+        for (int64_t b = 0; b < n; b += 512) {
+            int64_t e = n - b < 512 ? n : b + 512;
+            int32_t hit = 0;
+            for (int64_t i = b; i < e; i++)
+                hit |= (d[i] & INT32_C(0x7fffffff)) == INT32_C(0x7f800000);
+            if (RAY_LIKELY(!hit)) continue;
+            any = true;
+            for (int64_t i = b; i < e; i++)
+                if ((d[i] & INT32_C(0x7fffffff)) == INT32_C(0x7f800000)) d[i] = nb;
+        }
+    } else {
+        return false;
+    }
+    if (any) v->attrs |= RAY_ATTR_HAS_NULLS;
+    return any;
+}

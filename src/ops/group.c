@@ -3339,9 +3339,17 @@ static void med_per_group_fn(void* ctx_v, uint32_t worker_id,
             c->out_data[g] = NULL_F64;
             any_null = true;
         } else {
-            c->out_data[g] = c->use_quantile
+            /* A midpoint or an interpolation of two finite values can
+             * overflow ((1e308 + 1e308) / 2): the answer is the null, as
+             * the direct call's make_f64 gives.  Checked once per group. */
+            double a = c->use_quantile
                 ? ray_quantile_dbl_inplace(slice, actual, c->q)
                 : ray_median_dbl_inplace(slice, actual);
+            if (__builtin_expect(!(__builtin_fabs(a) <= DBL_MAX), 0)) {
+                a = NULL_F64;
+                any_null = true;
+            }
+            c->out_data[g] = a;
         }
     }
     if (any_null) atomic_store_explicit(&c->any_null, true, memory_order_relaxed);
@@ -3484,9 +3492,12 @@ static bool rank_large_group(med_par_ctx_t* source, int64_t group,
         lower = ray_nth_dbl_inplace(c.input, c.n, lo);
         upper = hi == lo ? lower : ray_nth_dbl_inplace(c.input, c.n, hi);
     }
-    *answer = source->use_quantile
+    /* Overflow from finite values is the null, as in med_per_group_fn. */
+    *answer = ray_f64_fin(source->use_quantile
         ? (fraction > 0 ? lower + fraction * (upper - lower) : lower)
-        : (valid % 2 ? lower : (lower + upper) / 2.0);
+        : (valid % 2 ? lower : (lower + upper) / 2.0));
+    if (*answer != *answer)
+        atomic_store_explicit(&source->any_null, true, memory_order_relaxed);
     return true;
 }
 

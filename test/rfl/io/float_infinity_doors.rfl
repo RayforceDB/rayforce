@@ -1,0 +1,99 @@
+;; An F64 or F32 infinity cannot enter the engine (#1769): where float data
+;; comes in from outside it becomes the type's null.  The deserializer (de,
+;; IPC receive, the journal, object files) and the Parquet reader (read,
+;; scan, each and the splayed/parted importers) both convert it.
+(set raw64 (fn [n p] (de (concat (take (ser (take 0.0 n)) 26) (take p (* 8 n))))))
+(set raw32 (fn [n p] (de (concat (take (ser (as 'F32 (take 0.0 n))) 26) (take p (* 4 n))))))
+(set PINF [0x00 0x00 0x00 0x00 0x00 0x00 0xf0 0x7f])
+(set NINF [0x00 0x00 0x00 0x00 0x00 0x00 0xf0 0xff])
+(set ONE [0x00 0x00 0x00 0x00 0x00 0x00 0xf0 0x3f])
+(set PINF32 [0x00 0x00 0x80 0x7f])
+(set NINF32 [0x00 0x00 0x80 0xff])
+;; de: vectors, flagged as holding nulls
+(raw64 3 PINF) -- [0Nf 0Nf 0Nf]
+(raw64 2 NINF) -- [0Nf 0Nf]
+(nil? (raw64 3 PINF)) -- [true true true]
+(raw32 3 PINF32) -- (as 'F32 [0Nf 0Nf 0Nf])
+(nil? (raw32 2 NINF32)) -- [true true]
+(set M (de (concat (take (ser (take 0.0 3)) 26) (concat ONE (concat PINF ONE)))))
+M -- [1.0 0Nf 1.0]
+(nil? M) -- [false true false]
+;; finite values and NaN payloads keep their bits
+(set Q (de (concat (take (ser (take 0.0 2)) 26) (concat ONE [0x01 0x00 0x00 0x00 0x00 0x00 0xf0 0x7f]))))
+(take (ser Q) -8) -- [0x01 0x00 0x00 0x00 0x00 0x00 0xf0 0x7f]
+(first Q) -- 1.0
+;; de: atoms
+(de (concat (take (ser 1.0) 18) PINF)) -- 0Nf
+(nil? (de (concat (take (ser 1.0) 18) NINF))) -- true
+(nil? (de (concat (take (ser (as 'F32 1.0)) 18) PINF32))) -- true
+;; a round trip through ser keeps a finite vector as it is
+(set F (- (* 0.37 (til 2000)) 300.5))
+(identical (de (ser F)) F) -- true
+;; with no infinity left, the direct call, the atom and a select agree
+(set V (raw64 9 PINF))
+(set T (table [x] (list V)))
+(nil? (at (select {r: (neg x) from: T}) 'r)) -- (nil? (neg V))
+(at (select {r: (floor x) from: T}) 'r) -- (floor V)
+(neg (first V)) -- 0Nf
+;; Parquet: DOUBLE and FLOAT, plain and dictionary-encoded, required and
+;; optional
+(set p0 (.parquet.read "test/data/parquet/infinities-0.parquet"))
+(set p1 (.parquet.read "test/data/parquet/infinities-1.parquet"))
+(at p0 'd) -- [0Nf 1.5 0Nf 2.5 0Nf 3.5 0Nf 4.5 5.5]
+(at p1 'd) -- [0Nf 1.5 0Nf 2.5 0Nf 3.5 0Nf 4.5 5.5]
+(at p0 'f) -- (as 'F32 [0Nf 1.5 0Nf 2.5 0Nf 3.5 0Nf 4.5 5.5])
+(at p1 'of) -- (as 'F32 [0Nf 0Nf 0Nf 2.5 0Nf 3.5 0Nf 4.5 5.5])
+(nil? (at p0 'od)) -- [true true true false true false true false false]
+(at (select {n: (neg d) from: (.parquet.scan "test/data/parquet/infinities-0.parquet")}) 'n) -- [0Nf -1.5 0Nf -2.5 0Nf -3.5 0Nf -4.5 -5.5]
+(.sys.exec "rm -rf /tmp/rf_float_infinity_doors && mkdir -p /tmp/rf_float_infinity_doors")
+(.parquet.splayed "test/data/parquet/infinities-1.parquet" "/tmp/rf_float_infinity_doors/s/") -- 9
+(at (.db.splayed.get "/tmp/rf_float_infinity_doors/s/") 'f) -- (as 'F32 [0Nf 1.5 0Nf 2.5 0Nf 3.5 0Nf 4.5 5.5])
+(.sys.exec "rm -rf /tmp/rf_float_infinity_doors")
+;; a constant select output folded when the query is planned gives the null
+;; as the atom does, so neg of it is the null in both forms
+(set C (table [x] (list [1.0 2.0 3.0])))
+(at (select {r: (log 0.0) from: C}) 'r) -- [0Nf 0Nf 0Nf]
+(at (select {r: (log 0) from: C}) 'r) -- [0Nf 0Nf 0Nf]
+(at (select {r: (exp 1000.0) from: C}) 'r) -- [0Nf 0Nf 0Nf]
+(nil? (at (select {r: (exp 1000.0) from: C}) 'r)) -- [true true true]
+(at (select {r: (neg (log 0.0)) from: C}) 'r) -- [0Nf 0Nf 0Nf]
+(neg (log 0.0)) -- 0Nf
+(at (select {r: (sqrt -1.0) from: C}) 'r) -- [0Nf 0Nf 0Nf]
+(at (select {r: (log 1.0) from: C}) 'r) -- [0.0 0.0 0.0]
+(set CE (table [x] (list [1.0e 2.0e 3.0e])))
+(at (select {r: (log 0.0e) from: CE}) 'r) -- [0Nf 0Nf 0Nf]
+(at (select {r: (exp 1000.0e) from: CE}) 'r) -- [0Nf 0Nf 0Nf]
+(at (update {r: (log 0.0) from: C}) 'r) -- [0Nf 0Nf 0Nf]
+(at (update {r: (exp 1000.0) from: C where: (> x 1.0)}) 'r) -- [0Nf 0Nf 0Nf]
+;; an aggregate whose answer overflows from finite inputs, a midpoint or an
+;; interpolation of two finite values, is the null in a select as in the
+;; direct call: without by:, with by:, a constant argument, and parted
+(set MA (table [k x] (list [a a b b] [1e308 1e308 -1e308 -1e308])))
+(set QA (table [k x] (list [a a b b] [-1e308 1e308 -1e308 1e308])))
+(med [1e308 1e308]) -- 0Nf
+(quantile [-1e308 1e308] 0.5) -- 0Nf
+(at (select {r: (med x) from: (take MA 2)}) 'r) -- [0Nf]
+(nil? (at (select {r: (med x) from: (take MA 2)}) 'r)) -- [true]
+(at (select {r: (med x) from: MA by: k}) 'r) -- [0Nf 0Nf]
+(at (select {r: (med [1e308 1e308]) from: (take MA 2)}) 'r) -- [0Nf]
+(at (select {r: (quantile x 0.5) from: (take QA 2)}) 'r) -- [0Nf]
+(nil? (at (select {r: (quantile x 0.5) from: QA by: k}) 'r)) -- [true true]
+(at (select {r: (quantile x 0.25) from: QA by: k}) 'r) -- [0Nf 0Nf]
+(at (select {r: (quantile [-1e308 1e308] 0.5) from: (take QA 2)}) 'r) -- [0Nf]
+(at (select {r: (percentile x 50) from: (take QA 2)}) 'r) -- [0Nf]
+(at (select {r: (percentile x 50) from: QA by: k}) 'r) -- [0Nf 0Nf]
+(at (update {r: (med x) from: MA by: k}) 'r) -- [0Nf 0Nf 0Nf 0Nf]
+(set MB (table [k x] (list (take 'a 100000) (take 1e308 100000))))
+(at (select {r: (med x) from: MB by: k}) 'r) -- [0Nf]
+(.sys.exec "rm -rf /tmp/rf_float_infinity_doors")
+(.db.splayed.set "/tmp/rf_float_infinity_doors/p/2024.01.01/t/" (take MA 2))
+(.db.splayed.set "/tmp/rf_float_infinity_doors/p/2024.01.02/t/" (take MA 2))
+(set PM (.db.parted.get "/tmp/rf_float_infinity_doors/p/" 't))
+(at (select {r: (med x) from: PM}) 'r) -- [0Nf]
+(at (select {r: (med x) from: PM by: k}) 'r) -- [0Nf]
+(.db.splayed.set "/tmp/rf_float_infinity_doors/q/2024.01.01/t/" (take QA 2))
+(.db.splayed.set "/tmp/rf_float_infinity_doors/q/2024.01.02/t/" (take QA 2))
+(set PQ (.db.parted.get "/tmp/rf_float_infinity_doors/q/" 't))
+(at (select {r: (quantile x 0.5) from: PQ}) 'r) -- [0Nf]
+(at (select {r: (percentile x 50) from: PQ by: k}) 'r) -- [0Nf]
+(.sys.exec "rm -rf /tmp/rf_float_infinity_doors")
