@@ -296,6 +296,13 @@ A top-level `or` narrows to the partitions any of its operands keeps; an operand
 
 `(within c [lo hi])` narrows as `(and (>= c lo) (<= c hi))` does, on the key and on a data column, when the range is a typed two-element vector, written or bound to a name. A null bound narrows nothing; the other bound still narrows. Under `not`, `within` narrows as `(or (< c lo) (> c hi))` does, and only when both bounds are usable.
 
+A date part of the partition key compared with an integer literal narrows too: `yyyy`, `mm`, `dd`, `dow` and `doy` on a date key, and also `hh`, `minute` and `ss` on a timestamp key. Every row of a partition holds its key, so the part is the partition's, and the partitions narrow as their keys' parts compare:
+- `(== (yyyy date) 2024)` reads the partitions of 2024;
+- `(in (mm date) [6 7 8])` reads the summer's;
+- `(>= (hh part) 9)` reads those from nine o'clock.
+
+This holds for every comparison, `in`, `within`, and under `and`, `or` and `not`, and in `by:` and outputs as well, e.g. `by: {m: (mm date)}`. The accessor is the function the head holds, so an alias of `yyyy` narrows as `yyyy` does. A name rebound to another function, or a lexical local of that name, narrows nothing. The literal is an `I64` atom, or an `I64` vector for an `in`. Another type (`2024i`), a computed bound or a column keeps every partition, and the where still decides the rows.
+
 ## Symbol Table Persistence
 
 The global symbol intern table maps strings to integer IDs. When saving data to disk, the symbol table must be persisted so that symbol vectors can be correctly interpreted when reloaded.

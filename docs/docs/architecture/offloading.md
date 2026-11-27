@@ -61,6 +61,8 @@ Supported predicates:
 
 Multiple filter predicates on the partition column are combined with AND — each narrows the set of active partitions further.
 
+A date part of the partition column compared with a constant prunes as well. For example, `(== (yyyy date) 2024)` or `(in (mm date) [6 7 8])`: the accessor is applied to the partition keys and the comparison to its answers (see [Partition Pruning](../storage/index.md#partition-pruning)).
+
 !!! note "Pruning applies to all partition types"
     Date-partitioned (`YYYY.MM.DD`), integer-partitioned, and symbol-partitioned tables all support pruning. Symbol partition keys in `MAPCOMMON` are stored as 64-bit intern IDs (the key_values vector is always `RAY_SYM_W64`), and SYM atom constants also carry the intern ID, so equality comparisons work correctly.
 

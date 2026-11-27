@@ -25567,6 +25567,37 @@ static uint16_t prune_cmp_negate(uint16_t op) {
     }
 }
 
+/* A native date-part accessor (yyyy, mm, dd, hh, minute, ss, dow, doy),
+ * unshadowed (fn from prune_head_fn): judged by the function the name
+ * holds, so an alias of one is one, and a name rebound to anything else is
+ * not (#1842).  Each answers one value per element, the same on a
+ * partition's key as on each of its rows. */
+static bool prune_part_head(ray_t* fn) {
+    if (!fn || fn->type != RAY_UNARY || (fn->attrs & RAY_FN_SPECIAL_FORM)) return false;
+    ray_unary_fn f = (ray_unary_fn)(uintptr_t)fn->i64;
+    return f == ray_extract_yyyy_fn || f == ray_extract_mm_fn || f == ray_extract_dd_fn ||
+           f == ray_extract_hh_fn || f == ray_extract_minute_fn || f == ray_extract_ss_fn ||
+           f == ray_extract_dow_fn || f == ray_extract_doy_fn;
+}
+
+/* The partition key's values seen through a date part: for `x` a call of
+ * a native date-part accessor on the key column `key_id`, the accessor of
+ * the key values `kv` (one per partition, as each of the partition's rows
+ * holds), an I64 vector.  Owned; NULL for anything else, or when the
+ * accessor declines the key's type. */
+static ray_t* prune_key_part(ray_t* x, ray_t* tbl, int64_t key_id, ray_t* kv) {
+    if (!x || x->type != RAY_LIST || (x->attrs & ATTR_QUOTED) || ray_len(x) != 2 || key_id < 0) return NULL;
+    ray_t** el = (ray_t**)ray_data(x);
+    if (prune_col_name(el[1]) != key_id) return NULL;
+    ray_t* fn = prune_head_fn(el[0], tbl);
+    if (!prune_part_head(fn)) return NULL;
+    ray_t* dv = ((ray_unary_fn)(uintptr_t)fn->i64)(kv);
+    if (!dv) return NULL;
+    if (RAY_IS_ERR(dv)) { ray_error_free(dv); return NULL; }
+    if (dv->type != RAY_I64 || dv->len != kv->len) { ray_release(dv); return NULL; }
+    return dv;
+}
+
 /* Is `head` the native `within`, unshadowed (fn from prune_head_fn)? */
 static bool prune_within_head(ray_t* head, ray_t* fn) {
     return fn && fn->type == RAY_BINARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
@@ -25695,6 +25726,25 @@ static void prune_cmp_mask_at(uint16_t op, ray_t* x1, ray_t* x2, ray_t* tbl, int
     ray_t* rb = prune_bound_const(x2, tbl, op == OP_IN);
     ray_t* l = lb && lb->type != -RAY_SYM ? lb : x1;
     ray_t* r = rb && rb->type != -RAY_SYM ? rb : x2;
+    /* a date part of the key against a literal (#1842): every row of a
+     * partition holds its key, so its part is the partition's, and the
+     * partitions compare as the key does, through those values */
+    ray_t* kp = kv ? prune_key_part(l, tbl, key_id, kv) : NULL;
+    bool kp_left = kp != NULL;
+    if (!kp && kv && op != OP_IN) kp = prune_key_part(r, tbl, key_id, kv);
+    if (kp) {
+        ray_t* lit = kp_left ? r : l;
+        bool ok = lit && (op == OP_IN
+            ? lit->type == RAY_I64 && !(lit->attrs & ATTR_QUOTED)        /* a typed vector literal */
+            : lit->type == -RAY_I64 && !RAY_ATOM_IS_NULL(lit));
+        if (ok) {
+            memset(tmp, 0, (size_t)n_words * sizeof(uint64_t));
+            if (ray_part_prune_mask(kp, op, !kp_left, lit, tmp))
+                for (int64_t w = 0; w < n_words; w++) acc[w] &= tmp[w];
+        }
+        ray_release(kp);
+        return;
+    }
     int64_t l_col = prune_col_name(l), r_col = prune_col_name(r);
     bool l_key = key_id >= 0 && l_col == key_id, r_key = key_id >= 0 && r_col == key_id;
     if (l_key == r_key) {
@@ -25961,6 +26011,10 @@ static bool prune_where_not_cond(ray_t* e, ray_t* tbl, int* budget, int depth) {
     if (!within && (!op || op == OP_IN || ray_len(e) != 3)) return false;
     for (int i = 1; i <= (within ? 1 : 2); i++) {
         ray_t* a = el[i];
+        /* a date part of a column: an I64 per row (#1842) */
+        if (a && a->type == RAY_LIST && !(a->attrs & ATTR_QUOTED) && ray_len(a) == 2 &&
+            prune_part_head(prune_head_fn(((ray_t**)ray_data(a))[0], tbl)))
+            a = ((ray_t**)ray_data(a))[1];   /* not-a-table */
         if (!a || a->type >= 0 || (a->type == -RAY_SYM && (a->attrs & ATTR_QUOTED))) return false;
         if (a->type == -RAY_SYM) {
             if (prune_bound_const(a, tbl, false)) continue;
@@ -26150,6 +26204,9 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
         return prune_where_elementwise_impl(el[1], tbl, sub) && el[2] &&
                ((el[2]->type < 0 && el[2]->type != -RAY_SYM) ||
                 (el[2]->type == -RAY_SYM && prune_bound_const(el[2], tbl, false)));
+    /* a date part of one value reads only that value (#1842) */
+    if (n == 2 && prune_part_head(fn))
+        return prune_where_elementwise_impl(el[1], tbl, sub);
     /* within: a row's answer reads only that row and a constant range (#1500) */
     if (n == 3 && prune_within_head(el[0], fn))
         return prune_where_elementwise_impl(el[1], tbl, sub) && prune_within_range(el[2], tbl);

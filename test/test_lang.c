@@ -16101,6 +16101,86 @@ static test_result_t test_sym_private_range(void) {
     PASS();
 }
 
+/* A where on a date part of the partition key (yyyy mm dd hh minute ss dow
+ * doy) opens only the partitions whose key's part can pass (#1842): every
+ * row of a partition holds its key.  Recognised by the function the head
+ * holds: an alias prunes, a formal of the same name or a literal of
+ * another type does not; the answers are the flat copy's either way. */
+static test_result_t test_eval_part_skip_date_part(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root), "/tmp/rayforce_lang_part_skip_dpart_%ld", (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    /* Thu 2023.06.01, Mon 2024.01.01, Sat 2024.06.15, Wed 2025.01.01, Wed 2025.12.31 */
+    static const char* const dparts[] = { "2023.06.01", "2024.01.01", "2024.06.15", "2025.01.01", "2025.12.31" };
+    static const char* const tparts[] = { "2024.01.01.10.00.00", "2024.01.01.11.30.00", "2024.02.01.10.00.05" };
+    char src[1024];
+    for (int i = 0; i < 5; i++) {
+        n = snprintf(src, sizeof(src), "(.db.splayed.set \"%s/d/%s/t/\" (table [v] (list (+ %d [1 2 3]))))",
+                     root, dparts[i], 10 * i);
+        TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format splayed set");
+        ray_t* w = ray_eval_str(src);
+        TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w)); ray_release(w);
+    }
+    for (int i = 0; i < 3; i++) {
+        n = snprintf(src, sizeof(src), "(.db.splayed.set \"%s/t/%s/t/\" (table [v] (list (+ %d [1 2]))))",
+                     root, tparts[i], 10 * i);
+        TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format splayed set");
+        ray_t* w = ray_eval_str(src);
+        TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w)); ray_release(w);
+    }
+    n = snprintf(src, sizeof(src),
+                 "(do (set pd (.db.parted.get \"%s/d/\" 't)) (set pt (.db.parted.get \"%s/t/\" 't))"
+                 " (set fd (table [date v] (list (at pd 'date) (at pd 'v))))"
+                 " (set ft (table [part v] (list (at pt 'part) (at pt 'v))))"
+                 " (set yr yyyy) (set mon mm) 0)", root, root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format parted get");
+    ray_t* w = ray_eval_str(src);
+    TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w)); ray_release(w);
+    static const part_skip_t cases[] = {
+        { "(select {from: %s where: (== (yyyy date) 2024)})", false, 3 },
+        { "(select {from: %s where: (== 2024 (yyyy date))})", false, 3 },
+        { "(select {from: %s where: (== (mm date) 6)})", false, 3 },
+        { "(select {from: %s where: (== (dd date) 1)})", false, 2 },
+        { "(select {from: %s where: (>= (yyyy date) 2025)})", false, 3 },
+        { "(select {from: %s where: (< (yyyy date) 2024)})", false, 4 },
+        { "(select {from: %s where: (!= (yyyy date) 2024)})", false, 2 },
+        { "(select {from: %s where: (within (yyyy date) [2024 2024])})", false, 3 },
+        { "(select {from: %s where: (in (mm date) [1 12])})", false, 2 },
+        { "(select {from: %s where: (== (dow date) 3)})", false, 3 },
+        { "(select {from: %s where: (== (doy date) 1)})", false, 3 },
+        { "(select {from: %s where: (and (== (yyyy date) 2025) (> v 30))})", false, 3 },
+        { "(select {from: %s where: (or (== (yyyy date) 2023) (== (dd date) 31))})", false, 3 },
+        { "(select {from: %s where: (not (== (yyyy date) 2024))})", false, 2 },
+        { "(select {from: %s where: (and (== (yyyy date) 2024) (>= date 2024.03.01))})", false, 4 },
+        { "(select {s: (sum v) from: %s where: (== (yyyy date) 2024) by: {m: (mm date)}})", false, 3 },
+        { "(select {y: (yyyy date) v: v from: %s where: (== (mm date) 1)})", false, 3 },
+        /* an alias holds the same function */
+        { "(select {from: %s where: (== (yr date) 2024)})", false, 3 },
+        { "(select {from: %s where: (in (mon date) [6])})", false, 3 },
+        /* what it cannot prove reads every partition, as before */
+        { "((fn [yyyy] (select {from: %s where: (== (yyyy date) 2024)})) (fn [x] 2024))", false, 0 },
+        { "(select {from: %s where: (== (yyyy date) 2024i)})", false, 0 },
+        { "(select {from: %s where: (== (yyyy date) (+ 2023 1))})", false, 0 },
+        { "(select {from: %s where: (== (yyyy date) v)})", false, 0 },
+        { "(select {from: %s where: (or (== (yyyy date) 2024) (> v 0))})", false, 0 },
+        /* a timestamp key */
+        { "(select {from: %s where: (== (hh part) 10)})", true, 1 },
+        { "(select {from: %s where: (== (minute part) 30)})", true, 2 },
+        { "(select {from: %s where: (== (ss part) 5)})", true, 2 },
+        { "(select {from: %s where: (and (== (mm part) 1) (== (hh part) 11))})", true, 2 },
+        { "(select {from: %s where: (== (dd part) 1)})", true, 0 },
+    };
+    test_result_t r = { TEST_PASS, NULL };
+    for (size_t i = 0; r.status == TEST_PASS && i < sizeof cases / sizeof cases[0]; i++)
+        r = part_skip_case(cases[i].q, cases[i].ts_key ? "pt" : "pd", cases[i].ts_key ? "ft" : "fd",
+                           cases[i].pruned);
+    ray_release(ray_eval_str("(do (set yr 0) (set mon 0) 0)"));
+    lang_parted_insert_rm_rf(root);
+    return r;
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/query/group_wide_null_masks", test_group_wide_null_masks, lang_setup, lang_teardown },
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
@@ -16645,5 +16725,6 @@ const test_entry_t lang_entries[] = {
     { "lang/capture_skips_private", test_capture_skips_private, lang_setup, lang_teardown },
     { "lang/row_arg_any_position", test_row_arg_any_position, lang_setup, lang_teardown },
 
+    { "lang/eval/part_skip_date_part", test_eval_part_skip_date_part, lang_setup, lang_teardown },
     { NULL, NULL, NULL, NULL },
 };
