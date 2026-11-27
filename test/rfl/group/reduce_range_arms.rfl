@@ -96,7 +96,7 @@
 ;; reduction (per-row sentinel skip path).
 (avg (as 'I16 [10 0N 20 0N 30])) -- 20.0
 (< (abs (- (var_pop (as 'I32 [2 0N 4 0N 4 0N 4 5 5 7 9])) 4.0)) 0.0001) -- true
-(< (abs (- (stddev_pop (as 'I16 [2 0N 4 0N 4 0N 4 5 5 7 9])) 2.0)) 0.0001) -- true
+(< (abs (- (dev_pop (as 'I16 [2 0N 4 0N 4 0N 4 5 5 7 9])) 2.0)) 0.0001) -- true
 
 ;; F64 + nulls + avg: F64 reduce_range HAS_NULLS=1 plus the OP_AVG
 ;; finaliser's null-aware divisor (uses non-null count).

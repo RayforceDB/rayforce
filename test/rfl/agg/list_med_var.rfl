@@ -50,7 +50,7 @@
 ;; ─── var/stddev on list (var_stddev_core list branch: lines 593-607) ──
 ;; Basic: list [1 2 3 4 5], pop_var = 2.0, sample_var = 2.5
 (var_pop  (list 1 2 3 4 5)) -- 2.0
-(stddev_pop (list 1 2 3 4 5)) -- 1.4142135623730951
+(dev_pop (list 1 2 3 4 5)) -- 1.4142135623730951
 ;; Sample variance on the same list.
 (< (abs (- (var (list 2 4 4 4 5 5 7 9)) 4.571428571428571)) 0.000001) -- true
 ;; Null skipping in list: 0Ni is skipped.
@@ -65,7 +65,7 @@
 (nil? (stddev (list 42.0))) -- true
 ;; Single-element list for pop: → 0.0.
 (var_pop   (list 42.0)) -- 0.0
-(stddev_pop (list 42.0)) -- 0.0
+(dev_pop (list 42.0)) -- 0.0
 ;; Return type f64.
 (type (var (list 1.0 2.0 3.0))) -- 'f64
 

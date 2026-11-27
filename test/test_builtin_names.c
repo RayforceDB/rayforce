@@ -44,12 +44,12 @@ extern ray_runtime_t *__RUNTIME;
 static void names_setup(void) { ray_runtime_create(0, NULL); }
 static void names_teardown(void) { ray_runtime_destroy(__RUNTIME); }
 
+/* Empty since #1826 removed stddev_pop, read-csv and write-csv: a pair added
+ * here goes above the terminator, with its reason. */
 static const struct { const char* a; const char* b; const char* reason; } k_allowed[] = {
-    { "dev_pop",    "stddev_pop", "pending owner decision (#1814 audit)" },
-    { ".csv.read",  "read-csv",   "pending owner decision (#1814 audit)" },
-    { ".csv.write", "write-csv",  "pending owner decision (#1814 audit)" },
+    { NULL, NULL, NULL },
 };
-enum { N_ALLOWED = sizeof k_allowed / sizeof *k_allowed };
+enum { N_ALLOWED = sizeof k_allowed / sizeof *k_allowed - 1 };
 
 enum { MAX_FNS = 4096 };
 typedef struct { char name[96]; int8_t type; int64_t fn; } fn_entry_t;
@@ -108,7 +108,7 @@ static test_result_t test_no_two_names_one_function(void) {
     }
     free(ids); free(vals);
     TEST_ASSERT_FMT(s.n > 300, "only %d builtins found", s.n);
-    bool seen[N_ALLOWED] = { false };
+    bool seen[N_ALLOWED + 1] = { false };
     for (int i = 0; i < s.n; i++)
         for (int j = i + 1; j < s.n; j++) {
             if (s.e[i].type != s.e[j].type || s.e[i].fn != s.e[j].fn) continue;

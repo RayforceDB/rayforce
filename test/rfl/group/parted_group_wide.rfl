@@ -92,7 +92,7 @@
 (.db.splayed.set "/tmp/rfl_pgwn/2024.01.02/t/" (mknull 600 600))
 (set Pn (.db.parted.get "/tmp/rfl_pgwn/" 't))
 (set Fn (concat (mknull 600 0) (mknull 600 600)))
-(set qn (fn [T] (select {a: (avg f) v: (var f) vp: (var_pop f) d: (dev f) sd: (stddev f) sp: (stddev_pop f) ak: (avg k) vk: (var k) dk: (dev k) fi: (first f) la: (last k) from: T by: g asc: g})))
+(set qn (fn [T] (select {a: (avg f) v: (var f) vp: (var_pop f) d: (dev f) sd: (stddev f) sp: (dev_pop f) ak: (avg k) vk: (var k) dk: (dev k) fi: (first f) la: (last k) from: T by: g asc: g})))
 (set Bn (at (.sys.mem) 'group-perpart-runs))
 (set NP (qn Pn))
 (> (at (.sys.mem) 'group-perpart-runs) Bn) -- true

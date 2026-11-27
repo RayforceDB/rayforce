@@ -10,7 +10,7 @@ BOOL,prod,no,i64,I64,yes,typed streaming
 BOOL,var,no,f64,F64,yes,typed streaming
 BOOL,var_pop,no,f64,F64,yes,typed streaming
 BOOL,stddev,no,f64,F64,yes,typed streaming
-BOOL,stddev_pop,no,f64,F64,yes,typed streaming
+BOOL,dev_pop,no,f64,F64,yes,typed streaming
 BOOL,all,yes,b8,B8,yes,typed streaming
 BOOL,any,yes,b8,B8,yes,typed streaming
 BOOL,med,no,f64,ERROR,no,rejected: language type contract
@@ -25,7 +25,7 @@ U8,prod,no,i64,I64,yes,typed streaming
 U8,var,no,f64,F64,yes,typed streaming
 U8,var_pop,no,f64,F64,yes,typed streaming
 U8,stddev,no,f64,F64,yes,typed streaming
-U8,stddev_pop,no,f64,F64,yes,typed streaming
+U8,dev_pop,no,f64,F64,yes,typed streaming
 U8,all,yes,b8,B8,yes,typed streaming
 U8,any,yes,b8,B8,yes,typed streaming
 U8,med,no,f64,F64,no,shared row indices
@@ -40,7 +40,7 @@ I16,prod,no,i64,I64,yes,typed streaming
 I16,var,no,f64,F64,yes,typed streaming
 I16,var_pop,no,f64,F64,yes,typed streaming
 I16,stddev,no,f64,F64,yes,typed streaming
-I16,stddev_pop,no,f64,F64,yes,typed streaming
+I16,dev_pop,no,f64,F64,yes,typed streaming
 I16,all,yes,b8,B8,yes,typed streaming
 I16,any,yes,b8,B8,yes,typed streaming
 I16,med,no,f64,F64,no,shared row indices
@@ -55,7 +55,7 @@ I32,prod,no,i64,I64,yes,typed streaming
 I32,var,no,f64,F64,yes,typed streaming
 I32,var_pop,no,f64,F64,yes,typed streaming
 I32,stddev,no,f64,F64,yes,typed streaming
-I32,stddev_pop,no,f64,F64,yes,typed streaming
+I32,dev_pop,no,f64,F64,yes,typed streaming
 I32,all,yes,b8,B8,yes,typed streaming
 I32,any,yes,b8,B8,yes,typed streaming
 I32,med,no,f64,F64,no,shared row indices
@@ -70,7 +70,7 @@ I64,prod,no,i64,I64,yes,typed streaming
 I64,var,yes,f64,F64,yes,typed streaming
 I64,var_pop,yes,f64,F64,yes,typed streaming
 I64,stddev,yes,f64,F64,yes,typed streaming
-I64,stddev_pop,yes,f64,F64,yes,typed streaming
+I64,dev_pop,yes,f64,F64,yes,typed streaming
 I64,all,yes,b8,B8,yes,typed streaming
 I64,any,yes,b8,B8,yes,typed streaming
 I64,med,yes,f64,F64,no,shared row indices
@@ -85,7 +85,7 @@ F32,prod,no,f64,F64,yes,typed streaming
 F32,var,no,f64,F64,yes,typed streaming
 F32,var_pop,no,f64,F64,yes,typed streaming
 F32,stddev,no,f64,F64,yes,typed streaming
-F32,stddev_pop,no,f64,F64,yes,typed streaming
+F32,dev_pop,no,f64,F64,yes,typed streaming
 F32,all,no,b8,B8,yes,typed streaming
 F32,any,no,b8,B8,yes,typed streaming
 F32,med,no,f64,ERROR,no,rejected: language type contract
@@ -100,7 +100,7 @@ F64,prod,no,f64,F64,yes,typed streaming
 F64,var,yes,f64,F64,yes,typed streaming
 F64,var_pop,yes,f64,F64,yes,typed streaming
 F64,stddev,yes,f64,F64,yes,typed streaming
-F64,stddev_pop,yes,f64,F64,yes,typed streaming
+F64,dev_pop,yes,f64,F64,yes,typed streaming
 F64,all,yes,b8,B8,yes,typed streaming
 F64,any,yes,b8,B8,yes,typed streaming
 F64,med,yes,f64,F64,no,shared row indices
@@ -115,7 +115,7 @@ DATE,prod,no,ERROR,ERROR,no,rejected: language type contract
 DATE,var,no,f64,F64,yes,typed streaming
 DATE,var_pop,no,f64,F64,yes,typed streaming
 DATE,stddev,no,f64,F64,yes,typed streaming
-DATE,stddev_pop,no,f64,F64,yes,typed streaming
+DATE,dev_pop,no,f64,F64,yes,typed streaming
 DATE,all,no,ERROR,ERROR,no,rejected: language type contract
 DATE,any,no,ERROR,ERROR,no,rejected: language type contract
 DATE,med,no,f64,F64,no,shared row indices
@@ -130,7 +130,7 @@ TIME,prod,no,ERROR,ERROR,no,rejected: language type contract
 TIME,var,no,f64,F64,yes,typed streaming
 TIME,var_pop,no,f64,F64,yes,typed streaming
 TIME,stddev,no,f64,F64,yes,typed streaming
-TIME,stddev_pop,no,f64,F64,yes,typed streaming
+TIME,dev_pop,no,f64,F64,yes,typed streaming
 TIME,all,no,ERROR,ERROR,no,rejected: language type contract
 TIME,any,no,ERROR,ERROR,no,rejected: language type contract
 TIME,med,no,f64,F64,no,shared row indices
@@ -145,7 +145,7 @@ TIMESTAMP,prod,no,ERROR,ERROR,no,rejected: language type contract
 TIMESTAMP,var,no,f64,F64,yes,typed streaming
 TIMESTAMP,var_pop,no,f64,F64,yes,typed streaming
 TIMESTAMP,stddev,no,f64,F64,yes,typed streaming
-TIMESTAMP,stddev_pop,no,f64,F64,yes,typed streaming
+TIMESTAMP,dev_pop,no,f64,F64,yes,typed streaming
 TIMESTAMP,all,no,ERROR,ERROR,no,rejected: language type contract
 TIMESTAMP,any,no,ERROR,ERROR,no,rejected: language type contract
 TIMESTAMP,med,no,f64,F64,no,shared row indices
@@ -160,7 +160,7 @@ GUID,prod,no,ERROR,ERROR,no,rejected: language type contract
 GUID,var,no,ERROR,ERROR,no,rejected: language type contract
 GUID,var_pop,no,ERROR,ERROR,no,rejected: language type contract
 GUID,stddev,no,ERROR,ERROR,no,rejected: language type contract
-GUID,stddev_pop,no,ERROR,ERROR,no,rejected: language type contract
+GUID,dev_pop,no,ERROR,ERROR,no,rejected: language type contract
 GUID,all,no,ERROR,ERROR,no,rejected: language type contract
 GUID,any,no,ERROR,ERROR,no,rejected: language type contract
 GUID,med,no,ERROR,ERROR,no,rejected: language type contract
@@ -175,7 +175,7 @@ SYM,prod,no,ERROR,ERROR,no,rejected: language type contract
 SYM,var,no,ERROR,ERROR,no,rejected: language type contract
 SYM,var_pop,no,ERROR,ERROR,no,rejected: language type contract
 SYM,stddev,no,ERROR,ERROR,no,rejected: language type contract
-SYM,stddev_pop,no,ERROR,ERROR,no,rejected: language type contract
+SYM,dev_pop,no,ERROR,ERROR,no,rejected: language type contract
 SYM,all,no,ERROR,ERROR,no,rejected: language type contract
 SYM,any,no,ERROR,ERROR,no,rejected: language type contract
 SYM,med,no,ERROR,ERROR,no,rejected: language type contract
@@ -190,7 +190,7 @@ STR,prod,no,ERROR,ERROR,no,rejected: language type contract
 STR,var,no,ERROR,ERROR,no,rejected: language type contract
 STR,var_pop,no,ERROR,ERROR,no,rejected: language type contract
 STR,stddev,no,ERROR,ERROR,no,rejected: language type contract
-STR,stddev_pop,no,ERROR,ERROR,no,rejected: language type contract
+STR,dev_pop,no,ERROR,ERROR,no,rejected: language type contract
 STR,all,no,ERROR,ERROR,no,rejected: language type contract
 STR,any,no,ERROR,ERROR,no,rejected: language type contract
 STR,med,no,ERROR,ERROR,no,rejected: language type contract
@@ -205,7 +205,7 @@ LIST,prod,no,i64,I64,no,generic: dynamic LIST values
 LIST,var,no,f64,F64,no,generic: dynamic LIST values
 LIST,var_pop,no,f64,F64,no,generic: dynamic LIST values
 LIST,stddev,no,f64,F64,no,generic: dynamic LIST values
-LIST,stddev_pop,no,f64,F64,no,generic: dynamic LIST values
+LIST,dev_pop,no,f64,F64,no,generic: dynamic LIST values
 LIST,all,no,b8,B8,no,generic: dynamic LIST values
 LIST,any,no,b8,B8,no,generic: dynamic LIST values
 LIST,med,no,f64,F64,no,generic: dynamic LIST values

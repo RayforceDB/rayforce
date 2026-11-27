@@ -48,7 +48,7 @@ static void contract_teardown(void) {
 
 static const char* const unary_names[] = {
     "count", "sum", "avg", "min", "max", "first", "last", "prod",
-    "var", "var_pop", "stddev", "stddev_pop", "all", "any", "med"
+    "var", "var_pop", "stddev", "dev_pop", "all", "any", "med"
 };
 static const struct {
     int8_t input;
@@ -1923,7 +1923,7 @@ static test_result_t test_native_binary_output(void) {
 
 static test_result_t test_nullable_differential(void) {
     const char* types[] = {"I16", "I32", "I64", "F32", "F64", "DATE", "TIME", "TIMESTAMP", "SYM", "STR"};
-    const char* operations[] = {"sum v", "min v", "max v", "avg v", "var v", "var_pop v", "stddev v", "stddev_pop v", "prod v", "first v", "last v", "med v", "mode v", "quantile v 0.25", "top v 2", "bot v 2"};
+    const char* operations[] = {"sum v", "min v", "max v", "avg v", "var v", "var_pop v", "stddev v", "dev_pop v", "prod v", "first v", "last v", "med v", "mode v", "quantile v 0.25", "top v 2", "bot v 2"};
     for (size_t t = 0; t < sizeof(types)/sizeof(types[0]); t++) {
         char source[512];
         if (t < 8) {

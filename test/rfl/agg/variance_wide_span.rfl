@@ -21,14 +21,14 @@
 (set vp (* sd sd))
 
 ;; every grouped route, and keyless and the eager builtin
-(ok (at (select {from: T by: k q: (stddev_pop v) asc: k}) 'q) sd) -- true
+(ok (at (select {from: T by: k q: (dev_pop v) asc: k}) 'q) sd) -- true
 (ok (at (select {from: T by: s q: (dev v) asc: s}) 'q) sd) -- true
 (ok (at (select {from: T by: f q: (var_pop v) asc: f}) 'q) vp) -- true
 (ok (at (select {from: T by: k q: (var v) asc: k}) 'q) (/ (* vp 3000) 2999)) -- true
 (ok (at (select {from: (update {q: (var_pop v) by: k from: T}) by: k q: (first q) asc: k}) 'q) vp) -- true
-(ok (at (select {from: T by: k q: (stddev_pop v) where: (> k 0) asc: k}) 'q) sd) -- true
-(ok (at (select {from: T q: (stddev_pop v)}) 'q) sd) -- true
-(ok (stddev_pop V) sd) -- true
+(ok (at (select {from: T by: k q: (dev_pop v) where: (> k 0) asc: k}) 'q) sd) -- true
+(ok (at (select {from: T q: (dev_pop v)}) 'q) sd) -- true
+(ok (dev_pop V) sd) -- true
 
 ;; a TIMESPAN column
 (set TS (table [k v] (list k (as 'TIMESPAN V))))
@@ -42,8 +42,8 @@
 (.db.splayed.set (format "%/par/2024.01.02/t/" D) (drop T 4500))
 (set SPL (.db.splayed.get (format "%/spl/t/" D)))
 (set PT (.db.parted.get (format "%/par/" D) 't))
-(ok (at (select {from: SPL by: k q: (stddev_pop v) asc: k}) 'q) sd) -- true
-(ok (at (select {from: PT by: k q: (stddev_pop v) asc: k}) 'q) sd) -- true
+(ok (at (select {from: SPL by: k q: (dev_pop v) asc: k}) 'q) sd) -- true
+(ok (at (select {from: PT by: k q: (dev_pop v) asc: k}) 'q) sd) -- true
 (ok (at (select {from: PT by: s q: (var_pop v) asc: s}) 'q) vp) -- true
-(ok (at (select {from: PT q: (stddev_pop v)}) 'q) sd) -- true
+(ok (at (select {from: PT q: (dev_pop v)}) 'q) sd) -- true
 (.sys.exec (format "rm -rf %" D)) -- 0

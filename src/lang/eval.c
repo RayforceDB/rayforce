@@ -7016,7 +7016,6 @@ static void ray_register_builtins(void) {
     register_unary("mode",  RAY_FN_AGGR, ray_mode_fn);
     register_unary("dev",        RAY_FN_AGGR, ray_dev_fn);
     register_unary("stddev",     RAY_FN_AGGR, ray_stddev_fn);
-    register_unary("stddev_pop", RAY_FN_AGGR, ray_stddev_pop_fn);
     register_unary("dev_pop",    RAY_FN_AGGR, ray_stddev_pop_fn);
     register_unary("var",        RAY_FN_AGGR, ray_var_fn);
     register_unary("var_pop",    RAY_FN_AGGR, ray_var_pop_fn);
@@ -7133,8 +7132,6 @@ static void ray_register_builtins(void) {
     register_vary(".json.parse", RAY_FN_NONE, ray_json_parse_fn);
     register_vary(".json.get", RAY_FN_NONE, ray_json_get_fn);
     register_unary(".json.format", RAY_FN_ROWWISE, ray_json_format_fn);
-    register_vary("read-csv",   RAY_FN_RESTRICTED, ray_read_csv_fn);
-    register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
     register_vary(".csv.splayed",      RAY_FN_RESTRICTED, ray_read_csv_splayed_fn);
     register_vary(".csv.parted",       RAY_FN_RESTRICTED, ray_read_csv_parted_fn);

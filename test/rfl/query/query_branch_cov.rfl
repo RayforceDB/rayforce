@@ -333,7 +333,7 @@
 (at (at (select {vr: (var v) by: k from: TSV}) 'vr) 0) -- 2.0
 ;; var_pop (population variance) → 1.0.
 (at (at (select {vp: (var_pop v) by: k from: TSV}) 'vp) 0) -- 1.0
-;; dev_pop / stddev_pop — population stddev = 1.0.
+;; dev_pop — population stddev = 1.0.
 (at (at (select {dp: (dev_pop v) by: k from: TSV}) 'dp) 0) -- 1.0
 ;; med (median) per group via aggr_med_per_group_buf fast path.
 ;;   group k=1 → med([2,4]) = 3.0 ; group k=2 → med([4,6]) = 5.0.

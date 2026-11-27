@@ -2,7 +2,7 @@
 ;; Per-group holistic aggregators in src/ops/group.c.
 ;;
 ;; Holistic aggregators (med/median, top/bot K, var/var_pop/stddev/
-;; stddev_pop) cannot be merged from a partial-row layout the way
+;; dev_pop) cannot be merged from a partial-row layout the way
 ;; sum/count/min/max can — each group's full payload must be visible
 ;; before the answer materialises.  The kernels under test:
 ;;
@@ -16,7 +16,7 @@
 ;; paths.  This file targets the *generic per-group* code path —
 ;; specifically the eval-level scatter that runs when:
 ;;
-;;   - the agg is med/var/stddev/stddev_pop/var_pop (any per-group),
+;;   - the agg is med/var/stddev/dev_pop/var_pop (any per-group),
 ;;   - multiple aggregators in one select share the same group key,
 ;;   - top/bot K against a SYM key (falls through to OP_TOP_N path).
 ;;
@@ -134,28 +134,28 @@
 ;;   sample_stddev= √(32/7) → sum_g 2 * √(32/7) ≈ 4.276179
 (set Tvar (table [g v] (list (as 'I64 [0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1]) (as 'I64 [2 4 4 4 5 5 7 9 2 4 4 4 5 5 7 9]))))
 (count (select {v: (var_pop v) by: g from: Tvar})) -- 2
-(count (select {v: (stddev_pop v) by: g from: Tvar})) -- 2
+(count (select {v: (dev_pop v) by: g from: Tvar})) -- 2
 (count (select {v: (var v) by: g from: Tvar})) -- 2
 (count (select {v: (stddev v) by: g from: Tvar})) -- 2
 
 ;; Population variance / stddev — exact integer answers.
 (sum (at (select {v: (var_pop v) by: g from: Tvar}) 'v))    -- 8.0
-(sum (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)) -- 4.0
+(sum (at (select {v: (dev_pop v) by: g from: Tvar}) 'v)) -- 4.0
 ;; per-group value (both groups identical Wikipedia fixture → 4.0 each;
 ;; assert one group directly so a single bad group can't hide in the sum).
 (at (at (select {v: (var_pop v) by: g from: Tvar}) 'v) 0)    -- 4.0
-(at (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v) 1) -- 2.0
+(at (at (select {v: (dev_pop v) by: g from: Tvar}) 'v) 1) -- 2.0
 ;; Bug 5 (now fixed): `dev` in select-by used to map to OP_STDDEV
 ;; (sample) while scalar `dev` is OP_STDDEV_POP (population).  The
 ;; one-line fix at src/ops/query.c:316 aligns the planner mapping so
 ;; per-group `dev` is also population — `dev` is now an alias of
-;; `stddev_pop` (and `dev_pop`) in every context, by convention
+;; `dev_pop` in every context, by convention
 ;; (`dev` = pop, `sdev` would be sample).
 (sum (at (select {v: (dev v) by: g from: Tvar}) 'v))        -- 4.0
-;; Sanity: stddev_pop (explicit) sums to 4.0 (= 2 * 2.0).
-(sum (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)) -- 4.0
-;; Per-group dev == per-group stddev_pop after the fix:
-(< (abs (- (sum (at (select {v: (dev v) by: g from: Tvar}) 'v)) (sum (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)))) 0.001) -- true
+;; Sanity: dev_pop (explicit) sums to 4.0 (= 2 * 2.0).
+(sum (at (select {v: (dev_pop v) by: g from: Tvar}) 'v)) -- 4.0
+;; Per-group dev == per-group dev_pop after the fix:
+(< (abs (- (sum (at (select {v: (dev v) by: g from: Tvar}) 'v)) (sum (at (select {v: (dev_pop v) by: g from: Tvar}) 'v)))) 0.001) -- true
 
 ;; Sample variance / stddev — fp tolerance.
 (< (abs (- (sum (at (select {v: (var v) by: g from: Tvar}) 'v)) (* 2.0 4.571428571428571))) 0.000001) -- true
@@ -165,20 +165,20 @@
 (type (at (select {v: (var v) by: g from: Tvar}) 'v))        -- 'F64
 (type (at (select {v: (var_pop v) by: g from: Tvar}) 'v))    -- 'F64
 (type (at (select {v: (stddev v) by: g from: Tvar}) 'v))     -- 'F64
-(type (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)) -- 'F64
+(type (at (select {v: (dev_pop v) by: g from: Tvar}) 'v)) -- 'F64
 
 
 ;; ─── variance / stddev per group: F64 source ────────────────────────
 (set TvarF (table [g v] (list (as 'I64 [0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1]) (as 'F64 [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0 2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0]))))
 (sum (at (select {v: (var_pop v) by: g from: TvarF}) 'v))    -- 8.0
-(sum (at (select {v: (stddev_pop v) by: g from: TvarF}) 'v)) -- 4.0
+(sum (at (select {v: (dev_pop v) by: g from: TvarF}) 'v)) -- 4.0
 
 
 ;; ─── variance per group: constant group → 0.0 ───────────────────────
 (set Tconst (table [g v] (list (as 'I64 [0 0 0 0 1 1 1 1]) (as 'I64 [7 7 7 7 13 13 13 13]))))
 (sum (at (select {v: (var_pop v) by: g from: Tconst}) 'v))    -- 0.0
 (sum (at (select {v: (var v) by: g from: Tconst}) 'v))        -- 0.0
-(sum (at (select {v: (stddev_pop v) by: g from: Tconst}) 'v)) -- 0.0
+(sum (at (select {v: (dev_pop v) by: g from: Tconst}) 'v)) -- 0.0
 (sum (at (select {v: (stddev v) by: g from: Tconst}) 'v))     -- 0.0
 
 
@@ -191,7 +191,7 @@
 (set T1 (table [g v] (list (as 'I64 [0 1 2]) (as 'I64 [10 20 30]))))
 (count (select {v: (var_pop v) by: g from: T1})) -- 3
 (sum (at (select {v: (var_pop v) by: g from: T1}) 'v))    -- 0.0
-(sum (at (select {v: (stddev_pop v) by: g from: T1}) 'v)) -- 0.0
+(sum (at (select {v: (dev_pop v) by: g from: T1}) 'v)) -- 0.0
 (sum (at (select {v: (var v) by: g from: T1}) 'v))    -- 0.0
 (sum (at (select {v: (stddev v) by: g from: T1}) 'v)) -- 0.0
 
@@ -273,14 +273,14 @@
 (sum (at (select {m: (med v) by: g from: Tbig}) 'm)) -- 65528.0
 
 
-;; ─── parallel threshold: var_pop / stddev_pop ───────────────────────
+;; ─── parallel threshold: var_pop / dev_pop ───────────────────────
 ;;
 ;; Same Tbig.  Group g is AP { g, g+16, …, g+511*16 }, n=512, d=16.
 ;; var_pop = d² (n² - 1) / 12 = 256 * 262143 / 12 = 5,592,384.
 ;; Sum over 16 groups = 16 * 5592384 = 89,478,144.
 (< (abs (- (sum (at (select {v: (var_pop v) by: g from: Tbig}) 'v)) 89478144.0)) 1.0) -- true
 ;; Pop stddev = sqrt(5592384); * 16.
-(< (abs (- (sum (at (select {v: (stddev_pop v) by: g from: Tbig}) 'v)) (* 16.0 (sqrt 5592384.0)))) 0.001) -- true
+(< (abs (- (sum (at (select {v: (dev_pop v) by: g from: Tbig}) 'v)) (* 16.0 (sqrt 5592384.0)))) 0.001) -- true
 
 
 ;; ─── empty-input edge case: degenerate group (after WHERE) ──────────
@@ -345,7 +345,7 @@
 (set Vp   (sum (at (select {v: (var v) by: g from: Trn}) 'v)))
 (set Sp   (sum (at (select {s: (stddev v) by: g from: Trn}) 's)))
 (set Vpop (sum (at (select {v: (var_pop v) by: g from: Trn}) 'v)))
-(set Spop (sum (at (select {s: (stddev_pop v) by: g from: Trn}) 's)))
+(set Spop (sum (at (select {s: (dev_pop v) by: g from: Trn}) 's)))
 (> Vp 0.0) -- true
 (> Sp 0.0) -- true
 (>= Vpop 0.0) -- true

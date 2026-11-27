@@ -9,7 +9,7 @@
 (stddev e) !- type
 (dev_pop e) !- type
 (var_pop e) !- type
-(stddev_pop e) !- type
+(dev_pop e) !- type
 (med e) !- type
 (quantile e 0.5) !- type
 (dev (enlist 'a)) !- type

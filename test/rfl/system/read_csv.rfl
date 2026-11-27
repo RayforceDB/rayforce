@@ -16,7 +16,7 @@
 (.sys.exec "awk 'BEGIN{print \"id,sym\"; for(i=0;i<20000;i++) printf(\"%d,s%d\\n\",i,i)}' > rf_test_syms.csv") -- 0
 
 (count (.csv.read [I64 SYMBOL] "rf_test_syms.csv")) -- 20000
-(count (read-csv [I64 SYMBOL] "rf_test_syms.csv")) -- 20000
+(count (.csv.read [I64 SYMBOL] "rf_test_syms.csv")) -- 20000
 
 ;; W16 SYM comparison: 20000 distinct syms → max_id > 255 → W16 compaction.
 ;; Load again and compare sym column against a SYM atom → lines 822-825 in eval.c.
@@ -94,3 +94,8 @@
 ;; Value-pair: kept rows are the two empty syms.
 (at (at (select {x: name from: _t where: (== name "")}) 'x) 0) -- '
 (.sys.exec "rm -f rf_test_empty.csv") -- 0
+;; the errors name the builtins by their names, .csv.read and .csv.write
+;; (#1826 removed read-csv and write-csv)
+(try (.csv.read 1) (fn [e] (at e 'msg))) -- ".csv.read: path must be str, got i64"
+(try (.csv.write 1 "x") (fn [e] (at e 'msg))) -- ".csv.write: first argument must be table, got i64"
+(try (.csv.write (table [a] (list [1])) 1) (fn [e] (at e 'msg))) -- ".csv.write: path must be str, got i64"

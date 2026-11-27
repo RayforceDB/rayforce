@@ -596,7 +596,7 @@ or quantile of a vector is exact at any magnitude.
 ### `(dev x)` — aggregate
 
 Population standard deviation. The standard deviation of a TIMESPAN vector
-(`dev`, `stddev`, `stddev_pop`, `mdev`) is a TIMESPAN, rounded to the
+(`dev`, `stddev`, `dev_pop`, `mdev`) is a TIMESPAN, rounded to the
 nanosecond; a variance of durations is a squared duration and stays F64.
 
 ```lisp
@@ -611,12 +611,12 @@ Sample standard deviation.
 (stddev [1 2 3])  ; 1.0
 ```
 
-### `(stddev_pop x)` / `(dev_pop x)` — aggregate
+### `(dev_pop x)` — aggregate
 
 Population standard deviation.
 
 ```lisp
-(stddev_pop [1 2 3])  ; 0.816...
+(dev_pop [1 2 3])  ; 0.816...
 ```
 
 ### `(var x)` / `(var_pop x)` — aggregate
@@ -630,7 +630,7 @@ Sample and population variance.
 
 #### Variance and standard deviation accuracy
 
-`var`, `var_pop`, `stddev`, `stddev_pop`, `dev` and `dev_pop` give the same
+`var`, `var_pop`, `stddev`, `dev` and `dev_pop` give the same
 value, to the bound below, on every route a query takes: keyless or
 grouped, `select` or `update`, in-memory, splayed or partitioned, any key
 type, any number of workers. Each sums the differences of the values from a

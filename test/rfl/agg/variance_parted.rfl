@@ -1,5 +1,5 @@
 ;; @requires: posix
-;; var, var_pop, stddev, dev, dev_pop and stddev_pop over a partitioned
+;; var, var_pop, stddev, dev and dev_pop over a partitioned
 ;; table give the value they give over the same rows in memory or splayed
 ;; (#1666).  Each partition's group used to ship SUM(x), SUM(x^2) and the
 ;; count, merged by SUM: the raw squares cancel once the values are large
@@ -29,7 +29,7 @@
 (set build (fn [T] (do (.sys.exec (format "rm -rf %" D)) (.db.splayed.set (format "%/spl/t/" D) T) (.db.splayed.set (format "%/par/2024.01.01/t/" D) (select {from: T k: k s: s f: f h: h v: v where: (== part 0)})) (.db.splayed.set (format "%/par/2024.01.02/t/" D) (select {from: T k: k s: s f: f h: h v: v where: (== part 1)})) (.db.splayed.set (format "%/par/2024.01.03/t/" D) (select {from: T k: k s: s f: f h: h v: v where: (== part 2)})) (.db.splayed.set (format "%/par/2024.01.04/t/" D) (select {from: T k: k s: s f: f h: h v: v where: (== part 3)})) (.db.splayed.set (format "%/par/2024.01.05/t/" D) (select {from: T k: k s: s f: f h: h v: v where: (== part 9)})) 0)))
 
 ;; every route of a table: keyless, and by each key type, ascending
-(set routes (fn [X] (raze (list (at (select {from: X q: (var_pop v)}) 'q) (at (select {from: X q: (var v)}) 'q) (at (select {from: X q: (stddev v)}) 'q) (at (select {from: X q: (dev v)}) 'q) (at (select {from: X q: (dev_pop v)}) 'q) (at (select {from: X q: (stddev_pop v)}) 'q) (at (select {from: X by: k q: (var_pop v) asc: k}) 'q) (at (select {from: X by: s q: (var v) asc: s}) 'q) (at (select {from: X by: f q: (dev v) asc: f}) 'q) (at (select {from: X by: h q: (var_pop v) asc: h}) 'q) (at (select {from: X by: k q: (stddev v) where: (> k 0) asc: k}) 'q)))))
+(set routes (fn [X] (raze (list (at (select {from: X q: (var_pop v)}) 'q) (at (select {from: X q: (var v)}) 'q) (at (select {from: X q: (stddev v)}) 'q) (at (select {from: X q: (dev v)}) 'q) (at (select {from: X q: (dev_pop v)}) 'q) (at (select {from: X q: (dev_pop v)}) 'q) (at (select {from: X by: k q: (var_pop v) asc: k}) 'q) (at (select {from: X by: s q: (var v) asc: s}) 'q) (at (select {from: X by: f q: (dev v) asc: f}) 'q) (at (select {from: X by: h q: (var_pop v) asc: h}) 'q) (at (select {from: X by: k q: (stddev v) where: (> k 0) asc: k}) 'q)))))
 
 ;; floats: magnitudes 0 to 1e15, quarter steps
 (set T (update {v: 0Nf from: (mk [0.0 100000000.0 100.0 1000000000000000.0 7.0] 0.25) where: (and (== part 1) (== k 2))}))

@@ -22,9 +22,9 @@
 ;; the aggregates that answer a duration, used as a value in a query
 (type (at (select {r: (avg (- sp (avg sp))) from: T}) 'r)) -- 'TIMESPAN
 (type (at (select {r: (avg (- sp (stddev sp))) from: T}) 'r)) -- 'TIMESPAN
-(type (at (select {r: (avg (- sp (stddev_pop sp))) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (avg (- sp (dev_pop sp))) from: T}) 'r)) -- 'TIMESPAN
 (type (at (select {r: (stddev (- sp (avg sp))) from: T}) 'r)) -- 'TIMESPAN
-(type (at (select {r: (stddev_pop (- sp (avg sp))) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (dev_pop (- sp (avg sp))) from: T}) 'r)) -- 'TIMESPAN
 
 ;; a comparison is no duration
 (type (at (select {r: (avg (> sp (avg sp))) from: T}) 'r)) -- 'F64

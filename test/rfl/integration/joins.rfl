@@ -125,23 +125,23 @@
 ;;   trade @ 05 window [04, 06]: Bid row at 04(101)              -> count=1, min=101
 (set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))(set quotes (table [Sym Time Bid] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 0Nl 101])))(set intervals (map-left + [-1000 1000] (at trades 'Time)))(at (window-join [Sym Time] intervals trades quotes {c: (count Bid)}) 'c) -- [2 1]
 (set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))(set quotes (table [Sym Time Bid] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 0Nl 101])))(set intervals (map-left + [-1000 1000] (at trades 'Time)))(at (window-join [Sym Time] intervals trades quotes {m: (min Bid)}) 'm) -- [99 101]
-;; stddev/stddev_pop/var/var_pop must work as standalone aggregation
+;; stddev/dev_pop/var/var_pop must work as standalone aggregation
 ;; builtins so resolve_agg_opcode support in window-join is fully backed
 ;; by an eval-level implementation.
 (stddev [10 20 30]) -- 10.0
-(stddev_pop [10 20 30]) -- 8.16
+(dev_pop [10 20 30]) -- 8.16
 (var [10 20 30]) -- 100.0
 (var_pop [10 20 30]) -- 66.67
 (dev_pop [10 20 30]) -- 8.16
-;; stddev_pop/var_pop must resolve through compile_expr_dag's agg switch.
+;; dev_pop/var_pop must resolve through compile_expr_dag's agg switch.
 ;; That switch is reached only when the aggregation appears *inside*
 ;; another expression: at the top level of a select projection the
 ;; is_agg_expr path routes directly to ray_group via resolve_agg_opcode
 ;; and never hits compile_expr_dag. Nesting inside a binary op forces
 ;; the outer projection through compile_expr_dag, which then recursively
-;; compiles (stddev_pop v) / (var_pop v). Without the switch entries
+;; compiles (dev_pop v) / (var_pop v). Without the switch entries
 ;; compile_expr_dag returns NULL and the whole select errors with "domain".
-(set t (table [v] (list [10 20 30])))(at (select {from: t x: (+ 0.0 (stddev_pop v))}) 'x) -- [8.16]
+(set t (table [v] (list [10 20 30])))(at (select {from: t x: (+ 0.0 (dev_pop v))}) 'x) -- [8.16]
 (set t (table [v] (list [10 20 30])))(at (select {from: t x: (+ 0.0 (var_pop v))}) 'x) -- [66.67]
 ;; window-join across two partitions — exercises narrow-width sym reads
 ;; in the sort-merge compare (RAY_SYM_W8 for 2-sym tables would misread

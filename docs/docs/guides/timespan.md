@@ -57,7 +57,7 @@ extracts its time of day; casting a timespan to I64 exposes its raw count.
 | Comparisons with another span or an integer count | BOOL |
 | `sum spans` | TIMESPAN; skips nulls |
 | `avg spans`, `med spans`, `quantile spans p` | TIMESPAN, rounded to the nanosecond (half away from zero); skip nulls |
-| `dev`, `stddev`, `stddev_pop`, `mdev` | TIMESPAN; a variance is a squared duration and stays F64 |
+| `dev`, `stddev`, `dev_pop`, `mdev` | TIMESPAN; a variance is a squared duration and stays F64 |
 | `min`, `max`, `first`, `last` | Preserve TIMESPAN |
 | `min span number`, `max span number`, either order, any numeric type | TIMESPAN: the number counts nanoseconds, a float rounded first (see below) |
 | `sums`, `mins`, `maxs`, `msum`, `mmin`, `mmax`, `deltas` | TIMESPAN |

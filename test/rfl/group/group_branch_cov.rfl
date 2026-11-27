@@ -940,7 +940,7 @@
 (.db.splayed.set "/tmp/rfl_pp_stdp_mk/1/t/" _ppstdp_a)
 (.db.splayed.set "/tmp/rfl_pp_stdp_mk/2/t/" _ppstdp_b)
 (set Ppstdp (.db.parted.get "/tmp/rfl_pp_stdp_mk/" 't))
-(set Rppstdp (select {sp: (stddev_pop v) from: Ppstdp by: [k1 k2]}))
+(set Rppstdp (select {sp: (dev_pop v) from: Ppstdp by: [k1 k2]}))
 (== (count Rppstdp) 20) -- true
 (> (min (at Rppstdp 'sp)) 0.0) -- true
 (.sys.exec "rm -rf /tmp/rfl_pp_stdp_mk") -- 0
