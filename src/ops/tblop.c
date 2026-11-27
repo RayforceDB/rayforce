@@ -1950,9 +1950,9 @@ static ray_t* alter_target(ray_t** args, int64_t n,
                 ray_t* nd = ray_dict_upsert(d, key, v);
                 if (ka) ray_release(key);
                 if (va) ray_release(v);
-                /* Upsert consumes d on success or owned error. Its NULL
-                 * return is a failed header COW, which retains our ref. */
-                if (!nd) { ray_release(d); nd = ray_error("oom", NULL); }
+                /* Upsert consumes d on every answer: the dict, or an owned
+                 * error (a failed copy included). */
+                if (!nd) nd = ray_error("oom", NULL);
                 if (RAY_IS_ERR(nd)) { ray_release(idx); ray_release(val); ray_release(name_sym); return nd; }
                 d = nd;
             }

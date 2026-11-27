@@ -31,7 +31,6 @@
 #include "table/sym.h"
 #include "table/table.h"
 #include "core/runtime.h"
-#include "lang/format.h"
 #include "store/col.h"
 #include "ops/idxop.h"      /* RAY_IDX_DICT */
 #include "store/enc.h"
@@ -43,6 +42,8 @@
 #include "lang/env.h"
 #include "store/splay.h"
 #include "store/part.h"
+#include "lang/parse.h"
+#include "lang/eval.h"
 #include "ops/colgather.h"
 #include "ops/agg_engine.h"   /* agg_route_stats: the first-n route */
 #include "core/pool.h"      /* ray_cancel */
@@ -3786,6 +3787,116 @@ static test_result_t test_group_fallback_order(void) {
     PASS();
 }
 
+/* A parted table's group runs per partition (exec_group_per_partition):
+ * each partition's graph, its scans and group node, and the merge graph
+ * are built under the failure; the nth allocation of the group fails,
+ * every n it reaches.  A failure the route cannot answer sends the group
+ * to the flattened table, whose variance may differ in its last bits. */
+static test_result_t test_group_parted_alloc_fail(void) {
+    for (int p = 0; p < 3; p++) {
+        char q[600];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/gp/2024.01.0%d/t/\" "
+                 "(table [j v w] (list (%% (til 30000) 7) (+ (til 30000) %d) (as 'F64 (%% (til 30000) 13)))) {compress: false})",
+                 p + 1, p * 30000);
+        aw_eval_ok(q);
+    }
+    aw_eval_ok("(set P (.db.parted.get \"" AW_TMP "/gp\" 't))");
+    static const char* const pq[] = {
+        "(select {s: (sum v) c: (count v) from: P by: j})",
+        "(select {a: (avg w) m: (max v) from: P by: j})",
+        "(select {d: (dev w) from: P by: j})",
+    };
+    static const char* const pcmp[] = {
+        NULL, NULL,
+        "(and (all (== (at Q 'j) (at R0 'j))) (all (< (abs (- (at Q 'd) (at R0 'd))) 1e-9)))",
+    };
+    for (size_t q = 0; q < sizeof pq / sizeof *pq; q++) {
+        int64_t runs0 = ray_group_perpart_runs();
+        char setq[200];
+        snprintf(setq, sizeof setq, "(set R0 %s)", pq[q]);
+        aw_eval_ok(setq);
+        TEST_ASSERT_FMT(ray_group_perpart_runs() > runs0, "%s: not grouped per partition", pq[q]);
+        int failed = 0;
+        for (int64_t n = 1; n <= 4000; n++) {
+            ray_heap_gc();
+            bool traced = ray_mem_trace_begin();
+            ray_group_alloc_fail_for_test(n);
+            ray_t* got = aw_eval(pq[q]);
+            bool fired = ray_group_alloc_fail_fired_for_test();
+            ray_group_alloc_fail_for_test(0);
+            if (got && RAY_IS_ERR(got)) {
+                char code[32];
+                snprintf(code, sizeof code, "%s", ray_err_code(got));
+                ray_error_free(got);
+                ray_heap_gc();
+                ray_mem_trace_t tr = {0};
+                if (traced) ray_mem_trace_end(&tr);
+                TEST_ASSERT_FMT(strcmp(code, "oom") == 0, "%s, allocation %lld fails: %s, not oom", pq[q], (long long)n, code);
+                TEST_ASSERT_FMT(tr.net_bytes <= 0, "%s, allocation %lld fails: %lld bytes kept", pq[q], (long long)n, (long long)tr.net_bytes);
+                failed++;
+                continue;
+            }
+            if (traced) { ray_mem_trace_t t0; ray_mem_trace_end(&t0); }
+            TEST_ASSERT_NOT_NULL(got);
+            ray_env_set(ray_sym_intern("Q", 1), got);
+            ray_release(got);
+            TEST_ASSERT_FMT(aw_q_same(pcmp[q]), "%s, allocation %lld fails: an answer, not the reference", pq[q], (long long)n);
+            if (!fired) break;
+        }
+        TEST_ASSERT_FMT(failed > 0, "%s: no allocation failure answered oom", pq[q]);
+    }
+    aw_eval_ok("(set P 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set Q 0)");
+    PASS();
+}
+
+static int aw_sweep_eval(const char* const* qs, const char* const* cmps, size_t nq);
+
+/* Building the select's graph: the nth allocation of the whole evaluation
+ * (parse, plan, the graph's nodes, the group) fails, every n it reaches.
+ * A node that failed to allocate answers `oom` keeping nothing, never
+ * "not implemented" or a crash (aw_sweep_eval). */
+static test_result_t test_group_build_alloc_fail(void) {
+    aw_eval_ok("(set F (table [k j v w] (list (% (* (til 70000) 7919) 1000) (% (til 70000) 7) (til 70000) (as 'F64 (% (til 70000) 13)))))");
+    for (int p = 0; p < 3; p++) {
+        char q[600];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/gb/2024.01.0%d/t/\" "
+                 "(table [j v w] (list (%% (til 30000) 7) (+ (til 30000) %d) (as 'F64 (%% (til 30000) 13)))) {compress: false})",
+                 p + 1, p * 30000);
+        aw_eval_ok(q);
+    }
+    aw_eval_ok("(set P (.db.parted.get \"" AW_TMP "/gb\" 't))");
+    static const char* const bq[] = {
+        "(select {from: F by: k})",
+        "(select {s: (sum v) from: F by: k})",
+        "(select {s: (sum v) c: (count v) from: F by: [k j]})",
+        "(select {q: (med v) from: F by: j})",
+        "(select {c: (pearson_corr v w) from: F by: j})",
+        "(select {s: (sum v) a: (avg w) from: F})",
+        "(select {c: (wavg w v) from: F})",
+        "(select {t: (sum (* v w)) from: F by: j})",
+        "(select {s: (sum v) c: (count v) from: P by: j})",
+        "(select {s: (sum v) from: P})",
+        "(select {s: (sum (* v w)) from: P by: j})",
+        "(select {v: v j: j from: P asc: v take: 5})",
+        "(select {from: P take: 7})",
+        "(select {a: (avg v) from: P})",
+        "(select {a: (avg w) d: (dev w) from: P})",
+        "(inner-join [j] (select {j: j v: v from: P}) R2)",
+        "(sum (at (insert P 2024.01.03 (list 3 99 1.5)) 'v))",   /* a scalar append to a parted segment */
+    };
+    aw_eval_ok("(set R2 (table [j b] (list (til 7) (* 10 (til 7)))))");
+    /* a per-partition failure the route cannot answer sends the group to
+     * the flattened table, which sums in another order (#1819) */
+    const char* bcmp[sizeof bq / sizeof *bq] = {0};
+    bcmp[sizeof bq / sizeof *bq - 3] =
+        "(and (all (< (abs (- (at Q 'a) (at R0 'a))) 1e-9)) (all (< (abs (- (at Q 'd) (at R0 'd))) 1e-9)))";
+    int failed = aw_sweep_eval(bq, bcmp, sizeof bq / sizeof *bq);
+    TEST_ASSERT_FMT(failed >= 0, "a failed allocation while building the select answered other than oom keeping nothing");
+    TEST_ASSERT_FMT(failed > 0, "no allocation failure answered oom");
+    aw_eval_ok("(set F 0)"); aw_eval_ok("(set P 0)"); aw_eval_ok("(set R2 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set Q 0)");
+    PASS();
+}
+
 static test_result_t test_group_alloc_fail(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
@@ -3922,6 +4033,65 @@ static test_result_t test_group_alloc_fail(void) {
         TEST_ASSERT_FMT(ray_group_test_radix_bufs_forced() > forced0, "%s: never reached the radix buffers", fq[q]);
         TEST_ASSERT_FMT(failed > 0, "%s: no second failure answered oom", fq[q]);
     }
+    /* two more emit_agg_columns callers: the slice-group route (an indexed
+     * key under `where: (in s ...)`, exec_group_slices) and the keyless
+     * whole-table route, whose row-gathered GUID max is recomputed after
+     * it; v2 on and off.  A failed slice route groups the selection on
+     * another route, whose SYM key column may carry the has-nulls flag:
+     * the slice answers compare by value. */
+    aw_eval_ok("(set KS (as 'SYM (at ['aa 'bb 'cc 'dd 'ee 'ff 'gg 'hh] (% (til 40000) 8))))");
+    aw_eval_ok("(set TI (table [s v f] (list (.attr.set 'grouped KS) (til 40000) (as 'F64 (% (til 40000) 64)))))");
+    aw_eval_ok("(set H (table [k v g] (list (% (til 70000) 7) (til 70000) (take (guid 3) 70000))))");
+    static const char* const eq[] = {
+        "(select {sv: (sum f) n: (count v) a: (avg v) from: TI by: s where: (in s ['aa 'cc])})",
+        "(select {s: (sum v) m: (max v) a: (avg v) from: H})",
+        "(select {s: (sum v) g: (max g) from: H})",
+    };
+    static const char* const ecmp[] = {
+        "(and (== (count Q) (count R0)) (all (== (at Q 's) (at R0 's))) (all (== (at Q 'sv) (at R0 'sv))) (all (== (at Q 'n) (at R0 'n))) (all (== (at Q 'a) (at R0 'a))))",
+        NULL, NULL,
+    };
+    for (int e = 0; e < 2; e++) {
+        ray_agg_engine_v2 = e == 0;
+        for (size_t q = 0; q < sizeof eq / sizeof *eq; q++) {
+            uint64_t sl0 = agg_route_stats().routes[AGG_ROUTE_SLICES];
+            char setq[200];
+            snprintf(setq, sizeof setq, "(set R0 %s)", eq[q]);
+            aw_eval_ok(setq);
+            if (q == 0)
+                TEST_ASSERT_FMT(agg_route_stats().routes[AGG_ROUTE_SLICES] > sl0, "%s: not on the slice route", eq[q]);
+            int failed = 0;
+            for (int64_t n = 1; n <= 4000; n++) {
+                ray_heap_gc();
+                bool traced = ray_mem_trace_begin();
+                ray_group_alloc_fail_for_test(n);
+                ray_t* got = aw_eval(eq[q]);
+                bool fired = ray_group_alloc_fail_fired_for_test();
+                ray_group_alloc_fail_for_test(0);
+                if (got && RAY_IS_ERR(got)) {
+                    char code[32];
+                    snprintf(code, sizeof code, "%s", ray_err_code(got));
+                    ray_error_free(got);
+                    ray_heap_gc();
+                    ray_mem_trace_t tr = {0};
+                    if (traced) ray_mem_trace_end(&tr);
+                    TEST_ASSERT_FMT(strcmp(code, "oom") == 0, "%s (v2 %d), allocation %lld fails: %s, not oom", eq[q], e == 0, (long long)n, code);
+                    TEST_ASSERT_FMT(tr.net_bytes <= 0, "%s (v2 %d), allocation %lld fails: %lld bytes kept", eq[q], e == 0, (long long)n, (long long)tr.net_bytes);
+                    failed++;
+                    continue;
+                }
+                if (traced) { ray_mem_trace_t t0; ray_mem_trace_end(&t0); }
+                TEST_ASSERT_NOT_NULL(got);
+                ray_env_set(ray_sym_intern("Q", 1), got);
+                ray_release(got);
+                TEST_ASSERT_FMT(aw_q_same(ecmp[q]), "%s (v2 %d), allocation %lld fails: an answer, not the reference", eq[q], e == 0, (long long)n);
+                if (!fired) break;
+            }
+            TEST_ASSERT_FMT(failed > 0, "%s (v2 %d): no allocation failure answered oom", eq[q], e == 0);
+        }
+    }
+    ray_agg_engine_v2 = true;
+    aw_eval_ok("(set KS 0)"); aw_eval_ok("(set TI 0)"); aw_eval_ok("(set H 0)");
     /* a keys-only `select by:` builds its result after the group (first
      * rows, the table, the gathered columns): the nth allocation of that
      * build fails, every n it reaches (#1811) */
@@ -7034,6 +7204,129 @@ static test_result_t test_temporal_accessor_dag(void) {
     PASS();
 }
 
+/* `src` parsed once, evaluated as ray_eval_str does: a sweep then counts
+ * the evaluation's allocations, not the parser's. */
+static ray_t* aw_eval_parsed(ray_t* parsed) {
+    ray_clear_error_trace();
+    ray_raise_clear();
+    ray_t* r = ray_eval(parsed);
+    ray_eval_request_end();
+    if (r && !RAY_IS_ERR(r) && ray_is_lazy(r)) r = ray_lazy_materialize(r);
+    return r;
+}
+
+/* Sweep each query in qs: the nth allocation of its evaluation fails,
+ * every n it reaches: of the parsed query on the calling thread's own
+ * code, then on its pool tasks too, then of the text, parse included.
+ * Each run answers R0 (by `cmp` when given, else byte for byte) or `oom`
+ * keeping nothing; the error's trace, which the next request clears, is
+ * cleared first.  Returns the oom count, or -1 after a failure (reported). */
+static int aw_sweep_eval(const char* const* qs, const char* const* cmps, size_t nq) {
+    int failed = 0;
+    aw_eval_ok("(set Q 0)");   /* bound before the trace: an answer rebinds it */
+    for (int skip = 2; skip >= 0; skip--) {
+        ray_alloc_fail_skip_tasks_for_test(skip == 1);
+        for (size_t q = 0; q < nq; q++) {
+            char setq[600];
+            snprintf(setq, sizeof setq, "(set R0 %s)", qs[q]);
+            aw_eval_ok(setq);
+            ray_t* parsed = ray_parse(qs[q]);
+            if (!parsed || RAY_IS_ERR(parsed)) { fprintf(stderr, "  %s: does not parse\n", qs[q]); return -1; }
+            for (int64_t n = 1; n <= 40000; n++) {
+                ray_heap_gc();
+                bool traced = ray_mem_trace_begin();
+                ray_alloc_fail_set_for_test(n, 1);
+                ray_t* got = skip == 2 ? ray_eval_str(qs[q]) : aw_eval_parsed(parsed);
+                bool fired = ray_alloc_fail_armed_for_test() == 0;
+                ray_alloc_fail_set_for_test(0, 0);
+                ray_clear_error_trace();
+                const char* what = NULL;
+                char msg[96];
+                if (got && RAY_IS_ERR(got)) {
+                    bool oom = strcmp(ray_err_code(got), "oom") == 0;
+                    snprintf(msg, sizeof msg, "%s, not oom", ray_err_code(got));
+                    ray_error_free(got);
+                    ray_heap_gc();
+                    ray_mem_trace_t tr = {0};
+                    if (traced) ray_mem_trace_end(&tr);
+                    if (!oom) what = msg;
+                    else if (tr.net_bytes > 0) { snprintf(msg, sizeof msg, "%lld bytes kept", (long long)tr.net_bytes); what = msg; }
+                    else failed++;
+                } else if (!got) {
+                    if (traced) { ray_mem_trace_t t0; ray_mem_trace_end(&t0); }
+                    what = "no answer";
+                } else {
+                    /* compared, then released: an answer keeps nothing either */
+                    ray_env_set(ray_sym_intern("Q", 1), got);
+                    ray_release(got);
+                    bool same = aw_q_same(cmps ? cmps[q] : NULL);
+                    ray_t* zero = ray_i64(0);
+                    ray_env_set(ray_sym_intern("Q", 1), zero);
+                    ray_release(zero);
+                    ray_heap_gc();
+                    ray_mem_trace_t tr = {0};
+                    if (traced) ray_mem_trace_end(&tr);
+                    if (!same) what = "an answer, not the reference";
+                    else if (tr.net_bytes > 0) { snprintf(msg, sizeof msg, "an answer, %lld bytes kept", (long long)tr.net_bytes); what = msg; }
+                }
+                if (what) {
+                    fprintf(stderr, "  %s (%s), allocation %lld fails: %s\n", qs[q], skip == 2 ? "parse included" : skip ? "tasks skipped" : "tasks too", (long long)n, what);
+                    ray_release(parsed);
+                    ray_alloc_fail_skip_tasks_for_test(false);
+                    return -1;
+                }
+                if (!fired) break;
+            }
+            ray_release(parsed);
+        }
+    }
+    ray_alloc_fail_skip_tasks_for_test(false);
+    return failed;
+}
+
+/* Planning under a failure: every select shape builds its graph's nodes
+ * (scans, constants, the filter, group, join, sort, window and select
+ * nodes) while the nth allocation of the evaluation fails.  A node that
+ * failed to build is refused by every builder it is handed to, and the
+ * plan answers the recorded `oom`: never a crash, "not implemented", or
+ * memory kept (#1817).  (The where: shapes are swept with the filter's
+ * own failures, aware/filter_alloc_fail.) */
+static test_result_t test_plan_alloc_fail(void) {
+    aw_eval_ok("(set F (table [k j v w] (list (% (* (til 70000) 7919) 1000) (% (til 70000) 7) (til 70000) (as 'F64 (% (til 70000) 13)))))");
+    aw_eval_ok("(set L (table [k a] (list (% (til 3000) 700) (til 3000))))");
+    aw_eval_ok("(set R (table [k b] (list (til 500) (* 2 (til 500)))))");
+    static const char* const pq[] = {
+        "(select {s: (sum v) from: F by: k})",
+        "(select {s: (sum v) c: (count w) from: F by: [k j]})",
+        "(select {v: v from: F asc: [j v] take: 9})",
+        "(select {m: (max v) a: (avg w) from: F})",
+        "(select {r: (sums v) m: (mavg 3 w) from: F})",
+        "(inner-join [k] L R)",
+        "(left-join [k] L R)",
+        "(select {s: (sum a) n: (count b) from: (inner-join [k] L R) by: k})",
+        "(select {r: (if (> v 5) 1 0) from: C})",
+        "(select {s: (sum ((at D 'f) v)) from: C})",
+        "(select {c: (pearson_corr v (* 2.0 w)) from: F by: j})",   /* a second argument that compiles a literal */
+        "(update {v: (+ (sum v) 0) from: C})",   /* a one-element scalar broadcast as its atom */
+    };
+    static const char* const pcmp[] = {
+        "(all (== (ser (select {from: Q asc: k})) (ser (select {from: R0 asc: k}))))",
+        "(all (== (ser (select {from: Q asc: [k j]})) (ser (select {from: R0 asc: [k j]}))))",
+        NULL, NULL, NULL, NULL, NULL,
+        "(all (== (ser (select {from: Q asc: k})) (ser (select {from: R0 asc: k}))))",
+        NULL, NULL,
+        "(all (== (ser (select {from: Q asc: j})) (ser (select {from: R0 asc: j}))))",
+        NULL,
+    };
+    aw_eval_ok("(set D (dict ['f] (list neg)))");   /* a computed call head: rewritten to its name */
+    aw_eval_ok("(set C (table [v] (list (til 2000))))");
+    int failed = aw_sweep_eval(pq, pcmp, sizeof pq / sizeof *pq);
+    TEST_ASSERT_FMT(failed >= 0, "a failed allocation while planning answered other than oom keeping nothing");
+    TEST_ASSERT_FMT(failed > 0, "no allocation failure answered oom");
+    aw_eval_ok("(set F 0)"); aw_eval_ok("(set L 0)"); aw_eval_ok("(set R 0)"); aw_eval_ok("(set D 0)"); aw_eval_ok("(set C 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set Q 0)");
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -7090,6 +7383,8 @@ const test_entry_t aware_entries[] = {
     { "aware/group_sym_key_nulls_flag", test_group_sym_key_nulls_flag, aw_setup, aw_teardown },
     { "aware/group_fallback_order", test_group_fallback_order, aw_setup, aw_teardown },
     { "aware/group_alloc_fail", test_group_alloc_fail, aw_setup, aw_teardown },
+    { "aware/group_parted_alloc_fail", test_group_parted_alloc_fail, aw_setup, aw_teardown },
+    { "aware/group_build_alloc_fail", test_group_build_alloc_fail, aw_setup, aw_teardown },
     { "aware/holistic_oom", test_holistic_oom, aw_setup, aw_teardown },
     { "aware/radix_cancel_keeps_nothing", test_radix_cancel_keeps_nothing, aw_setup, aw_teardown },
     { "aware/sel_compact_cancel_at_dispatch", test_sel_compact_cancel_at_dispatch, aw_setup, aw_teardown },
@@ -7148,5 +7443,6 @@ const test_entry_t aware_entries[] = {
     { "aware/filter_only_columns", test_filter_only_columns, aw_setup, aw_teardown },
     { "aware/firstn_where_deferred", test_firstn_where_deferred, aw_setup, aw_teardown },
     { "aware/grouped_grade_routes", test_grouped_grade_routes, aw_setup, aw_teardown },
+    { "aware/plan_alloc_fail", test_plan_alloc_fail, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

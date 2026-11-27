@@ -1081,9 +1081,10 @@ static ray_t* parse_list(ray_parser_t *p) {
             elem = parse_expr(p);
         }
         if (RAY_IS_ERR(elem)) { ray_release(list); return elem; }
-        list = ray_list_append(list, elem);
+        ray_t* grown = ray_list_append(list, elem);   /* a failed append leaves list */
         ray_release(elem);
-        if (RAY_IS_ERR(list)) return list;
+        if (!grown || RAY_IS_ERR(grown)) { ray_release(list); return grown ? grown : ray_error("oom", NULL); }
+        list = grown;
         skip_ws_and_comments(p);
     }
     if (*p->pos != ')') { ray_release(list); return ray_error("parse", NULL); }

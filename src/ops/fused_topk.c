@@ -1341,7 +1341,9 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
             if (gerr) { build_ok = 0; break; }
             col = gather_by_idx(src, global_idx, global_n);
         }
-        if (!col || RAY_IS_ERR(col)) { build_ok = 0; break; }
+        /* a gather that failed to allocate: declined, the unfused path
+         * runs; its error goes, it is not refcounted */
+        if (!col || RAY_IS_ERR(col)) { ray_error_free(col); build_ok = 0; break; }
         result = ray_table_add_col(result, alias, col);
         ray_release(col);
     }

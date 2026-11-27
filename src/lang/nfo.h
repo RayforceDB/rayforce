@@ -59,7 +59,8 @@ typedef union ray_span_t {
 #define NFO_VALS(nfo)      ray_list_get((nfo), 3)
 
 /* Create a new nfo object for the given source file.
- * Returns a RAY_LIST or ray_error() on failure. */
+ * Returns a RAY_LIST, or NULL (no nfo: the source goes without spans) when
+ * a part fails to allocate. */
 ray_t* ray_nfo_create(const char* filename, size_t fname_len,
                       const char* source,   size_t src_len);
 

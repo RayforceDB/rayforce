@@ -582,7 +582,7 @@ static ray_op_t* dag_temporal_int_arith(ray_graph_t* g, const char* name, size_t
         if (!lit || RAY_IS_ERR(lit) || lit->type != -RAY_TIMESPAN || RAY_ATOM_IS_NULL(lit))
             return NULL;
         ray_t* a = ray_i64(lit->i64);
-        if (!a || RAY_IS_ERR(a)) return NULL;
+        if (!a || RAY_IS_ERR(a)) { ray_error_free(a); return NULL; }
         uint32_t tid = tv->id;
         xv = ray_const_atom(g, a);
         ray_release(a);
@@ -595,7 +595,7 @@ static ray_op_t* dag_temporal_int_arith(ray_graph_t* g, const char* name, size_t
             int32_t w = (int32_t)(uint32_t)(uint64_t)c;
             if (w == NULL_I32) return NULL;   /* its I32 constant would read as null */
             ray_t* a = ray_i32(w);
-            if (!a || RAY_IS_ERR(a)) return NULL;
+            if (!a || RAY_IS_ERR(a)) { ray_error_free(a); return NULL; }
             uint32_t tid = tv->id;
             xv = ray_const_atom(g, a);
             ray_release(a);
@@ -1341,7 +1341,7 @@ static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t 
     if (n_out == 0) return NULL;
 
     ray_t* res = ray_table_new(n_out);
-    if (!res || RAY_IS_ERR(res)) return NULL;
+    if (!res || RAY_IS_ERR(res)) { ray_error_free(res); return NULL; }
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
         if (kid == from_id) continue;
@@ -1373,10 +1373,10 @@ static ray_t* select_aggs_from_metadata(ray_t* tbl, ray_t** dict_elems, int64_t 
         if (v && !RAY_IS_ERR(v)) v = ray_vec_append(v, &atom->i64);
         if (v && !RAY_IS_ERR(v) && RAY_ATOM_IS_NULL(atom)) ray_vec_set_null(v, 0, true);
         ray_release(atom);
-        if (!v || RAY_IS_ERR(v)) { ray_release(res); return NULL; }
+        if (!v || RAY_IS_ERR(v)) { ray_error_free(v); ray_release(res); return NULL; }
         res = ray_table_add_col(res, kid, v);
         ray_release(v);
-        if (!res || RAY_IS_ERR(res)) return NULL;
+        if (!res || RAY_IS_ERR(res)) { ray_error_free(res); return NULL; }
     }
     return res;
 }
@@ -2529,7 +2529,7 @@ static ray_t* or_eq_as_in(ray_t* e, ray_graph_t* g) {
     if (h) ray_release(h);
     if (c) ray_release(c);
     ray_release(set);
-    if (!in || RAY_IS_ERR(in)) return NULL;
+    if (!in || RAY_IS_ERR(in)) { ray_error_free(in); return NULL; }
     return in;
 }
 
@@ -3398,7 +3398,7 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
                          * symbol's rows), which membership masks out */
                         uint32_t m_id = m->id;
                         ray_t* es = ray_str("", 0);
-                        if (!es || RAY_IS_ERR(es)) return NULL;
+                        if (!es || RAY_IS_ERR(es)) { ray_error_free(es); return NULL; }
                         ray_op_t* c = ray_const_atom(g, es);
                         ray_release(es);
                         if (!c) return NULL;
@@ -5194,7 +5194,7 @@ static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
             { *ok = 0; return NULL; }
     }
     ray_t* out = ray_list_new(0);
-    if (!out || RAY_IS_ERR(out)) { *ok = 0; return out && RAY_IS_ERR(out) ? NULL : NULL; }
+    if (!out || RAY_IS_ERR(out)) { ray_error_free(out); *ok = 0; return NULL; }   /* NULL: ineligible, the error is not returned */
     for (int64_t i = 0; i < n && *ok; i++) {
         ray_t* child = el[i];
         ray_t* rep = NULL;
@@ -5203,6 +5203,9 @@ static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
             rep = agg_arith_rewrite(child, tbl, hexprs, hnames,
                                     n_hidden, cap, ok);
             rep_owned = 1;
+            /* a hidden name that failed to allocate: ineligible, never an
+             * element of the rewrite */
+            if (rep && RAY_IS_ERR(rep)) { ray_error_free(rep); rep = NULL; *ok = 0; }
         } else if (child && child->type == -RAY_SYM &&
                    !(child->attrs & ATTR_QUOTED) && i > 0) {
             /* bare symbol argument: a table column reference outside an
@@ -5216,12 +5219,13 @@ static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
             rep = child;   /* call head / literal / quoted sym */
         }
         if (*ok && rep) {
-            out = ray_list_append(out, rep);
-            if (RAY_IS_ERR(out)) *ok = 0;
+            ray_t* grown = ray_list_append(out, rep);   /* a failed append leaves out */
+            if (!grown || RAY_IS_ERR(grown)) { ray_error_free(grown); *ok = 0; }
+            else out = grown;
         }
         if (rep_owned && rep) ray_release(rep);
     }
-    if (!*ok) { if (out && !RAY_IS_ERR(out)) ray_release(out); return NULL; }
+    if (!*ok) { ray_release(out); return NULL; }
     return out;
 }
 
@@ -5686,7 +5690,7 @@ static ray_t* query_name_computed_heads(ray_t* e, ray_t* tbl, const head_binds_t
             out = ray_list_new(e->len);
             for (int64_t j = 0; j < e->len && out && !RAY_IS_ERR(out); j++) {
                 ray_t* nx = ray_list_append(out, es[j]);
-                if (!nx || RAY_IS_ERR(nx)) ray_release(out);
+                if (!nx || RAY_IS_ERR(nx)) ray_release(out);   /* nx (its error) is returned below */
                 out = nx;
             }
             if (!out || RAY_IS_ERR(out)) { ray_release(sub); return out ? out : ray_error("oom", NULL); }
@@ -6175,7 +6179,7 @@ static ray_t* grouped_nested_agg_inlined(ray_t* expr, ray_t* tbl, bool inside_ag
     ray_t* hit = grouped_output_nested_agg(expr, inside_agg);
     if (hit || !tbl || tbl->type != RAY_TABLE || !query_expr_has_helper(expr)) return hit;
     ray_t* x = query_inline_helpers(expr, tbl);
-    if (!x || RAY_IS_ERR(x)) return NULL;
+    if (!x || RAY_IS_ERR(x)) { ray_error_free(x); return NULL; }
     if (x == expr) { ray_release(x); return NULL; }
     hit = grouped_output_nested_agg(x, inside_agg);
     if (hit) *out_expanded = x; else ray_release(x);
@@ -8896,7 +8900,7 @@ static ray_t* derived_key_chunk_strs(const char** ptr, uint32_t* len, int64_t n)
     sv->len = n;
     if (total > 0) {
         ray_t* sp = ray_alloc((size_t)total);
-        if (!sp || RAY_IS_ERR(sp)) { ray_release(sv); scratch_free(aux_hdr); return NULL; }
+        if (!sp || RAY_IS_ERR(sp)) { ray_error_free(sp); ray_release(sv); scratch_free(aux_hdr); return NULL; }
         sp->type = RAY_U8;
         sp->len  = (int64_t)total;
         sv->str_pool = sp;
@@ -10476,7 +10480,7 @@ static ray_t* dkv_sym(const char* name) { return ray_sym(ray_sym_intern(name, st
 /* (head a) / (head a b) as an expression list; the arguments are consumed. */
 static ray_t* dkv_call(const char* head, ray_t* a, ray_t* b) {
     ray_t* l = ray_list_new(b ? 3 : 2);
-    if (!l || RAY_IS_ERR(l)) { if (a) ray_release(a); if (b) ray_release(b); return NULL; }
+    if (!l || RAY_IS_ERR(l)) { ray_error_free(l); if (a) ray_release(a); if (b) ray_release(b); return NULL; }
     ray_t* h = dkv_sym(head);
     l = ray_list_append(l, h); ray_release(h);
     l = ray_list_append(l, a); ray_release(a);
@@ -10504,7 +10508,7 @@ static ray_t* dkv_select(const int64_t* keys, ray_t** vals, int64_t n) {
     ray_t* d = ray_dict_new(kv, vl);
     if (!d || RAY_IS_ERR(d)) { if (d) ray_error_free(d); return NULL; }
     ray_t* sel = ray_list_new(2);
-    if (!sel || RAY_IS_ERR(sel)) { ray_release(d); return NULL; }
+    if (!sel || RAY_IS_ERR(sel)) { ray_error_free(sel); ray_release(d); return NULL; }
     ray_t* h = dkv_sym("select");
     sel = ray_list_append(sel, h); ray_release(h);
     sel = ray_list_append(sel, d); ray_release(d);
@@ -10796,11 +10800,11 @@ static ray_t* dkv_order_by_position(ray_t* H, int64_t dom_count) {
     }
     if (Hc->attrs & RAY_ATTR_HAS_NULLS) nc->attrs |= RAY_ATTR_HAS_NULLS;
     ray_t* out = ray_table_new(2);
-    if (!out || RAY_IS_ERR(out)) { ray_release(nc); ray_release(nn); return NULL; }
+    if (!out || RAY_IS_ERR(out)) { ray_error_free(out); ray_release(nc); ray_release(nn); return NULL; }
     out = ray_table_add_col(out, ray_table_col_name(H, 0), nc);
     out = ray_table_add_col(out, ray_table_col_name(H, 1), nn);
     ray_release(nc); ray_release(nn);
-    if (!out || RAY_IS_ERR(out)) return NULL;
+    if (!out || RAY_IS_ERR(out)) { ray_error_free(out); return NULL; }
     return out;
 }
 
@@ -12243,7 +12247,7 @@ static ray_t* dks_spread(ray_t* key_dom, const int32_t* code, int64_t n, uint32_
         if (total > UINT32_MAX || pool_cancelled(pool)) { ray_release(out); scratch_free(bytes_hdr); return NULL; }
         if (total > 0) {
             ray_t* sp = ray_alloc((size_t)total);
-            if (!sp || RAY_IS_ERR(sp)) { ray_release(out); scratch_free(bytes_hdr); return NULL; }
+            if (!sp || RAY_IS_ERR(sp)) { ray_error_free(sp); ray_release(out); scratch_free(bytes_hdr); return NULL; }
             sp->type = RAY_U8;
             sp->len = (int64_t)total;
             out->str_pool = sp;
@@ -14470,7 +14474,7 @@ static bool rw_pure(ray_t* e, ray_t* tbl, int depth) {
             bool sub = i > 0 && rw_has_if(es[i], tbl, depth + 1);
             if (sub && !rw_pure(es[i], tbl, depth + 1)) { ok = false; break; }
             ray_t* nx = ray_list_append(x, sub ? zero : es[i]);
-            if (!nx || RAY_IS_ERR(nx)) { ok = false; break; }
+            if (!nx || RAY_IS_ERR(nx)) { ray_error_free(nx); ok = false; break; }
             x = nx;
         }
         if (ok) { x->attrs = e->attrs; ok = query_expr_effect_free(x); }
@@ -17117,7 +17121,9 @@ static int can_atom_broadcast(ray_t* a) {
  * once and fill — Q35 falls back into parity with Q34.
  *
  * Returns NULL for unsupported atom kinds;
- * caller falls back to the per-cell LIST path. */
+ * caller falls back to the per-cell LIST path.  A vector that fails to
+ * allocate is an `oom` error, never NULL: the LIST path would answer a
+ * column of another type. */
 static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
     /* n == 0 is a legitimate request, not a failure: a grouped select that
      * matched no row still owes its caller a typed, empty column for every
@@ -17145,7 +17151,7 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
     } else {
         v = ray_vec_new(vec_type, n);
     }
-    if (!v || RAY_IS_ERR(v)) return NULL;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->len = n;
     if (n == 0) return v;   /* typed and empty; nothing to broadcast into */
 
@@ -17189,7 +17195,7 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
     case RAY_STR:
         for (int64_t i = 0; i < n; i++) {
             ray_t* next = ray_str_vec_set(v, i, ray_str_ptr(a), ray_str_len(a));
-            if (!next || RAY_IS_ERR(next)) { ray_release(v); return NULL; }
+            if (!next || RAY_IS_ERR(next)) { ray_release(v); return next ? next : ray_error("oom", NULL); }
             v = next;
         }
         break;
@@ -18686,7 +18692,7 @@ ray_t* ray_try_select_head_expr(ray_t* expr, int64_t n, int* handled) {
     ray_release(nv);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return NULL; }
     ray_t* head = ray_dict_new(keys, vals);
-    if (!head || RAY_IS_ERR(head)) return NULL;
+    if (!head || RAY_IS_ERR(head)) { ray_error_free(head); return NULL; }
 
     if (handled) *handled = 1;
     ray_t* r = ray_select(&head, 1);
@@ -22517,7 +22523,7 @@ static ray_t* select_sort_take_pushdown(ray_t* dict, int depth, bool* plain) {
             return NULL;
         }
         ray_t* merged = ray_dict_new(mk, mv);
-        if (!merged || RAY_IS_ERR(merged)) return NULL;
+        if (!merged || RAY_IS_ERR(merged)) { ray_error_free(merged); return NULL; }
         bool mplain = false;
         ray_t* r = select_sort_take_pushdown(merged, depth + 1, &mplain);
         /* outputs that are columns alone: the merged select as written */
@@ -25863,7 +25869,7 @@ static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n
             ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
             ray_t* w = enc ? NULL : ray_table_col_idx(tbl, c);   /* plain wrapper: no decode */
             ray_t* nw = ray_alloc((size_t)n_out * sizeof(ray_t*));
-            if (!nw || RAY_IS_ERR(nw)) { ray_release(out); return ray_error("oom", NULL); }
+            if (!nw || RAY_IS_ERR(nw)) { ray_error_free(nw); ray_release(out); return ray_error("oom", NULL); }
             nw->type = m.type;
             nw->len = 0;
             nw->attrs = w ? w->attrs : 0;
@@ -27262,26 +27268,33 @@ static ray_t* select_parted_sorted(ray_t* dict, ray_t* tbl, unsigned plan) {
     }
     if (!narrow || RAY_IS_ERR(narrow)) { scratch_free(buf_hdr); return narrow ? narrow : ray_error("oom", NULL); }
 
-    /* The sort over it: from:, then asc:/desc:/take: in the query's order. */
+    /* The sort over it: from:, then asc:/desc:/take: in the query's order.
+     * A part that fails to build is the answer: its error, the parts made
+     * freed (a failed append leaves its list, which goes too). */
     ray_t* ck = ray_vec_new(RAY_SYM, n_clause + 1);
     ray_t* cv = ray_list_new((int32_t)(n_clause + 1));
     if (ck && !RAY_IS_ERR(ck) && cv && !RAY_IS_ERR(cv)) {
         ((int64_t*)ray_data(ck))[0] = id_from;
         ck->len = 1;
-        cv = ray_list_append(cv, narrow);
-        for (int64_t i = 0; i < nd && cv && !RAY_IS_ERR(cv); i++) {
+        ray_t* grown = ray_list_append(cv, narrow);
+        for (int64_t i = 0; i < nd && grown && !RAY_IS_ERR(grown); i++) {
+            cv = grown;
             int64_t kid = sym_cell_runtime_id(keys, i);
             if (kid != id_take && kid != id_asc && kid != id_desc) continue;
             ((int64_t*)ray_data(ck))[ck->len++] = kid;
-            cv = ray_list_append(cv, ((ray_t**)ray_data(vals))[i]);
+            grown = ray_list_append(cv, ((ray_t**)ray_data(vals))[i]);
         }
+        if (!grown || RAY_IS_ERR(grown)) { ray_release(cv); cv = grown ? grown : ray_error("oom", NULL); }
+        else cv = grown;
     }
     ray_release(narrow);
     ray_t* engine = (ck && !RAY_IS_ERR(ck) && cv && !RAY_IS_ERR(cv)) ? ray_dict_new(ck, cv) : NULL;
     if (!engine || RAY_IS_ERR(engine)) {
-        if (!engine) {
-            if (ck && !RAY_IS_ERR(ck)) ray_release(ck);
-            if (cv && !RAY_IS_ERR(cv)) ray_release(cv);
+        if (!engine) {   /* ck or cv failed: answer its error, free the rest */
+            ray_t* err = ck && RAY_IS_ERR(ck) ? ck : cv && RAY_IS_ERR(cv) ? cv : NULL;
+            if (ck && RAY_IS_ERR(ck)) { if (ck != err) ray_error_free(ck); } else if (ck) ray_release(ck);
+            if (cv && RAY_IS_ERR(cv)) { if (cv != err) ray_error_free(cv); } else if (cv) ray_release(cv);
+            engine = err;
         }
         scratch_free(buf_hdr);
         return engine ? engine : ray_error("oom", NULL);
@@ -28630,7 +28643,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
         }
         if (dep_candidate && base_sym >= 0 && local_n_dep > 0) {
             by_sym_vec_owned = ray_vec_new(RAY_SYM, 1);
-            if (!by_sym_vec_owned || RAY_IS_ERR(by_sym_vec_owned)) {
+            if (!by_sym_vec_owned || RAY_IS_ERR(by_sym_vec_owned)) { ray_error_free(by_sym_vec_owned);
                 scratch_free(local_dep_hdr);
                 ray_release(tbl);
                 DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv); return ray_error("oom", NULL);
@@ -28751,7 +28764,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
             }
             if (defer_ok) {
                 by_sym_vec_owned = ray_vec_new(RAY_SYM, nk);
-                if (!by_sym_vec_owned || RAY_IS_ERR(by_sym_vec_owned)) {
+                if (!by_sym_vec_owned || RAY_IS_ERR(by_sym_vec_owned)) { ray_error_free(by_sym_vec_owned);
                     ray_release(tbl);
                     DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv); return ray_error("oom", NULL);
                 }
@@ -29030,7 +29043,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
         }
 
         by_sym_vec_owned = ray_vec_new(RAY_SYM, nk);
-        if (!by_sym_vec_owned || RAY_IS_ERR(by_sym_vec_owned)) {
+        if (!by_sym_vec_owned || RAY_IS_ERR(by_sym_vec_owned)) { ray_error_free(by_sym_vec_owned);
             ray_env_pop_scope();
             ray_release(tbl);
             DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv); return ray_error("oom", NULL);
@@ -29208,6 +29221,11 @@ by_dict_done:
     }
 
     ray_op_t* root = ray_const_table(g, tbl);
+    if (!root) {   /* its node failed to allocate */
+        ray_graph_free(g);
+        scratch_free(dep_src_hdr);
+        ray_release(tbl); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
+    }
 
     /* Non-agg expression tracking for post-DAG scatter (used in GROUP BY).
      * Arith-of-aggs decomposition (see try_decompose_agg_arith): hidden agg
@@ -31320,7 +31338,7 @@ by_dict_done:
                     /* Build LIST column: pre-allocate, then gather per group.
                      * Direct pointer assignment avoids ray_list_append overhead. */
                     ray_t* list_col = ray_alloc(n_groups * sizeof(ray_t*));
-                    if (!list_col || RAY_IS_ERR(list_col)) {
+                    if (!list_col || RAY_IS_ERR(list_col)) { ray_error_free(list_col);
                         ray_release(full_val);
                         for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
                         scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
@@ -32060,7 +32078,13 @@ by_dict_done:
                     if (ray_len(val_expr) < 3) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select by: binary aggregation requires two column arguments"); }
                     agg_ins2[n_aggs] = compile_agg_arg_dag(g, agg_elems[2]);
                     agg_in2_ids[n_aggs] = agg_ins2[n_aggs] ? agg_ins2[n_aggs]->id : RAY_OP_NONE;
-                    if (!agg_ins2[n_aggs]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile binary aggregation second argument"); }
+                    if (!agg_ins2[n_aggs]) {
+                        for (int ci = 0; ci < n_compound; ci++)
+                            ray_release(compound_rw[ci]);
+                        ray_t* cerr = graph_take_compile_err(g);
+                        ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                        return cerr ? cerr : ray_error("domain", "select by: failed to compile binary aggregation second argument");
+                    }
                     if (dag_operand_type(g, agg_ins2[n_aggs]) > 0 &&
                         !agg_type_admitted(op, dag_operand_type(g, agg_ins2[n_aggs]))) {
                         int8_t in_t = dag_operand_type(g, agg_ins2[n_aggs]);
@@ -32146,8 +32170,10 @@ by_dict_done:
                 if (!agg_ins2[n_aggs]) {
                     for (int ci = 0; ci < n_compound; ci++)
                         ray_release(compound_rw[ci]);
+                    ray_t* cerr = graph_take_compile_err(g);
                     ray_graph_free(g); ray_release(tbl);
-                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile binary aggregation second argument");
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                    return cerr ? cerr : ray_error("domain", "select by: failed to compile binary aggregation second argument");
                 }
                 if (dag_operand_type(g, agg_ins2[n_aggs]) > 0 &&
                     !agg_type_admitted(hop, dag_operand_type(g, agg_ins2[n_aggs]))) {
@@ -32390,7 +32416,7 @@ by_dict_done:
                     if (empty_key_vec && !RAY_IS_ERR(empty_key_vec)) {
                         empty = ray_table_add_col(empty, empty_key_name, empty_key_vec);
                         ray_release(empty_key_vec);
-                    }
+                    } else ray_error_free(empty_key_vec);   /* as before: no key column */
 
                     for (int64_t c = 0; c < nc0; c++) {
                         int64_t cn = ray_table_col_name(filtered_tbl, c);
@@ -33586,7 +33612,7 @@ by_dict_done:
      * pushed onto, as the predicate pushdown wires a filter (opt.c), or run
      * now as the fused path runs it. */
     if (firstn_where) {
-        ray_op_t* grp = group_head_pushed && root->opcode == OP_HEAD ? op_child(g, root, 0) : NULL;
+        ray_op_t* grp = group_head_pushed && root && root->opcode == OP_HEAD ? op_child(g, root, 0) : NULL;
         ray_op_ext_t* gext = grp && grp->opcode == OP_GROUP ? find_ext(g, grp->id) : NULL;
         /* outputs past the group (a constant, a scatter) read the
          * selection afterwards (saved_selection): those run it here */
@@ -34053,11 +34079,11 @@ by_dict_done:
                 if (all_broadcastable) {
                     for (int64_t ni = 0; ni < n_nonaggs; ni++) {
                         ray_t* col = atom_broadcast_vec(nonagg_exprs[ni], n_groups);
-                        if (!col) {
+                        if (!col || RAY_IS_ERR(col)) {
                             /* can_atom_broadcast vetted these — anything
                              * after that is an OOM in atom_broadcast_vec. */
                             ray_release(result); ray_release(tbl);
-                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
+                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return col ? col : ray_error("oom", NULL);
                         }
                         result = ray_table_add_col(result, nonagg_names[ni], col);
                         ray_release(col);
@@ -34973,7 +34999,7 @@ by_dict_done:
                         if (full_is_row_aligned) {
                             cell = gather_by_idx(full_val,
                                 &idx_buf[offsets[gi]], grp_cnt[gi]);
-                            if (!cell || RAY_IS_ERR(cell)) {
+                            if (!cell || RAY_IS_ERR(cell)) { ray_error_free(cell);
                                 gather_ok = 0;
                                 break;
                             }
@@ -35633,7 +35659,10 @@ static ray_t* update_scalar_vec(ray_t* v, int64_t nrows) {
         return v;
     int alloc = 0;
     ray_t* a = collection_elem(v, 0, &alloc);
-    if (!a || RAY_IS_ERR(a)) return v;
+    if (!a || RAY_IS_ERR(a)) {   /* the atom failed: its error, never the 1-row vector */
+        ray_release(v);
+        return a ? a : ray_error("oom", NULL);
+    }
     if (!alloc) ray_retain(a);
     ray_release(v);
     return a;
@@ -36829,10 +36858,11 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                     if (err) { ray_release(agg_result); agg_result = err; }
                 }
 
-                if (RAY_IS_ERR(agg_result)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return agg_result; }
                 /* A one-element result is the group's scalar, broadcast like
-                 * an atom; it failed the length check on groups of 2+ rows. */
+                 * an atom; it failed the length check on groups of 2+ rows.
+                 * An atom that fails to allocate is the error below. */
                 if (!agg_cell) agg_result = update_scalar_vec(agg_result, gsize);
+                if (RAY_IS_ERR(agg_result)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return agg_result; }
 
                 if (target_list) {
                     if (first_group) {
@@ -38366,7 +38396,7 @@ static ray_t* build_parted_nonsym_segment(int8_t base,
         if (!tail || RAY_IS_ERR(tail))
             result = tail ? tail : ray_error("oom", NULL);
         for (int64_t r = 0; r < batch; r++) {
-            if (!tail || RAY_IS_ERR(tail)) break;
+            if (!tail || RAY_IS_ERR(tail)) break;   /* result holds its error */
             ray_t* next = append_parted_atom(tail, base, payload);
             if (!next || RAY_IS_ERR(next)) {
                 ray_release(tail);

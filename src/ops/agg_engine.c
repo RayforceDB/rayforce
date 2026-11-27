@@ -13633,7 +13633,7 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     if (grp_rc != 0) { agg_dense_plan_free(&dp); return agg_keys_error(grp_rc); }
 
     ray_t* result = ray_table_new(ext->n_keys + ext->n_aggs);
-    if (!result || RAY_IS_ERR(result)) { agg_dense_plan_free(&dp); agg_groups_free(&groups); return ray_error("oom", NULL); }
+    if (!result || RAY_IS_ERR(result)) { agg_dense_plan_free(&dp); agg_groups_free(&groups); return result ? result : ray_error("oom", NULL); }
 
     for (uint32_t k = 0; k < ext->n_keys; k++) {
         ray_t* kc = ray_group_gather(key_cols[k], groups.first_row, groups.ngroups);
@@ -13882,7 +13882,7 @@ ray_t* agg_run_one(const agg_vtable_t* vt, ray_t* val_col,
         if (vt->destroy)
             for (int64_t gi = 0; gi < ngroups; gi++)
                 vt->destroy(states + (size_t)gi * vt->state_size);
-        ray_free_raw(states); return ray_error("oom", NULL);
+        ray_free_raw(states); return out ? out : ray_error("oom", NULL);
     }
     out->len = ngroups;
     for (int64_t gi = 0; gi < ngroups; gi++) {
@@ -13923,7 +13923,7 @@ ray_t* agg_run_one_bin(const agg_vtable_t* vt, ray_t* x_col, ray_t* y_col,
         if (vt->destroy)
             for (int64_t gi = 0; gi < ngroups; gi++)
                 vt->destroy(states + (size_t)gi * vt->state_size);
-        ray_free_raw(states); return ray_error("oom", NULL);
+        ray_free_raw(states); return out ? out : ray_error("oom", NULL);
     }
     out->len = ngroups;
     for (int64_t gi = 0; gi < ngroups; gi++) {
