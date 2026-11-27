@@ -438,7 +438,7 @@ static ray_t* promote_vals_to_list(ray_t* vals) {
         ray_t* lst2 = ray_list_append(lst, a);
         if (owned) ray_release(a);
         if (!lst2 || RAY_IS_ERR(lst2)) {
-            if (lst2 == NULL) ray_release(lst);
+            ray_release(lst);   /* a failed append leaves lst, ours (#1857) */
             return lst2 ? lst2 : ray_error("oom", NULL);
         }
         lst = lst2;
@@ -554,11 +554,13 @@ ray_t* ray_dict_upsert(ray_t* d, ray_t* key_atom, ray_t* val) {
     ray_t* keys = slots[0];
     ray_t* vals = slots[1];   /* not-a-table */
 
-    /* The append/set helpers consume the input ref and return an owned ref
-     * (possibly the same pointer, or a fresh one after grow — in which case
-     * the OLD block is already freed inside the helper).  So we always
-     * overwrite slots[*] with the helper return and never release the old
-     * pointer ourselves — that would double-free on grow. */
+    /* The append/set helpers take the input ref on success and return an
+     * owned ref (possibly the same pointer, or a fresh one after grow — in
+     * which case the OLD block is already freed inside the helper).  So on
+     * success we overwrite slots[*] with the helper return and never release
+     * the old pointer ourselves — that would double-free on grow.  On failure
+     * the old pointer is untouched and still in its slot (#1857): releasing
+     * `d` releases it once. */
     if (idx >= 0) {
         /* Replace existing slot. */
         if (vals->type == RAY_LIST) {
@@ -605,7 +607,8 @@ ray_t* ray_dict_upsert(ray_t* d, ray_t* key_atom, ray_t* val) {
         keys = nk;
     }
 
-    /* Append key — helper consumes `keys`, returns owned (possibly new) ref. */
+    /* Append key — on success the helper takes `keys` and returns an owned
+     * (possibly new) ref; on failure `keys` stays in its slot. */
     ray_t* new_keys = NULL;
     if (keys->type == RAY_SYM && key_atom->type == -RAY_SYM) {
         int64_t kid = key_atom->i64;
@@ -635,7 +638,8 @@ ray_t* ray_dict_upsert(ray_t* d, ray_t* key_atom, ray_t* val) {
     if (!new_keys || RAY_IS_ERR(new_keys)) { ray_release(d); return new_keys ? new_keys : ray_error("oom", NULL); }
     slots[0] = new_keys;
 
-    /* Append val — list_append consumes vals, returns owned (possibly new). */
+    /* Append val — on success list_append takes vals and returns an owned
+     * (possibly new) ref; on failure vals stays in its slot. */
     ray_t* new_vals = ray_list_append(vals, val);
     if (!new_vals || RAY_IS_ERR(new_vals)) { ray_release(d); return new_vals ? new_vals : ray_error("oom", NULL); }
     slots[1] = new_vals;   /* not-a-table */

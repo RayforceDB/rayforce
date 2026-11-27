@@ -50,6 +50,17 @@ RAY_INLINE bool ray_cow_can_reuse_header(ray_t* v) {
     return rc == 1;
 }
 
+/* A write that copied `original` (ray_cow, which releases one reference of
+ * the original when it copies) and then failed: the copy goes, and the
+ * reference ray_cow released is taken back, so the caller's `original` is as
+ * it was and still the caller's (#1857).  ray_cow copies only a shared block,
+ * so the original is alive.  No-op when no copy was made. */
+static inline void ray_cow_abandon(ray_t* copy, ray_t* original) {
+    if (copy == original) return;
+    ray_retain(original);
+    ray_release(copy);
+}
+
 #ifdef DEBUG
 /* Debug stale-pointer detector — see src/mem/heap.c (issue #240). */
 void ray_dfd_check_live(const void* p, const char* who);

@@ -298,7 +298,7 @@ ray_t* ray_vec_append(ray_t* vec, const void* elem) {
     ray_t* original = vec;
     if (!ray_cow_can_reuse_header(vec)) {
         vec = ray_cow(vec);
-        if (!vec || RAY_IS_ERR(vec)) return vec;
+        if (!vec || RAY_IS_ERR(vec)) return vec ? vec : ray_error("oom", NULL);   /* a failed copy: the input untouched, never C NULL */
     }
 
     /* Append changes len + writes data: a hash index is extended over the
@@ -313,7 +313,7 @@ ray_t* ray_vec_append(ray_t* vec, const void* elem) {
         ray_t* new_vec = ray_cell_grow_one(vec, esz);
         if (!new_vec || RAY_IS_ERR(new_vec)) {
             vec_index_untake(vec, original, keep);
-            if (vec != original) ray_release(vec);
+            ray_cow_abandon(vec, original);   /* the caller keeps its vec (#1857) */
             return new_vec ? new_vec : ray_error("oom", NULL);
         }
         vec = new_vec;
@@ -367,7 +367,7 @@ ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
     ray_t* original = vec;
     if (!ray_cow_can_reuse_header(vec)) {
         vec = ray_cow(vec);
-        if (!vec || RAY_IS_ERR(vec)) return vec;
+        if (!vec || RAY_IS_ERR(vec)) return vec ? vec : ray_error("oom", NULL);   /* a failed copy: the input untouched, never C NULL */
     }
 
     /* a hash index is extended over the new rows, any other one dropped */
@@ -383,7 +383,7 @@ ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
         ray_t* new_vec = ray_scratch_realloc(vec, new_data_size);
         if (!new_vec || RAY_IS_ERR(new_vec)) {
             vec_index_untake(vec, original, keep);
-            if (vec != original) ray_release(vec);
+            ray_cow_abandon(vec, original);   /* the caller keeps its vec (#1857) */
             return new_vec ? new_vec : ray_error("oom", NULL);
         }
         vec = new_vec;
@@ -396,7 +396,7 @@ ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
 
 fail:
     vec_index_untake(vec, original, keep);
-    if (vec != original) ray_release(vec);
+    ray_cow_abandon(vec, original);   /* the caller keeps its vec (#1857) */
     return ray_error("oom", NULL);
 }
 
@@ -440,7 +440,7 @@ ray_t* ray_vec_set(ray_t* vec, int64_t idx, const void* elem) {
 
     /* COW: if shared, copy first */
     vec = ray_cow(vec);
-    if (!vec || RAY_IS_ERR(vec)) return vec;
+    if (!vec || RAY_IS_ERR(vec)) return vec ? vec : ray_error("oom", NULL);   /* a failed copy: the input untouched, never C NULL */
 
     /* Writing a slot value invalidates any attached accelerator index. */
     vec_drop_index_inplace(vec);
@@ -781,7 +781,7 @@ ray_t* ray_vec_insert_at(ray_t* vec, int64_t idx, const void* elem) {
     ray_t* original = vec;
     if (!ray_cow_can_reuse_header(vec)) {
         vec = ray_cow(vec);
-        if (!vec || RAY_IS_ERR(vec)) return vec;
+        if (!vec || RAY_IS_ERR(vec)) return vec ? vec : ray_error("oom", NULL);   /* a failed copy: the input untouched, never C NULL */
     }
 
     /* In-place insert mutates len + data + aux; any attached
@@ -794,7 +794,7 @@ ray_t* ray_vec_insert_at(ray_t* vec, int64_t idx, const void* elem) {
     if (vec->len >= cap) {
         ray_t* new_vec = ray_cell_grow_one(vec, esz);
         if (!new_vec || RAY_IS_ERR(new_vec)) {
-            if (vec != original) ray_release(vec);
+            ray_cow_abandon(vec, original);   /* the caller keeps its vec (#1857) */
             return new_vec ? new_vec : ray_error("oom", NULL);
         }
         vec = new_vec;
@@ -1285,7 +1285,7 @@ ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len) {
 
     ray_t* original = vec;
     vec = ray_cow(vec);
-    if (!vec || RAY_IS_ERR(vec)) return vec;
+    if (!vec || RAY_IS_ERR(vec)) return vec ? vec : ray_error("oom", NULL);   /* a failed copy: the input untouched, never C NULL */
     if (!str_pool_cow(vec)) goto fail_oom;
 
     int64_t pool_off = 0;
@@ -1325,10 +1325,10 @@ ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len) {
     return vec;
 
 fail_oom:
-    if (vec != original) ray_release(vec);
+    ray_cow_abandon(vec, original);   /* the caller keeps its vec (#1857) */
     return ray_error("oom", NULL);
 fail_range:
-    if (vec != original) ray_release(vec);
+    ray_cow_abandon(vec, original);   /* the caller keeps its vec (#1857) */
     return ray_error("range", "str_vec_append: pool offset exceeds %lld bytes", (long long)UINT32_MAX);
 }
 
@@ -1456,7 +1456,7 @@ ray_t* ray_str_vec_set(ray_t* vec, int64_t idx, const char* s, size_t len) {
 
     ray_t* original = vec;
     vec = ray_cow(vec);
-    if (!vec || RAY_IS_ERR(vec)) return vec;
+    if (!vec || RAY_IS_ERR(vec)) return vec ? vec : ray_error("oom", NULL);   /* a failed copy: the input untouched, never C NULL */
     if (!str_pool_cow(vec)) goto fail_oom;
 
     ray_str_t* elem = &((ray_str_t*)ray_data(vec))[idx];
@@ -1519,10 +1519,10 @@ ray_t* ray_str_vec_set(ray_t* vec, int64_t idx, const char* s, size_t len) {
     return vec;
 
 fail_oom:
-    if (vec != original) ray_release(vec);
+    ray_cow_abandon(vec, original);   /* the caller keeps its vec (#1857) */
     return ray_error("oom", NULL);
 fail_range:
-    if (vec != original) ray_release(vec);
+    ray_cow_abandon(vec, original);   /* the caller keeps its vec (#1857) */
     return ray_error("range", "str_vec_set: pool offset exceeds %lld bytes", (long long)UINT32_MAX);
 }
 
@@ -1563,9 +1563,9 @@ ray_t* ray_str_vec_compact(ray_t* vec) {
 
     ray_t* original = vec;
     vec = ray_cow(vec);
-    if (!vec || RAY_IS_ERR(vec)) return vec;
+    if (!vec || RAY_IS_ERR(vec)) return vec ? vec : ray_error("oom", NULL);   /* a failed copy: the input untouched, never C NULL */
     if (!str_pool_cow(vec)) {
-        if (vec != original) ray_release(vec);
+        ray_cow_abandon(vec, original);   /* the caller keeps its vec (#1857) */
         return ray_error("oom", NULL);
     }
 

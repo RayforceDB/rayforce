@@ -3543,11 +3543,13 @@ ray_t* ray_assert_fact_fn(ray_t** args, int64_t n) {
         }
 
         if (RAY_IS_ERR(new_col)) {
-            /* ray_cow inside ray_vec_append already released old_col ref on error/copy */
+            /* a failed append leaves old_col with our retain (#1857): drop it */
+            ray_release(old_col);
             ray_release(result);
             return new_col;
         }
-        /* ray_cow consumed our retain when it copied; don't double-release old_col */
+        /* on success ray_cow consumed our retain when it copied; don't
+         * double-release old_col */
 
         result = ray_table_add_col(result, col_name, new_col);
         ray_release(new_col);

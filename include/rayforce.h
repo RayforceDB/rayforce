@@ -664,6 +664,21 @@ ray_t* ray_vec_new(int8_t type, int64_t capacity);
 #define RAY_SYM_W64   3  /* int64_t  indices, unbounded */
 
 ray_t* ray_sym_vec_new(uint8_t sym_width, int64_t capacity);  /* RAY_SYM with adaptive width */
+
+/* The growing writes: ray_vec_append, ray_vec_append_raw, ray_vec_insert_at,
+ * ray_str_vec_append, ray_str_vec_set, ray_str_vec_compact, ray_list_append
+ * and ray_list_insert_at.
+ *   On success they take the caller's reference to `vec` (or `list`) and
+ *   answer an owned vector: the same block, or a copy or a grown block when
+ *   it was shared or full.
+ *   On failure they answer an owned error and leave `vec` untouched: still
+ *   the caller's, with its reference, to release or keep using.  A shared
+ *   input that was copied gets back the reference the copy took (#1857).
+ *   So keep the input until the answer is checked:
+ *       ray_t* nv = ray_vec_append(v, &x);
+ *       if (RAY_IS_ERR(nv)) { ray_release(v); return nv; }
+ *       v = nv;
+ *   `v = ray_vec_append(v, &x)` loses `v` on a failure. */
 ray_t* ray_vec_append(ray_t* vec, const void* elem);
 ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count);  /* one reserve + one memcpy */
 ray_t* ray_vec_set(ray_t* vec, int64_t idx, const void* elem);
