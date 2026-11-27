@@ -3580,7 +3580,7 @@ static bool query_inline_pure_builtin(int64_t id) {
         "til", "take", "drop", "enlist", "list", "count", "first", "last", "at", "in",
         "not-in", "except", "union", "sect", "where", "raze", "flip", "key", "value",
         "type", "sublist", "differ", "fills", "group", "upper", "lower", "trim", "strlen",
-        "like", "ilike", "str-find", "nil?",
+        "like", "ilike", "str-find", "nil?", "filter",
     };
     enum { NPURE = sizeof pure / sizeof *pure };
     /* Interned once per symbol-table epoch (sym.h): this runs for every
@@ -15807,11 +15807,117 @@ static void cd_want_group_rows(ray_t* src, const int64_t* idx_buf,
     ray_col_want_rows(src, idx_buf, offsets[n_groups - 1] + grp_cnt[n_groups - 1]);
 }
 
+/* A cheap first test of an operand of (count (distinct ...)): is it built
+ * from atomic builtins alone (+, -, *, ==, abs, ...) over names and values,
+ * (+ v 1) or (* a b)?  Then it gives one value per row and needs no
+ * per-group evaluation, and the full proof (agg_input_needs_group_eval) is
+ * not asked: such an operand costs what it did.  Each head is judged by the
+ * builtin it holds (fv_head_builtin: a local or a column shadows it), so a
+ * name rebound to reverse or to filter is not atomic (#1803 review). */
+static ray_t* fv_head_builtin(ray_t* e, ray_t* tbl);
+static bool cd_operand_rowwise(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || depth > 32) return false;
+    if (e->type != RAY_LIST) return true;          /* a name, an atom, a vector */
+    if ((e->attrs & ATTR_QUOTED) || e->len < 2) return false;
+    ray_t* fn = fv_head_builtin(e, tbl);
+    if (!fn || !(fn->attrs & RAY_FN_ATOMIC)) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    for (int64_t i = 1; i < e->len; i++)
+        if (!cd_operand_rowwise(es[i], tbl, depth + 1)) return false;
+    return true;
+}
+
+/* Does an operand of (count (distinct ...)) call something the rules
+ * cannot name a builtin for: a head computed in the expression ((at D 'r),
+ * ((first fs) i), ((rf) i)), a lambda written in place or held by a name,
+ * or a value that is no function?  Then it is not known to give one value
+ * per row, and it is evaluated per group, as an unknown helper's body is:
+ * the per-group answer is right whatever it does, the whole-table one only
+ * if it is row by row (#1803 review).  Asked only once the full proof has
+ * found nothing, so an operand of identified builtins pays nothing. */
+/* Does an argument of a call in `e` read a column of `tbl` (a name no local
+ * shadows), whatever the call's head: expr_refs_row_column does not look
+ * past a head it cannot name, as ((at D 'r) i). */
+static bool cd_args_read_column(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || depth > 32) return false;
+    if (e->type == -RAY_SYM)
+        return !(e->attrs & ATTR_QUOTED) && tbl_has_col(tbl, e->i64) && !ray_env_has_lexical_local(e->i64);
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (es[0] && es[0]->type == -RAY_SYM && es[0]->i64 == ray_sym_intern("quote", 5)) return false;
+    for (int64_t i = 1; i < e->len; i++)
+        if (cd_args_read_column(es[i], tbl, depth + 1)) return true;
+    return false;
+}
+
+static bool cd_operand_opaque(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return false;
+    if (depth > 32) return true;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (!h || h->type != -RAY_SYM) return true;            /* a computed head, a lambda literal */
+    if (h->attrs & ATTR_QUOTED) return true;
+    if (h->i64 == ray_sym_intern("quote", 5)) return false; /* data */
+    if (!tbl_has_col(tbl, h->i64)) {                        /* a column head fails as a column does */
+        ray_t* fn = ray_env_get(h->i64);
+        if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return true;
+    }
+    for (int64_t i = 1; i < e->len; i++)
+        if (cd_operand_opaque(es[i], tbl, depth + 1)) return true;
+    return false;
+}
+
+/* The call (name arg): a new list, arg retained; an owned error, with
+ * nothing left over, when an allocation fails. */
+static ray_t* cd_call1(const char* name, ray_t* arg) {
+    ray_t* l = ray_list_new(2);
+    if (!l || RAY_IS_ERR(l)) return l ? l : ray_error("oom", NULL);
+    ray_t* h = ray_sym(ray_sym_intern(name, strlen(name)));
+    if (!h || RAY_IS_ERR(h)) { ray_release(l); return h ? h : ray_error("oom", NULL); }
+    ray_t* n = ray_list_append(l, h);
+    ray_release(h);
+    /* a failed append leaves the list to the caller */
+    if (!n || RAY_IS_ERR(n)) { ray_release(l); return n ? n : ray_error("oom", NULL); }
+    l = n;
+    n = ray_list_append(l, arg);
+    if (!n || RAY_IS_ERR(n)) { ray_release(l); return n ? n : ray_error("oom", NULL); }
+    return n;
+}
+
+/* (count (distinct inner)), for each group's evaluation: a new list, or an
+ * owned error with nothing left over. */
+static ray_t* cd_group_expr(ray_t* inner) {
+    ray_t* dexpr = cd_call1("distinct", inner);
+    if (RAY_IS_ERR(dexpr)) return dexpr;
+    ray_t* cexpr = cd_call1("count", dexpr);
+    ray_release(dexpr);
+    return cexpr;
+}
+
+#ifdef DEBUG
+/* Test seam (lang/query/cd_group_expr_oom): cd_group_expr. */
+ray_t* ray_query_cd_group_expr_for_test(ray_t* inner) { return cd_group_expr(inner); }
+#endif
+
 static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
                                            const int64_t* idx_buf,
                                            const int64_t* offsets,
                                            const int64_t* grp_cnt,
                                            int64_t n_groups) {
+    /* An operand from the rows that gives no value per row -- (filter i c),
+     * (except s 'aa), (take i 2) -- is each group's: evaluated over the
+     * group's rows, as the other aggregates of it are (#1803).  Over the
+     * whole table its values would not line up with the groups' rows. */
+    if (inner_expr && inner_expr->type == RAY_LIST && !(inner_expr->attrs & ATTR_QUOTED) &&
+        !cd_operand_rowwise(inner_expr, tbl, 0) &&
+        ((expr_refs_row_column(inner_expr, tbl) && agg_input_needs_group_eval(inner_expr, tbl, false)) ||
+         (cd_operand_opaque(inner_expr, tbl, 0) && cd_args_read_column(inner_expr, tbl, 0)))) {
+        ray_t* cexpr = cd_group_expr(inner_expr);
+        if (RAY_IS_ERR(cexpr)) return cexpr;
+        ray_t* out = nonagg_eval_per_group_buf(cexpr, tbl, idx_buf, offsets, grp_cnt, n_groups);
+        ray_release(cexpr);
+        return out;
+    }
     /* Resolve the source vector — either a direct column ref (zero copy)
      * or a full-table eval of the inner sub-expression. */
     ray_t* src = NULL;
@@ -17010,8 +17116,10 @@ static bool scalar_edge_src_vectorizes(ray_t* e, ray_t* tbl, int depth) {
     ray_t** es = (ray_t**)ray_data(e);
     if (!rw_if_kind(e, tbl)) {
         ray_t* h = es[0];
+        /* what the head holds, a parameter's or a let's too (ray_env_get
+         * reads the scope first): a local holding an atomic builtin is it */
         if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
-            tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return false;
+            tbl_has_col(tbl, h->i64)) return false;
         ray_t* fn = ray_env_get(h->i64);
         if (!fn || RAY_IS_ERR(fn) || fn->type < RAY_UNARY || fn->type > RAY_VARY ||
             !(fn->attrs & RAY_FN_ATOMIC)) return false;
@@ -17067,8 +17175,11 @@ static bool scalar_edge_src_builtin(ray_t* e, ray_t* tbl, int depth) {
                 if (!scalar_edge_src_builtin(es[i], tbl, depth + 1)) return false;
             return true;
         }
+        /* what the head holds, a parameter's or a let's too (ray_env_get
+         * reads the scope first): a local holding filter is filter, as
+         * by: calls it (#1803 review) */
         if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
-            tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return false;
+            tbl_has_col(tbl, h->i64)) return false;
         ray_t* fn = ray_env_get(h->i64);
         if (fn && fn->type == RAY_LAMBDA) {
             for (int64_t i = 1; i < e->len; i++)
@@ -22601,13 +22712,30 @@ static ray_t* fv_value(ray_t* e, ray_t* tbl, const fv_cols_t* fc) {
 }
 
 /* The builtin the call `e` invokes, or NULL: a head no column or local
- * shadows, bound to a builtin. */
-static ray_t* fv_head_builtin(ray_t* e, ray_t* tbl) {
+ * shadows, bound to a builtin, judged by the object the name holds (as
+ * lit_named_builtin judges a call's head), not by its spelling: after (set
+ * keep filter) keep is filter, after (set abs reverse) abs is reverse, and
+ * a local or a parameter holding a builtin is that builtin (#1803 review). */
+/* What the head of `e` holds, as the evaluator resolves it (ray_env_get:
+ * the scope's locals, then the globals), when that is a builtin; NULL
+ * else.  The column shadowing is fv_head_shadowed's. */
+static ray_t* fv_head_fn(ray_t* e) {
     ray_t* h = ((ray_t**)ray_data(e))[0];
-    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || tbl_has_col(tbl, h->i64) ||
-        ray_env_has_lexical_local(h->i64)) return NULL;
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return NULL;
     ray_t* fn = ray_env_get(h->i64);
     return fn && fn->type >= RAY_UNARY && fn->type <= RAY_VARY ? fn : NULL;
+}
+
+/* Is the head of `e` a column of `tbl` (which shadows any builtin of its
+ * name: a column holds no builtin)? */
+static bool fv_head_shadowed(ray_t* e, ray_t* tbl) {
+    ray_t* h = ((ray_t**)ray_data(e))[0];
+    return tbl && h && h->type == -RAY_SYM && tbl_has_col(tbl, h->i64);
+}
+
+static ray_t* fv_head_builtin(ray_t* e, ray_t* tbl) {
+    ray_t* fn = fv_head_fn(e);
+    return fn && !fv_head_shadowed(e, tbl) ? fn : NULL;
 }
 
 /* Is the `i`th argument of the call `e` read as rows, given whether `e`
@@ -22617,19 +22745,28 @@ static ray_t* fv_head_builtin(ray_t* e, ray_t* tbl) {
  * the arguments its builtin maps element by element at that arity
  * (ray_fn_row_arg: atomic builtins, (min W 30), (as 'F64 W), if, ...);
  * and `distinct` its source, as (count (distinct v)) counts each group's
- * values. */
+ * values.  filter's values and mask are read as rows wherever the call is. */
 static bool call_is_fold_or_at(ray_t* e);
+static bool fn_is_fold(const void* fp);
 
 /* This is the one list of positions where a free vector as long as the
  * table is read as rows.  fold reduces its vector as an aggregate reduces
  * its source, so its values are read as rows too: (fold + W) by: folds
  * each group's slice of W, as (sum W) sums it (the owner's decision of
- * 2026-11-24, where #1429 and #1492 meet).  at is not: its source and its
- * index over a free vector are a lookup, read whole. */
-static bool fv_arg_rows(ray_t* e, int64_t i, ray_t* tbl, bool rows) {
-    if (i >= 2 && call_is_fold_or_at(e) && fv_head_builtin(e, tbl) &&
-        fv_head_builtin(e, tbl)->type == RAY_VARY)
+ * 2026-11-24, where #1429 and #1492 meet), and so are filter's values and
+ * mask, which pair up row by row (#1803).  Each builtin is the one the head
+ * holds (`fn`, fv_head_builtin), whatever it is spelled.  at is not: its
+ * source and its index over a free vector are a lookup, read whole. */
+static bool fv_arg_rows(ray_t* e, int64_t i, ray_t* tbl, bool rows, ray_t* fn) {
+    if (i >= 2 && e->len >= 3 && fn && fn->type == RAY_VARY &&
+        fn_is_fold((const void*)(uintptr_t)fn->i64))
         return true;                                   /* fold's values */
+    /* filter's values and mask pair up row by row, wherever the call is:
+     * (sum (filter W c)) by: sums each group's values of W where c holds,
+     * as over a column (#1803, the length rule of #1492). */
+    if (e->len == 3 && (i == 1 || i == 2) && fn && fn->type == RAY_BINARY &&
+        (void*)(uintptr_t)fn->i64 == (void*)ray_filter_fn)
+        return true;
     if (is_agg_expr(e)) {
         if (i == 1) return true;
         uint16_t op = resolve_agg_opcode(((ray_t**)ray_data(e))[0]->i64);
@@ -22637,12 +22774,10 @@ static bool fv_arg_rows(ray_t* e, int64_t i, ray_t* tbl, bool rows) {
                           op == OP_PEARSON_CORR);
     }
     if (!rows) return false;
-    ray_t* fn = fv_head_builtin(e, tbl);
     if (!fn) return false;
     if (ray_fn_row_arg(fn, e->len - 1, i)) return true;
-    static int64_t distinct_id = -1;
-    if (distinct_id < 0) distinct_id = ray_sym_intern("distinct", 8);
-    return i == 1 && e->len == 2 && ((ray_t**)ray_data(e))[0]->i64 == distinct_id;
+    return i == 1 && e->len == 2 && fn->type == RAY_UNARY &&
+           (void*)(uintptr_t)fn->i64 == (void*)ray_distinct_fn;
 }
 
 /* Is `e` a JSON read, .json.get or .json.parse, of a column: its path is
@@ -22724,8 +22859,18 @@ static ray_t* fv_subst(ray_t* e, ray_t* tbl, bool rows, fv_cols_t* fc) {
             return ray_error("length", ".json.get: %lld paths for %lld rows",
                              (long long)pv->len, (long long)nr);
     }
+    /* the builtin the call invokes, once for every argument */
+    ray_t* hfn = e->len >= 3 || (rows && e->len >= 2) ? fv_head_fn(e) : NULL;
+    /* the column check only where the builtin is read: as rows, or a fold
+     * or filter, whose arguments are rows wherever the call is */
+    if (hfn && !rows &&
+        !(hfn->type == RAY_VARY && fn_is_fold((const void*)(uintptr_t)hfn->i64)) &&
+        !(hfn->type == RAY_BINARY && (void*)(uintptr_t)hfn->i64 == (void*)ray_filter_fn))
+        hfn = NULL;
+    else if (hfn && fv_head_shadowed(e, tbl))
+        hfn = NULL;
     for (int64_t i = 1; i < e->len; i++) {
-        bool r = fv_arg_rows(e, i, tbl, rows) || (json_path && i == 2);
+        bool r = fv_arg_rows(e, i, tbl, rows, hfn) || (json_path && i == 2);
         ray_t* c = fv_subst(el[i], tbl, r, fc);
         if (!c || RAY_IS_ERR(c)) { if (out) ray_release(out); return c ? c : ray_error("oom", NULL); }
         if (!out && c == el[i]) { ray_release(c); continue; }
@@ -23603,6 +23748,9 @@ static const void* const query_whole_col_verbs[] = {
     (void*)ray_idesc_fn,   (void*)ray_rank_fn,  (void*)ray_xrank_fn, (void*)ray_rotate_fn,
     (void*)ray_xasc_fn,    (void*)ray_xdesc_fn, (void*)ray_distinct_fn, (void*)ray_where_fn,
     (void*)ray_group_indices_fn, (void*)ray_take_fn, (void*)ray_drop_fn,
+    /* they give no value per row either: filter keeps some rows, raze of a
+     * list of columns holds more values than rows (#1803) */
+    (void*)ray_filter_fn,  (void*)ray_raze_fn,
 };
 
 static bool query_code_needs_group_v(ray_t* e, ray_t* tbl, int depth, int* budget, bool verbs);

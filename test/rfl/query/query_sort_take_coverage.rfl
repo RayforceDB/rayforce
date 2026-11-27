@@ -1120,14 +1120,15 @@
 (value (cdkw Tcd Kcd)) -- (value ((fn [tbl k] (select {c: (count y) by: k from: tbl where: (> y 15)})) Tcd Kcd))
 ;; a bound list is a collection; a bound vector of another length than the
 ;; table is a length error, as in every aggregate (#1462); an operand over a
-;; column of another length (a take of it) has no value for some rows: the
-;; per-group kernel read past it
+;; column that gives no value per row (a take of it) is each group's, as in
+;; every other aggregate (#1803): the per-group kernel read past it whole
 (set Tln (table [k y] (list (% (til 1000) 10) (til 1000))))
 (cdl Tln (list "a" "b")) -- (cdz Tln (list "a" "b"))
 (distinct (cdl Tln (list "a" "b"))) -- [2]
 (cdl Tln [1 2]) !- length
 (cdl Thc [1 2]) !- length
-(select {c: (count (distinct (take y 2))) by: k from: Tln}) !- length
+(at (select {c: (count (distinct (take y 2))) by: k from: Tln}) 'c) -- [2 2 2 2 2 2 2 2 2 2]
+(at (select {c: (count (distinct (take y 2))) by: k from: Tln}) 'c) -- (at (select {c: (count (take y 2)) by: k from: Tln}) 'c)
 ;; a named key must have one value per row of the table, under a where: too
 ;; (a key as long as the rows the where: keeps is no key of the table)
 ((fn [t k] (select {c: (count (distinct y)) by: k from: t where: (> y 15)})) Tcd [7 7 8 8]) !- length
