@@ -3946,20 +3946,21 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     if (err == RAY_OK) {
         ray_t* schema = ray_vec_new(RAY_STR, ncols > 0 ? ncols : 1);
         if (!schema || RAY_IS_ERR(schema)) {
-            if (schema) ray_release(schema);
+            ray_error_free(schema);   /* owned here; ray_release leaves an error */
             schema = NULL;
             err = RAY_ERR_OOM;
         }
         for (int c = 0; schema && c < ncols; c++) {
             ray_t* na = ray_sym_str(col_name_ids[c]);
-            if (na)
-                schema = ray_str_vec_append(schema, ray_str_ptr(na),
-                                            ray_str_len(na));
-            if (!na || !schema || RAY_IS_ERR(schema)) {
-                if (schema && RAY_IS_ERR(schema)) ray_release(schema);
+            ray_t* ns = na ? ray_str_vec_append(schema, ray_str_ptr(na), ray_str_len(na)) : NULL;
+            if (!ns || RAY_IS_ERR(ns)) {
+                /* a failed append leaves schema, which is ours; the
+                 * append's error is freed (#1854) */
+                ray_error_free(ns);
+                ray_release(schema);
                 schema = NULL;
                 err = RAY_ERR_OOM;
-            }
+            } else schema = ns;
         }
         if (schema) {
             err = ray_col_save_bulk(schema, schema_path);

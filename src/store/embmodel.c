@@ -409,12 +409,27 @@ static ray_t* emb_limits(void) {
     struct { const char* name; int64_t v; } rows[] = {
         { "input", (int64_t)1 << 30 }, { "nodes", (int64_t)1 << 24 }, { "alloc", (int64_t)1 << 31 },
     };
+    /* keys and vals are owned here and hold 3 slots, so the appends do not
+     * grow; a value that fails to allocate is the failure, never a limit
+     * read as an error object (#1854) */
     for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {
         int64_t s = sym_intern_safe(rows[i].name, strlen(rows[i].name));
-        keys = ray_vec_append(keys, &s);
         ray_t* v = make_i64(rows[i].v);
-        vals = ray_list_append(vals, v);
+        if (s < 0 || !v || RAY_IS_ERR(v)) {
+            ray_error_free(v);
+            ray_release(keys); ray_release(vals);
+            return ray_error("oom", NULL);
+        }
+        ray_t* nk = ray_vec_append(keys, &s);
+        ray_t* nl = (nk && !RAY_IS_ERR(nk)) ? ray_list_append(vals, v) : NULL;
         ray_release(v);
+        if (!nk || RAY_IS_ERR(nk) || !nl || RAY_IS_ERR(nl)) {
+            ray_error_free(nk); ray_error_free(nl);
+            ray_release(nk && !RAY_IS_ERR(nk) ? nk : keys);
+            ray_release(vals);
+            return ray_error("oom", NULL);
+        }
+        keys = nk; vals = nl;
     }
     return ray_dict_new(keys, vals);
 }
@@ -433,10 +448,13 @@ static ray_t* emb_field(ray_t* doc, const char* path, ray_t* limits) {
 
 static bool emb_is_str(ray_t* v) { return v && !RAY_IS_ERR(v) && v->type == -RAY_STR; }
 
-/* A whole number held in a field, or `miss` when the field is not one. */
-static int64_t emb_int(ray_t* doc, const char* path, ray_t* limits, int64_t miss) {
+/* A whole number held in a field, or `miss` when the field is not one.
+ * *oom is set when reading it failed to allocate: never `miss` in its
+ * place (#1865). */
+static int64_t emb_int(ray_t* doc, const char* path, ray_t* limits, int64_t miss, bool* oom) {
     ray_t* v = emb_field(doc, path, limits);
     int64_t out = miss;
+    if (v && RAY_IS_ERR(v) && strcmp(ray_err_code(v), "oom") == 0) *oom = true;
     if (v && !RAY_IS_ERR(v)) {
         if (v->type == -RAY_I64) out = v->i64;
         else if (v->type == -RAY_F64 && v->f64 == (double)(int64_t)v->f64) out = (int64_t)v->f64;
@@ -476,21 +494,30 @@ typedef struct {
     const char* base;     /* where the tensors' bytes begin */
     size_t room;          /* and how many there are */
     const char* prefix;   /* some files name every tensor under "bert." */
+    bool oom;             /* a lookup failed to allocate: the load is oom, not a tensor missing (#1865) */
 } emb_file_t;
 
 /* The F32 tensor `name` of the shape given (cols 0 for a vector), in the
  * mapping; NULL when it is missing or is not that. */
-static const float* emb_tensor(const emb_file_t* f, const char* name, int64_t rows, int64_t cols) {
+static const float* emb_tensor(emb_file_t* f, const char* name, int64_t rows, int64_t cols) {
     char full[160];
     int k = snprintf(full, sizeof full, "%s%s", f->prefix, name);
     if (k < 0 || (size_t)k >= sizeof full) return NULL;
     const float* out = NULL;
     ray_t *key = ray_str(full, (size_t)k), *t = NULL, *dt = NULL, *sh = NULL, *off = NULL, *kk = NULL;
-    if (!key || RAY_IS_ERR(key)) return NULL;
+    if (!key || RAY_IS_ERR(key)) { ray_error_free(key); f->oom = true; return NULL; }   /* owned here */
     t = ray_dict_get(f->head, key);
     ray_release(key);
-    if (!t || RAY_IS_ERR(t) || t->type != RAY_DICT) goto done;
-#define EMB_GET(dst, lit) do { kk = ray_str(lit, sizeof(lit) - 1); dst = kk && !RAY_IS_ERR(kk) ? ray_dict_get(t, kk) : NULL; if (kk) ray_release(kk); } while (0)
+    if (t && RAY_IS_ERR(t)) { ray_error_free(t); t = NULL; f->oom = true; goto done; }
+    if (!t || t->type != RAY_DICT) goto done;
+    /* each key and lookup is owned here: a failed one marks the load oom
+     * and its error is freed (ray_release leaves it) */
+#define EMB_GET(dst, lit) do { \
+        kk = ray_str(lit, sizeof(lit) - 1); \
+        if (!kk || RAY_IS_ERR(kk)) { ray_error_free(kk); kk = NULL; f->oom = true; goto done; } \
+        dst = ray_dict_get(t, kk); ray_release(kk); kk = NULL; \
+        if (dst && RAY_IS_ERR(dst)) { ray_error_free(dst); dst = NULL; f->oom = true; goto done; } \
+    } while (0)
     EMB_GET(dt, "dtype"); EMB_GET(sh, "shape"); EMB_GET(off, "data_offsets");
 #undef EMB_GET
     if (!emb_is_str(dt) || ray_str_len(dt) != 3 || memcmp(ray_str_ptr(dt), "F32", 3) != 0) goto done;
@@ -529,8 +556,11 @@ static bool emb_read_weights(ray_embmodel_t* m, const char* dir, ray_t* limits, 
     ray_t* head = ray_json_parse_fn(args, 2);
     ray_release(text);
     if (!head || RAY_IS_ERR(head) || head->type != RAY_DICT) {
-        if (head) ray_release(head);
-        *err = ray_error("domain", ".emb.model.get: the table of tensors in %s cannot be read", path);
+        /* head is owned here: an oom is the failure, never "cannot be
+         * read"; an error is freed (ray_release leaves it, #1865) */
+        bool oom = head && RAY_IS_ERR(head) && strcmp(ray_err_code(head), "oom") == 0;
+        if (head && RAY_IS_ERR(head)) ray_error_free(head); else if (head) ray_release(head);
+        *err = oom ? ray_error("oom", NULL) : ray_error("domain", ".emb.model.get: the table of tensors in %s cannot be read", path);
         return false;
     }
     emb_file_t f = { .head = head, .base = (const char*)m->map + 8 + hlen, .room = m->map_len - 8 - (size_t)hlen, .prefix = "" };
@@ -546,12 +576,16 @@ static bool emb_read_weights(ray_embmodel_t* m, const char* dir, ray_t* limits, 
             char name[160];
             int k = snprintf(name, sizeof name, "%sembeddings.word_embeddings.weight", prefixes[pi]);
             ray_t* key = ray_str(name, (size_t)k);
-            ray_t* t = key && !RAY_IS_ERR(key) ? ray_dict_get(head, key) : NULL;
-            if (key) ray_release(key);
-            if (t && !RAY_IS_ERR(t) && t->type == RAY_DICT) {
+            if (!key || RAY_IS_ERR(key)) { ray_error_free(key); f.oom = true; goto done; }   /* owned here (#1865) */
+            ray_t* t = ray_dict_get(head, key);
+            ray_release(key);
+            if (t && RAY_IS_ERR(t)) { ray_error_free(t); f.oom = true; goto done; }
+            if (t && t->type == RAY_DICT) {
                 ray_t* kk = ray_str("shape", 5);
+                if (!kk || RAY_IS_ERR(kk)) { ray_error_free(kk); ray_release(t); f.oom = true; goto done; }
                 ray_t* sh = ray_dict_get(t, kk);
                 ray_release(kk);
+                if (sh && RAY_IS_ERR(sh)) { ray_error_free(sh); ray_release(t); f.oom = true; goto done; }
                 if (sh && sh->type == RAY_I64 && sh->len == 2 && ((const int64_t*)ray_data(sh))[1] == H) {
                     words = ((const int64_t*)ray_data(sh))[0];
                     f.prefix = prefixes[pi];
@@ -588,22 +622,32 @@ static bool emb_read_weights(ray_embmodel_t* m, const char* dir, ray_t* limits, 
 done:
 #undef EMB_NEED
     ray_release(head);
+    if (!ok && !*err && f.oom) *err = ray_error("oom", NULL);   /* never a tensor missing in its place */
     if (!ok && !*err)
         *err = ray_error("domain", ".emb.model.get: %s has no F32 tensor %s%s of the shape config.json describes", path, f.prefix, missing ? missing : "?");
     return ok;
 }
 
 /* The member `name` of a parsed JSON object: owned, or NULL when v is not an
- * object or has no such member. */
+ * object or has no such member, or an owned `oom` error when reading it
+ * failed to allocate (#1865): never "no such member" in its place. */
 static ray_t* emb_member(ray_t* v, const char* name) {
     if (!v || RAY_IS_ERR(v) || v->type != RAY_DICT) return NULL;
     ray_t* k = ray_str(name, strlen(name));
-    if (!k || RAY_IS_ERR(k)) return NULL;
+    if (!k || RAY_IS_ERR(k)) { ray_error_free(k); return ray_error("oom", NULL); }
     ray_t* out = ray_dict_get(v, k);
     ray_release(k);
-    if (out && (RAY_IS_ERR(out) || RAY_IS_NULL(out))) { ray_release(out); out = NULL; }
+    if (out && RAY_IS_ERR(out)) {   /* owned here: an oom is the answer, any other error no member */
+        bool oom = strcmp(ray_err_code(out), "oom") == 0;
+        ray_error_free(out);
+        return oom ? ray_error("oom", NULL) : NULL;
+    }
+    if (out && RAY_IS_NULL(out)) { ray_release(out); out = NULL; }
     return out;
 }
+
+/* *x, from emb_member, is the failure: handed to *err, the slot cleared. */
+#define EMB_MEMBER_CHECK(x) do { if ((x) && RAY_IS_ERR(x)) { *err = (x); (x) = NULL; goto done; } } while (0)
 
 /* The tokenizer described by tokenizer.json; NULL with *err set otherwise. */
 static emb_tok_t* emb_read_tokenizer(const char* dir, ray_t* limits, ray_t** err) {
@@ -618,6 +662,7 @@ static emb_tok_t* emb_read_tokenizer(const char* dir, ray_t* limits, ray_t** err
     model = emb_field(doc, "model", limits);
     if (model && RAY_IS_ERR(model)) { *err = model; model = NULL; goto done; }
     kind = emb_member(model, "type");
+    EMB_MEMBER_CHECK(kind);
     if (!emb_is_str(kind) || ray_str_len(kind) != 7 || memcmp(ray_str_ptr(kind), "Unigram", 7) != 0)
         EMB_FAIL("domain", ".emb.model.get: tokenizer.json holds a tokenizer of another kind than Unigram, which is the one kind read");
     /* The table of replacements is the normalizer itself, or one of a sequence of them. */
@@ -630,11 +675,14 @@ static emb_tok_t* emb_read_tokenizer(const char* dir, ray_t* limits, ray_t** err
     }
     ray_release(doc); doc = NULL;
     map = emb_member(norm, "precompiled_charsmap");
+    EMB_MEMBER_CHECK(map);
     if (!map) {
         ray_t* seq = emb_member(norm, "normalizers");
+        EMB_MEMBER_CHECK(seq);
         for (int64_t i = 0; seq && seq->type == RAY_LIST && i < seq->len && !map; i++)
             map = emb_member(ray_list_get(seq, i), "precompiled_charsmap");
         if (seq) ray_release(seq);
+        EMB_MEMBER_CHECK(map);
     }
     if (map && !emb_is_str(map)) { ray_release(map); map = NULL; }
     if (map) {
@@ -642,6 +690,7 @@ static emb_tok_t* emb_read_tokenizer(const char* dir, ray_t* limits, ray_t** err
         if (!charsmap) EMB_FAIL("domain", ".emb.model.get: the tokenizer's table of replacements is not base64");
     }
     vocab = emb_member(model, "vocab");
+    EMB_MEMBER_CHECK(vocab);
     if (!vocab || vocab->type != RAY_LIST || vocab->len < 4 || vocab->len > INT32_MAX / 2)
         EMB_FAIL("domain", ".emb.model.get: tokenizer.json has no vocabulary at model.vocab");
     int32_t n = (int32_t)vocab->len;
@@ -663,6 +712,7 @@ static emb_tok_t* emb_read_tokenizer(const char* dir, ray_t* limits, ray_t** err
         if (eos < 0 && lens[i] == 4 && memcmp(toks[i], "</s>", 4) == 0) eos = i;
     }
     unk_v = emb_member(model, "unk_id");
+    EMB_MEMBER_CHECK(unk_v);
     int64_t unk = !unk_v ? -1 : unk_v->type == -RAY_I64 ? unk_v->i64 : unk_v->type == -RAY_F64 ? (int64_t)unk_v->f64 : -1;
     if (unk < 0 || unk >= n || bos < 0 || eos < 0)
         EMB_FAIL("domain", ".emb.model.get: the vocabulary lacks the token for the unknown, for the beginning (<s>) or for the end (</s>)");
@@ -697,18 +747,26 @@ ray_embmodel_t* ray_embmodel_open(const char* dir, ray_t** err) {
     if (RAY_IS_ERR(cfg)) { *err = cfg; cfg = NULL; goto fail; }
     {
         ray_t* kind = emb_field(cfg, "model_type", limits);
+        if (kind && RAY_IS_ERR(kind)) {   /* owned here: an oom is the failure (#1865) */
+            bool oom = strcmp(ray_err_code(kind), "oom") == 0;
+            ray_error_free(kind);
+            if (oom) { *err = ray_error("oom", NULL); goto fail; }
+            kind = NULL;
+        }
         if (emb_is_str(kind)) {
             size_t k = ray_str_len(kind) < sizeof m->kind - 1 ? ray_str_len(kind) : sizeof m->kind - 1;
             memcpy(m->kind, ray_str_ptr(kind), k);
         }
         if (kind) ray_release(kind);
     }
-    m->dim = emb_int(cfg, "hidden_size", limits, 0);
-    m->layers = emb_int(cfg, "num_hidden_layers", limits, 0);
-    m->heads = emb_int(cfg, "num_attention_heads", limits, 0);
-    m->inner = emb_int(cfg, "intermediate_size", limits, 0);
-    m->max_tokens = emb_int(cfg, "max_position_embeddings", limits, 0);
-    m->types = emb_int(cfg, "type_vocab_size", limits, 2);
+    bool field_oom = false;
+    m->dim = emb_int(cfg, "hidden_size", limits, 0, &field_oom);
+    m->layers = emb_int(cfg, "num_hidden_layers", limits, 0, &field_oom);
+    m->heads = emb_int(cfg, "num_attention_heads", limits, 0, &field_oom);
+    m->inner = emb_int(cfg, "intermediate_size", limits, 0, &field_oom);
+    m->max_tokens = emb_int(cfg, "max_position_embeddings", limits, 0, &field_oom);
+    m->types = emb_int(cfg, "type_vocab_size", limits, 2, &field_oom);
+    if (field_oom) { *err = ray_error("oom", NULL); goto fail; }
     if (m->types < 1) m->types = 2;
     if (m->dim <= 0 || m->layers <= 0 || m->heads <= 0 || m->inner <= 0 || m->max_tokens < 3 || m->dim % m->heads != 0) {
         *err = ray_error("domain", ".emb.model.get: config.json does not describe an encoder: hidden_size, num_hidden_layers, num_attention_heads, intermediate_size and max_position_embeddings are needed");
@@ -716,7 +774,13 @@ ray_embmodel_t* ray_embmodel_open(const char* dir, ray_t** err) {
     }
     {
         ray_t* e = emb_field(cfg, "layer_norm_eps", limits);
-        m->eps = e && !RAY_IS_ERR(e) && e->type == -RAY_F64 ? (float)e->f64 : 1e-12f;
+        if (e && RAY_IS_ERR(e)) {   /* owned here: an oom is the failure (#1865) */
+            bool oom = strcmp(ray_err_code(e), "oom") == 0;
+            ray_error_free(e);
+            if (oom) { *err = ray_error("oom", NULL); goto fail; }
+            e = NULL;
+        }
+        m->eps = e && e->type == -RAY_F64 ? (float)e->f64 : 1e-12f;
         if (e) ray_release(e);
     }
     /* Other families count positions and name tensors in ways of their own. */

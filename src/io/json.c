@@ -525,10 +525,10 @@ static bool jarr_to_list(jp_t* jp, jarr_t* a) {
     if (!jp_bytes(jp, (size_t)n * JP_SLOT_BYTES + (size_t)n_atoms * JP_ATOM_BYTES)) return false;
     const int64_t* iv = a->ints ? (const int64_t*)ray_data(a->ints) : NULL;
     ray_t* list = ray_list_new(n > 4 ? n : 4);
-    if (!list || RAY_IS_ERR(list)) { jp_fail(jp, "oom", "out of memory"); return false; }
+    if (!list || RAY_IS_ERR(list)) { ray_error_free(list); jp_fail(jp, "oom", "out of memory"); return false; }   /* its error, owned here (#1865) */
     const int64_t* sn = a->str_nulls ? (const int64_t*)ray_data(a->str_nulls) : NULL;
     int64_t sni = 0, nsn = a->str_nulls ? a->str_nulls->len : 0;
-    for (int64_t i = 0; i < n && !RAY_IS_ERR(list); i++) {
+    for (int64_t i = 0; i < n; i++) {
         ray_t* v = RAY_NULL_OBJ;
         if (a->mode == 1) {
             switch (a->kind) {
@@ -555,10 +555,11 @@ static bool jarr_to_list(jp_t* jp, jarr_t* a) {
         if (own > JP_ATOM_BYTES && !jp_bytes(jp, own - JP_ATOM_BYTES)) {
             ray_release(v); ray_release(list); return false;
         }
-        list = ray_list_append(list, v);
+        ray_t* nl = ray_list_append(list, v);   /* a failed append leaves list, ours (#1857) */
         ray_release(v);
+        if (!nl || RAY_IS_ERR(nl)) { ray_release(list); jp->err = nl ? nl : ray_error("oom", NULL); return false; }
+        list = nl;
     }
-    if (RAY_IS_ERR(list)) { jp->err = list; return false; }
     jarr_free(a);
     jp->bytes -= run_pre < jp->bytes ? run_pre : jp->bytes;
     a->out = list;
@@ -571,23 +572,50 @@ static bool jarr_to_list(jp_t* jp, jarr_t* a) {
 static bool jarr_start(jp_t* jp, jarr_t* a, int kind) {
     int8_t t = kind == JK_INT ? RAY_I64 : kind == JK_FLOAT ? RAY_F64 : kind == JK_BOOL ? RAY_BOOL : RAY_STR;
     ray_t* v = ray_vec_new(t, a->n_null + 8);
-    if (!v || RAY_IS_ERR(v)) { jp_fail(jp, "oom", "out of memory"); return false; }
+    if (!v || RAY_IS_ERR(v)) { ray_error_free(v); jp_fail(jp, "oom", "out of memory"); return false; }   /* its error, owned here (#1865) */
     a->out = v;
     a->kind = kind;
     a->mode = 1;
+    /* a->out and a->str_nulls are the run's (released with it); a failed
+     * append leaves them in place (#1857) and its error is freed (#1865) */
     for (int64_t i = 0; i < a->n_null; i++) {
-        if (kind == JK_INT)   { int64_t x = NULL_I64; v = ray_vec_append(v, &x); }
-        else if (kind == JK_FLOAT) { double x = NULL_F64; v = ray_vec_append(v, &x); }
+        ray_t* nv;
+        if (kind == JK_INT)   { int64_t x = NULL_I64; nv = ray_vec_append(a->out, &x); }
+        else if (kind == JK_FLOAT) { double x = NULL_F64; nv = ray_vec_append(a->out, &x); }
         else {
-            v = ray_str_vec_append(v, "", 0);
-            if (!RAY_IS_ERR(v)) {
-                if (!a->str_nulls) a->str_nulls = ray_vec_new(RAY_I64, 8);
-                a->str_nulls = ray_vec_append(a->str_nulls, &i);
+            nv = ray_str_vec_append(a->out, "", 0);
+            if (nv && !RAY_IS_ERR(nv)) {
+                a->out = nv;
+                if (!a->str_nulls) {
+                    ray_t* sn = ray_vec_new(RAY_I64, 8);
+                    if (!sn || RAY_IS_ERR(sn)) { ray_error_free(sn); jp->err = ray_error("oom", NULL); return false; }
+                    a->str_nulls = sn;
+                }
+                nv = ray_vec_append(a->str_nulls, &i);
+                if (!nv || RAY_IS_ERR(nv)) { ray_error_free(nv); jp->err = ray_error("oom", NULL); return false; }
+                a->str_nulls = nv;
+                continue;
             }
         }
-        if (RAY_IS_ERR(v) || RAY_IS_ERR(a->str_nulls)) { a->out = NULL; jp->err = ray_error("oom", NULL); return false; }
-        a->out = v;
+        if (!nv || RAY_IS_ERR(nv)) { ray_error_free(nv); jp->err = ray_error("oom", NULL); return false; }
+        a->out = nv;
     }
+    return true;
+}
+
+/* An append into *slot (a vector the run owns): on success *slot is the
+ * answer; on failure *slot stays (a failed append leaves its input, #1857),
+ * the first error is kept in jp->err and any other freed (#1865). */
+static bool jv_append(jp_t* jp, ray_t** slot, const void* x) {
+    ray_t* n = ray_vec_append(*slot, x);
+    if (!n || RAY_IS_ERR(n)) { if (!jp->err) jp->err = n ? n : ray_error("oom", NULL); else ray_error_free(n); return false; }
+    *slot = n;
+    return true;
+}
+static bool jv_str_append(jp_t* jp, ray_t** slot, const char* p, size_t len) {
+    ray_t* n = ray_str_vec_append(*slot, p, len);
+    if (!n || RAY_IS_ERR(n)) { if (!jp->err) jp->err = n ? n : ray_error("oom", NULL); else ray_error_free(n); return false; }
+    *slot = n;
     return true;
 }
 
@@ -609,13 +637,14 @@ static bool jarr_add(jp_t* jp, jarr_t* a, ray_t* v, size_t built) {
             if (!jp_bytes(jp, (size_t)a->out->len * 2 * sizeof(double))) { ray_release(v); return false; }
             a->pre += (size_t)a->out->len * 2 * sizeof(double);
             ray_t* f = ray_vec_new(RAY_F64, a->out->len + 8);
-            if (!f || RAY_IS_ERR(f)) { ray_release(v); jp_fail(jp, "oom", "out of memory"); return false; }
+            if (!f || RAY_IS_ERR(f)) { ray_error_free(f); ray_release(v); jp_fail(jp, "oom", "out of memory"); return false; }
             const int64_t* d = (const int64_t*)ray_data(a->out);
-            for (int64_t i = 0; i < a->out->len && !RAY_IS_ERR(f); i++) {
+            bool f_ok = true;
+            for (int64_t i = 0; i < a->out->len && f_ok; i++) {
                 double x = d[i] == NULL_I64 ? NULL_F64 : (double)d[i];
-                f = ray_vec_append(f, &x);
+                f_ok = jv_append(jp, &f, &x);
             }
-            if (RAY_IS_ERR(f)) { ray_release(v); jp->err = f; return false; }
+            if (!f_ok) { ray_release(f); ray_release(v); return false; }   /* f is ours */
             a->ints = a->out;
             a->out = f;
             a->kind = JK_FLOAT;
@@ -624,11 +653,13 @@ static bool jarr_add(jp_t* jp, jarr_t* a, ray_t* v, size_t built) {
             if (!jp_bytes(jp, (size_t)a->out->len * 2 * sizeof(int64_t))) { ray_release(v); return false; }
             a->pre += (size_t)a->out->len * 2 * sizeof(int64_t);
             ray_t* iv = ray_vec_new(RAY_I64, a->out->len + 8);
-            for (int64_t i = 0; iv && !RAY_IS_ERR(iv) && i < a->out->len; i++) {
-                int64_t x = NULL_I64;
-                iv = ray_vec_append(iv, &x);
-            }
             if (!iv || RAY_IS_ERR(iv)) { ray_release(v); jp->err = iv ? iv : ray_error("oom", NULL); return false; }
+            bool iv_ok = true;
+            for (int64_t i = 0; i < a->out->len && iv_ok; i++) {
+                int64_t x = NULL_I64;
+                iv_ok = jv_append(jp, &iv, &x);
+            }
+            if (!iv_ok) { ray_release(iv); ray_release(v); return false; }   /* iv is ours */
             a->ints = iv;
         }
         if (!fits && !jarr_to_list(jp, a)) { ray_release(v); return false; }
@@ -636,9 +667,10 @@ static bool jarr_add(jp_t* jp, jarr_t* a, ray_t* v, size_t built) {
     if (a->mode == 2) {
         a->pre += JP_SLOT_BYTES;
         if (!jp_bytes(jp, JP_SLOT_BYTES)) { ray_release(v); return false; }
-        a->out = ray_list_append(a->out, v);
+        ray_t* nl = ray_list_append(a->out, v);   /* a failed append leaves a->out (#1857) */
         ray_release(v);
-        if (RAY_IS_ERR(a->out)) { jp->err = a->out; a->out = NULL; return false; }
+        if (!nl || RAY_IS_ERR(nl)) { jp->err = nl ? nl : ray_error("oom", NULL); return false; }
+        a->out = nl;
         return true;
     }
     /* a typed run: the atom's charge back, the cell's (with its growth) in */
@@ -649,41 +681,36 @@ static bool jarr_add(jp_t* jp, jarr_t* a, ray_t* v, size_t built) {
                                     : 2 * 8 * (a->ints ? 2 : 1);
     a->pre += cell;
     if (!jp_bytes(jp, cell)) { ray_release(v); return false; }
-    ray_t* o = a->out;
+    /* a->out, a->ints and a->str_nulls are the run's, released with it
+     * (jarr_free); each append leaves its slot in place on a failure */
+    bool ok = true;
     if (k == JK_NULL) {
-        if (a->kind == JK_INT) { int64_t x = NULL_I64; o = ray_vec_append(o, &x); }
+        if (a->kind == JK_INT) { int64_t x = NULL_I64; ok = jv_append(jp, &a->out, &x); }
         else if (a->kind == JK_FLOAT) {
             double x = NULL_F64;
-            o = ray_vec_append(o, &x);
-            if (a->ints) {
-                int64_t xi = NULL_I64;
-                a->ints = ray_vec_append(a->ints, &xi);
-                if (RAY_IS_ERR(a->ints)) { jp->err = a->ints; a->ints = NULL; }
-            }
+            ok = jv_append(jp, &a->out, &x);
+            if (ok && a->ints) { int64_t xi = NULL_I64; ok = jv_append(jp, &a->ints, &xi); }
         }
         else {
-            int64_t at = o->len;
-            o = ray_str_vec_append(o, "", 0);
-            if (!a->str_nulls) a->str_nulls = ray_vec_new(RAY_I64, 8);
-            if (a->str_nulls && !RAY_IS_ERR(a->str_nulls)) a->str_nulls = ray_vec_append(a->str_nulls, &at);
-            if (!a->str_nulls || RAY_IS_ERR(a->str_nulls)) { a->str_nulls = NULL; jp->err = ray_error("oom", NULL); }
+            int64_t at = a->out->len;
+            ok = jv_str_append(jp, &a->out, "", 0);
+            if (ok && !a->str_nulls) {
+                ray_t* sn = ray_vec_new(RAY_I64, 8);
+                if (!sn || RAY_IS_ERR(sn)) { ray_error_free(sn); if (!jp->err) jp->err = ray_error("oom", NULL); ok = false; }
+                else a->str_nulls = sn;
+            }
+            if (ok) ok = jv_append(jp, &a->str_nulls, &at);
         }
-    } else if (a->kind == JK_INT) { o = ray_vec_append(o, &v->i64); }
+    } else if (a->kind == JK_INT) { ok = jv_append(jp, &a->out, &v->i64); }
     else if (a->kind == JK_FLOAT) {
         double x = k == JK_INT ? (double)v->i64 : v->f64;
-        o = ray_vec_append(o, &x);
-        if (a->ints) {
-            int64_t xi = k == JK_INT ? v->i64 : NULL_I64;
-            a->ints = ray_vec_append(a->ints, &xi);
-            if (RAY_IS_ERR(a->ints)) { jp->err = a->ints; a->ints = NULL; }
-        }
+        ok = jv_append(jp, &a->out, &x);
+        if (ok && a->ints) { int64_t xi = k == JK_INT ? v->i64 : NULL_I64; ok = jv_append(jp, &a->ints, &xi); }
     }
-    else if (a->kind == JK_BOOL) { uint8_t x = v->b8 ? 1 : 0; o = ray_vec_append(o, &x); }
-    else o = ray_str_vec_append(o, ray_str_ptr(v), ray_str_len(v));
+    else if (a->kind == JK_BOOL) { uint8_t x = v->b8 ? 1 : 0; ok = jv_append(jp, &a->out, &x); }
+    else ok = jv_str_append(jp, &a->out, ray_str_ptr(v), ray_str_len(v));
     ray_release(v);
-    if (RAY_IS_ERR(o)) { a->out = NULL; jp->err = o; return false; }
-    a->out = o;
-    return !jp->err;
+    return ok && !jp->err;
 }
 
 /* The finished array: the typed run (its nulls flagged), the LIST, or a
@@ -870,8 +897,10 @@ static ray_t* jp_object(jp_t* jp, bool build) {
         keys = ray_vec_new(RAY_STR, 4);
         vals = ray_list_new(4);
         if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
-            if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
-            if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+            /* each is owned here: a vector released, a failed one's error
+             * freed (ray_release leaves it, #1865) */
+            if (keys && RAY_IS_ERR(keys)) ray_error_free(keys); else ray_release(keys);
+            if (vals && RAY_IS_ERR(vals)) ray_error_free(vals); else ray_release(vals);
             return jp_fail(jp, "oom", "out of memory");
         }
     }
@@ -891,8 +920,10 @@ static ray_t* jp_object(jp_t* jp, bool build) {
             size_t c = 2 * 16 + (kl > RAY_STR_INLINE_MAX ? 2 * kl : 0) + JP_SLOT_BYTES;
             if (!jp_bytes(jp, c)) goto fail;
             pre += c;
-            keys = ray_str_vec_append(keys, kp, kl);
-            if (RAY_IS_ERR(keys)) { jp->err = keys; keys = NULL; goto fail; }
+            /* a failed append leaves keys, released at fail (#1857) */
+            ray_t* nk = ray_str_vec_append(keys, kp, kl);
+            if (!nk || RAY_IS_ERR(nk)) { jp->err = nk ? nk : ray_error("oom", NULL); goto fail; }
+            keys = nk;
         }
         jp_ws(jp);
         if (jp->p >= jp->end || *jp->p != ':') { jp_unexpected(jp, "':'"); goto fail; }
@@ -901,9 +932,11 @@ static ray_t* jp_object(jp_t* jp, bool build) {
         ray_t* v = jp_value(jp, build);
         if (!v) goto fail;
         if (build) {
-            vals = ray_list_append(vals, v);
+            /* a failed append leaves vals, released at fail (#1857) */
+            ray_t* nl = ray_list_append(vals, v);
             ray_release(v);
-            if (RAY_IS_ERR(vals)) { jp->err = vals; vals = NULL; goto fail; }
+            if (!nl || RAY_IS_ERR(nl)) { jp->err = nl ? nl : ray_error("oom", NULL); goto fail; }
+            vals = nl;
         }
         jp_ws(jp);
         if (jp->p < jp->end && *jp->p == ',') { jp->p++; jp_ws(jp); continue; }
