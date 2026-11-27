@@ -336,8 +336,11 @@ select them first:
 
 The [whole-column verbs](#whole-column-projections) (`distinct`, `asc`,
 `desc`, `reverse`, `iasc`, `idesc`, `rank`, `xrank`, `rotate`, `take`, `drop`,
-`where`) are different: they see the surviving rows only, and under `by:` each
-group's surviving rows.
+`where`, `filter`, `raze`) are different: they see the surviving rows only, and under `by:` each
+group's surviving rows. An aggregate of one, `(sum (filter i c))` by `g`,
+aggregates what the verb gives over the group's rows: the group's values of
+`i` where `c` holds, `count`, `distinct` and the other aggregates included
+(#1803).
 
 So does every other expression of an output that reads a column whole:
 `fold` over a column (`fold-left`, `fold-right` and `fold-while` too, and a
@@ -582,7 +585,10 @@ single-expression helper reads, or a bound value: a lambda parameter or a
 aggregate reads its rows: as the aggregate's argument (both arguments of
 `wavg`, `wsum`, `cov`, `scov` and `pearson_corr`), through every call in it
 that maps that argument element by element, as the source of
-`distinct`, and as the vector `fold` folds. A call maps an argument element by element when, as the
+`distinct`, as the vector `fold` folds, and as either operand of `filter`,
+whose values and mask pair up row by row: `(sum (filter W c))` by `g` sums
+each group's values of `W` where `c` holds, as `(sum (filter w c))` does over
+a column `w`. A call maps an argument element by element when, as the
 builtin is applied there, each element gives one result from itself alone:
 arithmetic and comparisons, `if`, `and`, `or`, `not`, `nil?`, binary
 `(min W 30)` and `(max W 30)` (the one-argument forms are aggregates), a

@@ -1,0 +1,117 @@
+;; #1803: an aggregate of (filter i c) under by: read the shorter vector a
+;; filter of the whole table gives at the group's row positions: (sum
+;; (filter i c)) was [40 0] where [10 30] is right.  filter keeps some rows,
+;; so it is a whole-column verb now: under by: it runs over each group's rows
+;; (the surviving ones under where:), then the aggregate; (count (distinct
+;; ...)) of such an operand is each group's too.  A free vector as long as
+;; the table in filter's values or mask is a column, sliced per group (the
+;; length rule of #1492); a LIST global stays one whole value.
+(.sys.exec "rm -rf /tmp/rf_issue_1803 && mkdir -p /tmp/rf_issue_1803") -- 0
+(set T (table [g c i f k] (list ['a 'a 'b 'b] [true false true false] [10 20 30 40] [1.5 2.5 3.5 4.5] [1 0 1 0])))
+(.db.splayed.set "/tmp/rf_issue_1803/spl/t/" T "/tmp/rf_issue_1803/spl/.sym")
+(set S (.db.splayed.get "/tmp/rf_issue_1803/spl/t/" "/tmp/rf_issue_1803/spl/.sym"))
+(map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1803/par/%/t" (+ 2024.01.01 p)) T "/tmp/rf_issue_1803/par/.sym")) (til 2))
+(set P (.db.parted.get "/tmp/rf_issue_1803/par/" 't))
+;; the controls, as on dev
+(at (select {from: T by: g where: c r: (sum i)}) 'r) -- [10 30]
+(at (select {from: T by: g r: (sum (if c i 0))}) 'r) -- [10 30]
+(at (select {from: T by: g r: (last (filter i c))}) 'r) -- [10 30]
+(at (select {from: T by: g r: (filter i c)}) 'r) -- (list [10] [30])
+(at (select {from: P by: g where: c r: (sum i)}) 'r) -- [20 60]
+(at (select {from: P by: g r: (filter i c)}) 'r) -- (list [10 10] [30 30])
+(at (select {from: T r: (sum (filter i c))}) 'r) -- [40]
+(at (select {from: P r: (count (filter i c))}) 'r) -- [4]
+;; each group's rows where c holds
+(at (select {from: T by: g r: (sum (filter i c))}) 'r) -- [10 30]
+(at (select {from: S by: g r: (sum (filter i c))}) 'r) -- [10 30]
+(at (select {from: P by: g r: (sum (filter i c))}) 'r) -- [20 60]
+(at (select {from: T by: g r: (count (filter i c))}) 'r) -- [1 1]
+(at (select {from: P by: g r: (count (filter i c))}) 'r) -- [2 2]
+(at (select {from: T by: g r: (max (filter i c))}) 'r) -- [10 30]
+(at (select {from: P by: g r: (min (filter i c))}) 'r) -- [10 30]
+(at (select {from: T by: g r: (avg (filter i c))}) 'r) -- [10.0 30.0]
+(at (select {from: T by: g r: (med (filter i c))}) 'r) -- [10.0 30.0]
+(at (select {from: P by: g r: (var (filter i c))}) 'r) -- [0.0 0.0]
+(at (select {from: T by: g r: (sum (filter f c))}) 'r) -- [1.5 3.5]
+(at (select {from: P by: g r: (sum (filter f c))}) 'r) -- [3.0 7.0]
+(at (select {from: T by: g r: (sum (filter i (== k 1)))}) 'r) -- [10 30]
+(at (select {from: P by: g where: (> i 0) r: (sum (filter i c))}) 'r) -- [20 60]
+(at (select {from: T by: g r: (count (distinct (filter i c)))}) 'r) -- [1 1]
+(at (select {from: P by: g r: (count (distinct (filter i c)))}) 'r) -- [1 1]
+(at (select {from: P by: g r: (count (distinct (except i [10])))}) 'r) -- [1 2]
+;; a helper that filters is inlined, as written in the query
+(set hf (fn [v m] (filter v m)))
+(at (select {from: P by: g r: (sum (hf i c))}) 'r) -- [20 60]
+;; free vectors: as long as the table, a column in both of filter's operands
+(set W [1 2 3 4])
+(set MW [false true true false])
+(at (select {from: T by: g r: (sum (filter W c))}) 'r) -- [1 3]
+(at (select {from: T by: g r: (sum (filter i MW))}) 'r) -- [20 30]
+(at (select {from: T by: g r: (sum (filter W MW))}) 'r) -- [2 3]
+(at (select {from: T by: g r: (sum (filter (+ i W) c))}) 'r) -- [11 33]
+(at (select {from: T by: g r: (sum (hf W MW))}) 'r) -- [2 3]
+(at (select {from: T r: (sum (filter W MW))}) 'r) -- [5]
+;; another length: the length error; one value: filter of it is filter's own error
+(select {from: T by: g r: (sum (filter [1 2 3] c))}) !- length
+(select {from: P by: g r: (sum (filter W c))}) !- length
+(select {from: T by: g r: (sum (filter [7] c))}) !- length
+;; a LIST global is one whole value
+(set L (list 1 2 3 4))
+(at (select {from: T r: (count (filter L c))}) 'r) -- [2]
+(select {from: T by: g r: (count (filter L c))}) !- length
+;; a SYM column of a file, at its cell width (#1800), per group as well
+(set TS (table [g c s] (list ['a 'a 'b 'b] [true false true false] ['p 'q 'r 's])))
+(.db.splayed.set "/tmp/rf_issue_1803/ss/t/" TS "/tmp/rf_issue_1803/ss/.sym")
+(set SS (.db.splayed.get "/tmp/rf_issue_1803/ss/t/" "/tmp/rf_issue_1803/ss/.sym"))
+(map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1803/ps/%/t" (+ 2024.01.01 p)) TS "/tmp/rf_issue_1803/ps/.sym")) (til 2))
+(set PS (.db.parted.get "/tmp/rf_issue_1803/ps/" 't))
+(at (select {from: TS by: g r: (count (filter s c))}) 'r) -- [1 1]
+(at (select {from: SS by: g r: (count (filter s c))}) 'r) -- [1 1]
+(at (select {from: PS by: g r: (count (filter s c))}) 'r) -- [2 2]
+(at (select {from: PS by: g r: (last (filter s c))}) 'r) -- [p r]
+(at (select {from: PS by: g r: (count (distinct (filter s c)))}) 'r) -- [1 1]
+;; each call is judged by the builtin its head holds, not by its spelling:
+;; an alias of filter is filter, a name rebound to reverse or to filter is
+;; no atomic builtin, and a parameter holding one is that one (review)
+(set TR (table [g i] (list [1 1 1 2] [10 10 10 20])))
+(at (select {from: TR by: g r: (count (distinct (reverse i)))}) 'r) -- [1 1]
+(set abs0 abs)
+(set abs reverse)
+(at (select {from: TR by: g r: (count (distinct (abs i)))}) 'r) -- [1 1]
+(set abs abs0)
+((fn [abs] (at (select {from: TR by: g r: (count (distinct (abs i)))}) 'r)) reverse) -- [1 1]
+(set TK (table [g i c] (list [1 1 2 2] [10 20 30 40] [true false true false])))
+(set plus0 +)
+(set + filter)
+(at (select {from: TK by: g r: (count (distinct (+ i c)))}) 'r) -- [1 1]
+(set + plus0)
+(set WK [10 20 30 40])
+(set MK [true false true false])
+(set keep filter)
+(at (select {from: TK by: g r: (sum (keep WK MK))}) 'r) -- [10 30]
+(at (select {from: TK by: g r: (sum (keep WK c))}) 'r) -- [10 30]
+(at (select {from: TK where: (> i 0) by: g r: (sum (keep WK MK))}) 'r) -- [10 30]
+((fn [k] (at (select {from: TK by: g r: (sum (k WK MK))}) 'r)) filter) -- [10 30]
+(+ 1 2) -- 3
+;; keyless, a parameter or a let holding filter is filter, over free vectors
+;; and over columns, under where: too; a parameter holding distinct likewise
+(set TQ (table [g c i] (list ['a 'a 'b 'b 'b 'c 'a 'c 'b 'a] [true false true false true false true true false false] [10 20 30 40 50 60 70 80 90 100])))
+(set WQ (at TQ 'i))
+(set MQ (at TQ 'c))
+((fn [keep] (at (select {from: TQ r: (sum (keep WQ MQ))}) 'r)) filter) -- [240]
+((fn [] (let keep filter) (at (select {from: TQ r: (sum (keep WQ MQ))}) 'r))) -- [240]
+((fn [kp] (at (select {from: TQ r: (sum (kp i c))}) 'r)) filter) -- [240]
+((fn [kp] (at (select {from: TQ where: c r: (sum (kp i c))}) 'r)) filter) -- [240]
+((fn [dd] (at (select {from: TQ r: (count (dd i))}) 'r)) distinct) -- [10]
+((fn [kp] (at (select {from: TQ by: g r: (sum (kp WQ MQ))}) 'r)) filter) -- [80 80 80]
+;; count distinct over a head the rules cannot name a builtin for (a dict
+;; lookup, a call result, a lambda written in place) is each group's
+(set TD (table [g i] (list ['a 'a 'b 'b 'c 'c 'a 'b 'c 'a] [1 1 2 2 3 3 1 2 3 1])))
+(set DD (dict ['r] (list reverse)))
+(set rfn (fn [] reverse))
+(at (select {from: TD by: g r: (count (distinct (reverse i)))}) 'r) -- [1 1 1]
+(at (select {from: TD by: g r: (count (distinct ((at DD 'r) i)))}) 'r) -- [1 1 1]
+(at (select {from: TD by: g r: (count (distinct ((first (list reverse)) i)))}) 'r) -- [1 1 1]
+(at (select {from: TD by: g r: (count (distinct ((rfn) i)))}) 'r) -- [1 1 1]
+(at (select {from: TD by: g r: (count (distinct ((fn [x] (reverse x)) i)))}) 'r) -- [1 1 1]
+(.sys.exec "rm -rf /tmp/rf_issue_1803") -- 0

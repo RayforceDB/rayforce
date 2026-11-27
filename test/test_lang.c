@@ -518,6 +518,47 @@ static test_result_t test_eval_typed_map_oom(void) {
 #endif
 
 #ifdef DEBUG
+/* #1803: (count (distinct (filter i c))) by: evaluates each group's
+ * (count (distinct ...)), an expression the query builds.  With each of
+ * the builder's allocations failed in turn, it gives the expression or its
+ * owned oom error, and leaves nothing behind: the first list's failure was
+ * dropped, and a failed append lost its list. */
+ray_t* ray_query_cd_group_expr_for_test(ray_t* inner);
+static test_result_t test_query_cd_group_expr_oom(void) {
+    ray_t* inner = ray_parse("(filter i c)");
+    TEST_ASSERT(inner && !RAY_IS_ERR(inner), "parse");
+    ray_t* want = ray_query_cd_group_expr_for_test(inner);
+    TEST_ASSERT(want && !RAY_IS_ERR(want) && want->type == RAY_LIST && want->len == 2, "(count (distinct ...))");
+    ray_release(want);
+    for (int64_t nth = 1; nth <= 12; nth++) {
+        for (int64_t count = 1; count <= 2; count++) {
+            ray_heap_gc();
+            TEST_ASSERT_TRUE(ray_mem_trace_begin());
+            ray_alloc_fail_set_for_test(nth, count);
+            ray_t* r = ray_query_cd_group_expr_for_test(inner);
+            ray_alloc_fail_set_for_test(0, 0);
+            bool ok = r && (RAY_IS_ERR(r) ? strcmp(ray_err_code(r), "oom") == 0
+                                          : r->type == RAY_LIST && r->len == 2 &&
+                                            ((ray_t**)ray_data(r))[1]->type == RAY_LIST &&
+                                            ((ray_t**)ray_data(((ray_t**)ray_data(r))[1]))[1] == inner);
+            if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+            ray_error_clear();
+            ray_heap_gc();
+            ray_mem_trace_t tr;
+            ray_mem_trace_end(&tr);
+            if (!ok || tr.net_bytes != 0)
+                fprintf(stderr, "  allocation %lld failed x%lld: %s, %lld bytes left\n", (long long)nth,
+                        (long long)count, ok ? "ok" : "wrong", (long long)tr.net_bytes);
+            TEST_ASSERT(ok, "the expression or oom");
+            TEST_ASSERT(tr.net_bytes == 0, "nothing left behind");
+        }
+    }
+    ray_release(inner);
+    PASS();
+}
+#endif
+
+#ifdef DEBUG
 /* A binary atomic builtin mapped over a collection, with each of its
  * allocations failed in turn, once and twice running, from the first: the
  * map's read of the first cells, the cells after it, the result.  The call
@@ -15987,6 +16028,7 @@ const test_entry_t lang_entries[] = {
 #ifdef DEBUG
     { "lang/eval/binary_map_oom", test_eval_binary_map_oom, lang_setup, lang_teardown },
     { "lang/eval/typed_map_oom", test_eval_typed_map_oom, lang_setup, lang_teardown },
+    { "lang/query/cd_group_expr_oom", test_query_cd_group_expr_oom, lang_setup, lang_teardown },
     { "lang/eval/narrow_left_route", test_eval_narrow_left_route, lang_setup, lang_teardown },
     { "lang/eval/narrow_bounded_route", test_eval_narrow_bounded_route, lang_setup, lang_teardown },
 #endif
