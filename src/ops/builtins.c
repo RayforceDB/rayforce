@@ -1055,6 +1055,9 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
     int64_t rows_per_part = 0;
     int64_t data_n = n - 2;
     if (data_n >= 2 && is_numeric(args[n - 3])) {
+        /* a count: an integer, not a float read as its bits or a boolean (#1796) */
+        if (!ray_int_key(args[n - 3]))
+            return ray_error("type", "csv.parted: rows per partition must be an integer, got %s", ray_type_name(args[n - 3]->type));
         rows_per_part = as_i64(args[n - 3]);
         if (rows_per_part <= 0) return ray_error("range", "csv.parted: rows per partition must be positive, got %lld", (long long)rows_per_part);
         data_n--;

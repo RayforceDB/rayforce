@@ -5488,21 +5488,9 @@ static bool at_table_indirect(ray_t* tbl) {
     return false;
 }
 
-/* The keys `at` takes as a position, in a vector, a list or a string: an
- * integer atom of a type as_i64 reads as its value.  Any other key is
- * at_key_type_error. */
-static inline bool at_int_key_type(int8_t t) {
-    switch (t) {
-    case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: return true;
-    default: return false;
-    }
-}
-static inline bool at_int_key(ray_t* k) {
-    switch (k->type) {
-    case -RAY_I64: case -RAY_I32: case -RAY_I16: case -RAY_U8: return true;
-    default: return false;
-    }
-}
+/* The keys `at` takes as a position, in a vector, a list or a string, are
+ * the shared key rule (ray_int_key, lang/internal.h): an integer atom of a
+ * type as_i64 reads as its value.  Any other key is at_key_type_error. */
 static ray_t* at_key_type_error(int8_t atom_type) {
     return ray_error("type", "at: index must be an integer, got %s", ray_type_name(atom_type));
 }
@@ -5512,7 +5500,7 @@ static __attribute__((noinline)) ray_t* at_str_keys(ray_t* vec, const char* s, s
     int64_t idxlen = ray_len(idx);
     if (idxlen == 0) return ray_str("", 0);
     /* a vector's cells are atoms of its type: the first one names it */
-    if (ray_is_vec(idx) && !at_int_key_type(idx->type))
+    if (ray_is_vec(idx) && !ray_int_key_type(idx->type))
         return at_key_type_error((int8_t)-idx->type);
     char sbuf[8192];
     char* buf = sbuf;
@@ -5550,7 +5538,7 @@ static __attribute__((noinline)) ray_t* at_str_keys(ray_t* vec, const char* s, s
         int64_t k;
         if (RAY_LIKELY(c->type == -RAY_I64)) {
             k = c->i64;
-        } else if (at_int_key(c)) {
+        } else if (ray_int_key(c)) {
             k = as_i64(c);
         } else if (is_collection(c)) {
             if (!nested) {
@@ -5751,7 +5739,7 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
     }
 
     /* String indexing: (at "hello" 1) → 'e', (at "hello" [0 4]) → "ho".
-     * The keys are a vector's (at_int_key): an integer atom, or a
+     * The keys are a vector's (ray_int_key): an integer atom, or a
      * collection of them; any other key is the vector's type error, not
      * its payload read as a position (#1785).  A collection key is read
      * left to right, as the vector branch walks one: the first cell it
@@ -5764,7 +5752,7 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         if (is_collection(idx)) return at_str_keys(vec, s, slen, idx);
         int64_t i;
         if (RAY_LIKELY(idx->type == -RAY_I64)) i = idx->i64;
-        else if (at_int_key(idx)) i = as_i64(idx);
+        else if (ray_int_key(idx)) i = as_i64(idx);
         else return at_key_type_error(idx->type);
         if (i < 0 || (size_t)i >= slen) return ray_error("domain", "at: string index %lld out of range for length %lld", (long long)i, (long long)slen);
         /* Return 1-char string atom */
@@ -5815,7 +5803,7 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         return result;
     }
 
-    if (!at_int_key(idx)) return at_key_type_error(idx->type);
+    if (!ray_int_key(idx)) return at_key_type_error(idx->type);
     int64_t i = as_i64(idx);
 
     /* Typed vector: extract element directly */
@@ -8129,9 +8117,8 @@ static bool ts_window_arg(ray_t* n, int64_t* out) {
         case -RAY_I64:  *out = n->i64; return true;
         case -RAY_I32:  *out = (int64_t)n->i32; return true;
         case -RAY_I16:  *out = (int64_t)n->i16; return true;
-        case -RAY_U8:
-        case -RAY_BOOL: *out = (int64_t)n->u8; return true;
-        default: return false;
+        case -RAY_U8:   *out = (int64_t)n->u8; return true;
+        default: return false;   /* a boolean is not a window (#1796) */
     }
 }
 
