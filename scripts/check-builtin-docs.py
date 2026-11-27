@@ -152,11 +152,6 @@ AGG_FUNCTION = re.compile(r'^(?:static\s+)?(?:inline\s+)?[\w\s*]+?\b(\w+)\s*\([^
 ALLOWED_AGG_SPELLINGS = {
     ("src/ops/datalog.c", "dl_is_aggregate"): "Datalog's find-clause aggregates: syntax, not heads",
     ("src/ops/datalog.c", "dl_agg_op_from_name"): "Datalog's find-clause aggregates: syntax, not heads",
-    ("src/ops/query.c", "select_fallback_bulk_minmax"): "pending, #1844",
-    ("src/ops/query.c", "match_count_distinct"): "pending, #1844",
-    ("src/ops/query.c", "dkv_agg_kind"): "pending, #1844",
-    ("src/ops/query.c", "is_med_call"): "pending, #1844",
-    ("src/ops/query.c", "src_rank"): "pending, #1844",
 }
 
 
