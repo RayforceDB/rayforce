@@ -97,6 +97,25 @@ conventional-commit subjects since the previous release tag into sections —
 *Maintenance & internal*. Author names and merge-commit noise are dropped; a
 **Full changelog** compare link at the bottom is the exhaustive per-commit view.
 
+A **⚠️ Breaking changes** section comes first. It lists every commit in the
+range whose message ends with a `BREAKING CHANGE:` trailer (`BREAKING-CHANGE:`
+too), by the trailer's text and the commit's pull-request number. A commit
+whose subject marks its type with `!` (`fix(lang)!: …`) and has no trailer is
+listed by its subject's description. The commit also stays in its own
+section.
+
+Only the trailer block is read: the message's last paragraph, by git's trailer
+rules (`git interpret-trailers`). A line starting with whitespace continues the
+trailer above it, and the next `Key: value` line or any other line ends it.
+The words `BREAKING CHANGE:` in an earlier paragraph, or in a code block, are
+prose and are not listed. A pull request's description becomes its squash
+commit's body, so the trailer goes in the description's last paragraph, after
+a blank line:
+
+```
+BREAKING CHANGE: stddev_pop is removed; use dev_pop.
+```
+
 Because notes are scoped to `previousTag..thisRelease`, they only read well once
 there is a previous release tag to diff against — the first release (`v2.1.0`)
 spans the entire v2 line and was given a hand-written highlights summary instead.

@@ -172,13 +172,88 @@ def previous(api, requested, artifact, source):
     return None, None, None
 
 
-def render(subjects, repo, requested, prev):
+SUBJECT = re.compile(r'^([a-zA-Z]+)(?:\([^)]*\))?(!?):\s*(.*)$')
+# A trailer line in the trailer block, by git's rules (git interpret-trailers),
+# plus the one key Conventional Commits spells with a space.
+TRAILER = re.compile(r'^(BREAKING CHANGE|[A-Za-z0-9-]+)[ \t]*:[ \t]*(.*)$')
+
+
+FENCE = re.compile(r'^[ \t]*(`{3,}|~{3,})')
+
+
+def unfenced(body):
+    """`body` with every fenced code block (``` or ~~~, any length of at
+    least three, a language tag or not, indented or not) left out and a
+    blank line in its place, so nothing inside a fence is ever a trailer.  A
+    fence never closed runs to the end of the body."""
+    out, fence = [], None
+    for line in (body or '').split('\n'):
+        match = FENCE.match(line)
+        if fence is None:
+            if match:
+                fence = match[1]
+                out.append('')
+                continue
+            out.append(line)
+        elif match and match[1][0] == fence[0] and len(match[1]) >= len(fence) \
+                and not line.strip()[len(match[1]):].strip():
+            fence = None
+    return '\n'.join(out)
+
+
+def trailers(body):
+    """The (key, value) trailers of a commit body: its last paragraph, when
+    at least a quarter of that paragraph's lines are trailers (git's rule; a
+    line starting with whitespace continues the trailer above it).  Nothing
+    else in the body is read: not an earlier paragraph, nothing inside a
+    fenced code block (unfenced)."""
+    paragraphs = re.split(r'\n[ \t]*\n', unfenced(body).strip())
+    if not paragraphs or not paragraphs[-1].strip():
+        return []
+    lines = paragraphs[-1].split('\n')
+    found, own = [], 0
+    for line in lines:
+        if line[:1] in (' ', '\t'):
+            if found and found[-1] is not None:
+                found[-1] = (found[-1][0], found[-1][1] + ' ' + line.strip())
+            continue
+        match = TRAILER.match(line)
+        found.append((match[1], match[2].strip()) if match else None)
+        own += 1
+    trails = [t for t in found if t is not None]
+    if not trails or 4 * len(trails) < own:
+        return []
+    return trails
+
+
+def breaking(commits):
+    """The breaking changes among (subject, body) commits: each
+    `BREAKING CHANGE:` (or `BREAKING-CHANGE:`) trailer's text, or for a
+    subject marked `type!:` without one, its description."""
+    found = []
+    for subject, body in commits:
+        ref = re.search(r'\(#[0-9]+\)\s*$', subject)   # the pull request the queue appended
+        notes = [' '.join(v.split()) for k, v in trailers(body)
+                 if k.upper() in ('BREAKING CHANGE', 'BREAKING-CHANGE')]
+        notes = [n + (' ' + ref[0].strip() if ref else '') for n in notes if n]
+        if notes:
+            found += notes
+            continue
+        match = SUBJECT.match(subject)
+        if match and match[2]:
+            found.append(match[3])
+    return found
+
+
+def render(subjects, repo, requested, prev, broken=()):
     buckets = {key: [] for key in ('feat', 'fix', 'perf', 'docs', 'other')}
     for subject in subjects:
         match = re.match(r'^([a-zA-Z]+)(?:\([^)]*\))?!?:\s*(.*)$', subject)
         key = match[1] if match and match[1] in buckets and match[1] != 'other' else 'other'
         buckets[key].append('- ' + (match[2] if key != 'other' else subject))
     parts = []
+    if broken:
+        parts.append('### ⚠️ Breaking changes\n\n' + '\n'.join('- ' + b for b in broken) + '\n')
     for key, title in [('feat', '✨ Features'), ('fix', '🐛 Bug fixes'),
                        ('perf', '⚡ Performance'), ('docs', '📚 Documentation')]:
         if buckets[key]:
@@ -203,15 +278,18 @@ def generate(requested, target, pinned=None, repo='RayforceDB/rayforce', api=Non
     source = resolve(api, tag, artifact, pinned, body='',
                      allow_direct_merge=allow_direct_merge)
     prev, old, old_source = previous(api, requested, artifact, source)
-    args = ['log', '--no-merges', '--reverse', '--format=%s', source]
+    args = ['log', '--no-merges', '--reverse', '--format=%s%x1f%b%x1e', source]
     if old:
         args += ['--not', old_source, old]
-    subjects = git(*args).splitlines()
+    commits = [tuple(rec.lstrip('\n').split('\x1f', 1)) for rec in git(*args).split('\x1e')
+               if rec.strip()]
+    commits = [(c[0], c[1] if len(c) > 1 else '') for c in commits]
+    subjects = [c[0] for c in commits]
     if not subjects or all(re.match(r'^v?[0-9]+\.[0-9]+\.[0-9]+(?:\s|$)', s) for s in subjects):
         raise NotesError('Empty or wrapper-only release source delta; explicit release decision required')
     data = dict(tag=tag, artifact=artifact, source=source,
                 tree=git('rev-parse', artifact + '^{tree}'))
-    return (render(subjects, repo, requested, prev) + '\n\n<!-- ' + MARKER + ' '
+    return (render(subjects, repo, requested, prev, breaking(commits)) + '\n\n<!-- ' + MARKER + ' '
             + json.dumps(data, sort_keys=True, separators=(',', ':')) + ' -->\n')
 
 

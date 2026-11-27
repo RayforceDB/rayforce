@@ -44,7 +44,13 @@ merge queue batches landings, so there are no roll-up pull requests.
 2. Make your change. Keep commits focused; we use
    [Conventional Commits](https://www.conventionalcommits.org/)
    (`feat:`, `fix:`, `perf:`, `docs:`, `refactor:`, `test:`, `chore:`) — the
-   release notes are generated from these prefixes, so they matter.
+   release notes are generated from these prefixes, so they matter. A change
+   that removes or renames something users call, or changes an answer they
+   rely on, ends its description with a `BREAKING CHANGE:` trailer naming what
+   changed and what to use instead (`BREAKING CHANGE: stddev_pop is removed;
+   use dev_pop.`). It goes in the last paragraph, after a blank line, on one
+   line or continued on indented lines. The release notes list it under
+   **Breaking changes** ([RELEASE.md](RELEASE.md#release-notes)).
 3. Make sure the build is clean and tests pass locally:
 
    ```sh
