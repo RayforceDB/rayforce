@@ -2089,6 +2089,13 @@ void ray_alloc_fail_set_for_test(int64_t nth, int64_t count) {
     g_alloc_fail_at    = count > 0 && nth > 0 ? nth : 0;
     g_alloc_fail_count = count;
 }
+int64_t ray_alloc_fail_armed_for_test(void) { return g_alloc_fail_at > 0 ? g_alloc_fail_at : 0; }
+/* Pool tasks the calling thread is running (pool.c raises it around each),
+ * and whether the armed failure skips their allocations: which tasks the
+ * calling thread steals varies from run to run, its own code does not. */
+_Thread_local int ray_test_in_pool_task;
+static _Thread_local bool g_alloc_fail_skip_tasks;
+void ray_alloc_fail_skip_tasks_for_test(bool skip) { g_alloc_fail_skip_tasks = skip; }
 static bool alloc_fails_for_test(void) {
     if (--g_alloc_fail_at > 0) return false;
     if (--g_alloc_fail_count > 0) g_alloc_fail_at = 1;   /* the next one too */
@@ -2261,7 +2268,8 @@ static ray_t* heap_alloc_impl(size_t data_size, bool* fresh) {
 
 ray_t* ray_alloc(size_t data_size) {
 #ifdef DEBUG
-    if (RAY_UNLIKELY(g_alloc_fail_at > 0) && alloc_fails_for_test()) return NULL;
+    if (RAY_UNLIKELY(g_alloc_fail_at > 0) &&
+        !(g_alloc_fail_skip_tasks && ray_test_in_pool_task) && alloc_fails_for_test()) return NULL;
 #endif
     bool fresh;
     ray_t* v = heap_alloc_impl(data_size, &fresh);

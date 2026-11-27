@@ -6065,9 +6065,10 @@ static bool group_ht_wire_wide(group_ht_t* ht, uint32_t nk) {
 
 #ifdef DEBUG
 /* Test seam (ray_group_test_ht_rows_fail): the nth partition-table init of
- * the v2 radix route's phase 2 from now, on any thread, fails as a failed
- * rows allocation does (slots allocated, rows NULL); with cancel, it also
- * raises the cancel.  t_ht_seam_site marks the inits it counts. */
+ * a radix route's phase 2 (v2 or classic) from now, on any thread, fails
+ * as a failed rows allocation does (slots allocated, rows NULL); with
+ * cancel, it also raises the cancel.  t_ht_seam_site marks the inits it
+ * counts. */
 static _Atomic int64_t g_ht_rows_fail_for_test;
 static _Atomic bool    g_ht_rows_fail_cancel_for_test;
 static _Thread_local bool t_ht_seam_site;
@@ -8631,8 +8632,19 @@ static void radix_phase2_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         uint32_t fe_target = total < 4096 ? total : 4096;
         while (fe_cap < fe_target) fe_cap <<= 1;
         uint32_t fe_blk = total < 256 ? total : 256;
-        if (!group_ht_init_sized(&c->part_hts[p], fe_cap, &c->layout, fe_blk))
+#ifdef DEBUG
+        t_ht_seam_site = true;
+#endif
+        bool inited = group_ht_init_sized(&c->part_hts[p], fe_cap, &c->layout, fe_blk);
+#ifdef DEBUG
+        t_ht_seam_site = false;
+#endif
+        if (!inited) {
+            /* its groups would be missing from the answer: the caller
+             * answers `oom` (the same flag a failed grow sets) */
+            c->part_hts[p].oom = 1;
             continue;
+        }
         /* Wide keys need source-column resolution during probe/rehash. */
         if (c->layout.any_wide_key && c->key_data) {
             group_ht_set_key_data(&c->part_hts[p], c->key_data);
@@ -15225,13 +15237,42 @@ static bool group_firstn_where_ok(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int6
     return agg_v2_admission(g, op, tbl) == AGG_V2_ADMITTED;
 }
 
+#ifdef DEBUG
+/* Test seam (ray_group_alloc_fail_for_test): the nth allocation of the
+ * calling thread's own code (not the pool tasks it runs) while the
+ * outermost group runs fails. */
+static _Thread_local int64_t g_group_fail_nth;
+static _Thread_local bool    g_group_fail_fired;
+static _Thread_local int64_t g_group_fail_left;
+static _Thread_local int     g_group_fail_depth;
+void ray_group_alloc_fail_for_test(int64_t nth) { g_group_fail_nth = nth; g_group_fail_fired = false; }
+bool ray_group_alloc_fail_fired_for_test(void) { return g_group_fail_fired; }
+/* The allocations the last armed group made on this thread, when its
+ * failure did not fire (armed past them). */
+int64_t ray_group_alloc_count_for_test(void) { return g_group_fail_nth - g_group_fail_left; }
+#endif
+
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit) {
     uint32_t gid = op->id;
     if (g->firstn_where && !group_firstn_where_ok(g, op, tbl, group_limit)) {
         g->firstn_declined = true;
         return NULL;
     }
-    return group_retag_duration_means(g, gid, exec_group_core(g, op, tbl, group_limit));
+#ifdef DEBUG
+    bool arm = g_group_fail_nth && g_group_fail_depth++ == 0;
+    if (arm) { ray_alloc_fail_skip_tasks_for_test(true); ray_alloc_fail_set_for_test(g_group_fail_nth, 1); }
+#endif
+    ray_t* r = group_retag_duration_means(g, gid, exec_group_core(g, op, tbl, group_limit));
+#ifdef DEBUG
+    if (g_group_fail_nth) g_group_fail_depth--;
+    if (arm) {
+        g_group_fail_left = ray_alloc_fail_armed_for_test();
+        g_group_fail_fired = g_group_fail_left == 0;
+        ray_alloc_fail_set_for_test(0, 0);
+        ray_alloc_fail_skip_tasks_for_test(false);
+    }
+#endif
+    return r;
 }
 
 /* ============================================================================
@@ -21597,6 +21638,23 @@ v2_done:;
         ray_pool_dispatch_n(pool, radix_phase2_fn, &p2ctx, radix_n_parts);
         scratch_free(p2_kp_hdr);
         CHECK_CANCEL_GOTO(pool, cleanup);
+        /* A partition that could not allocate (its init, or a grow while
+         * folding rows in) lost groups: the query's `oom`.  Every partition
+         * is freed here, one whose init failed holding slots but no rows,
+         * which cleanup's rows-only free would keep. */
+        {
+            bool p2_oom = false;
+            for (uint32_t p = 0; p < radix_n_parts && !p2_oom; p++)
+                p2_oom = part_hts[p].oom != 0;
+            if (p2_oom) {
+                for (uint32_t p = 0; p < radix_n_parts; p++) group_ht_free(&part_hts[p]);
+                scratch_free(part_hts_hdr);
+                part_hts = NULL;
+                part_hts_hdr = NULL;
+                result = ray_error("oom", NULL);
+                goto cleanup;
+            }
+        }
 
         if (radix_bufs) {
             size_t n_bufs_free = (size_t)n_total * radix_n_parts;
@@ -22002,13 +22060,20 @@ v2_emit:;
         char* key_dsts[vla_keys];
         int8_t key_out_types[vla_keys];
         uint8_t key_esizes[vla_keys];
+        /* Every key and aggregate column is written by phase 3, so one that
+         * is missing (a failed allocation, or a key left unread by one) is
+         * the query's `oom`, checked once both loops have set every slot.
+         * Skipping it wrote phase 3 through a NULL key column, or dropped
+         * the aggregate's column from the answer. */
+        bool emit_oom = false;
+        ray_t* emit_err = NULL;   /* the first allocation's own error, the answer */
         for (uint32_t k = 0; k < n_keys; k++) {
             ray_t* src_col = key_vecs[k];
             key_cols[k] = NULL;
             key_dsts[k] = NULL;
             key_out_types[k] = 0;
             key_esizes[k] = 0;
-            if (!src_col) continue;
+            if (!src_col) { emit_oom = true; continue; }
             uint8_t esz = ray_sym_elem_size(src_col->type, src_col->attrs);
             ray_t* new_col;
             if (src_col->type == RAY_SYM) {
@@ -22032,7 +22097,12 @@ v2_emit:;
                 }
             } else
                 new_col = ray_vec_new(src_col->type, (int64_t)total_grps);
-            if (!new_col || RAY_IS_ERR(new_col)) continue;
+            if (!new_col || RAY_IS_ERR(new_col)) {
+                emit_oom = true;
+                if (new_col && !emit_err) emit_err = new_col;
+                else if (new_col) ray_error_free(new_col);
+                continue;
+            }
             new_col->len = (int64_t)total_grps;
             /* Seed HAS_NULLS from the source key column, exactly as the
              * gather-based emit does (agg_gather_key_col).  radix_phase3_fn
@@ -22109,6 +22179,9 @@ v2_emit:;
             if (!new_col || RAY_IS_ERR(new_col)) {
                 agg_cols[a] = NULL;
                 memset(&agg_outs[a], 0, sizeof(agg_outs[a]));
+                emit_oom = true;
+                if (new_col && !emit_err) emit_err = new_col;
+                else if (new_col) ray_error_free(new_col);
                 continue;
             }
             /* SYM MIN/MAX/FIRST/LAST emit RAW cell ids accumulated from
@@ -22127,6 +22200,14 @@ v2_emit:;
                 .dst = ray_data(new_col),
                 .vec = new_col,
             };
+        }
+
+        if (emit_oom) {
+            for (uint32_t k = 0; k < n_keys; k++) if (key_cols[k]) ray_release(key_cols[k]);
+            for (uint32_t a = 0; a < n_aggs; a++) if (agg_cols[a]) ray_release(agg_cols[a]);
+            ray_release(result);
+            result = emit_err ? emit_err : ray_error("oom", NULL);
+            goto cleanup;
         }
 
         /* Pass 3: parallel key gather + agg result building from inline rows */

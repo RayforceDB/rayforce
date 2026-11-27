@@ -194,6 +194,13 @@ ray_t*    ray_cow(ray_t* v);
 /* Test seam: ray_alloc on this thread returns NULL for `count` calls,
  * starting with the nth from now; nth 0 disarms. */
 void ray_alloc_fail_set_for_test(int64_t nth, int64_t count);
+/* How many allocations on this thread are still to come before the armed
+ * failure (0: it fired, or none is armed). */
+int64_t ray_alloc_fail_armed_for_test(void);
+/* Pool tasks running on this thread (raised by pool.c), and: the armed
+ * failure skips allocations made inside one (true) or counts them. */
+extern _Thread_local int ray_test_in_pool_task;
+void ray_alloc_fail_skip_tasks_for_test(bool skip);
 /* Test seam: the pools a heap may hold (0: RAY_MAX_POOLS), how many pools
  * share a size before the next ones double (0: the default), and the most
  * doublings (UINT32_MAX: the default; 0: standard pools only, the old
