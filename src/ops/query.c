@@ -26718,6 +26718,354 @@ typedef struct {
 static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                               select_owned_t* own);
 
+/* ──────────────────────────────────────────────────────────────────────
+ * A group by one key column with no outputs (`select {from: t by: k}`):
+ * each group's first row of the source, in the order of the GROUP+COUNT
+ * that found the groups, and every column gathered at those rows (#1783).
+ *
+ * The rows are found by reading each source row's key against the
+ * groups' keys: a direct table over the key range when the keys are
+ * integers that span few more values than there are groups, a hash table
+ * of the keys otherwise.  A prefix of the rows is read on the calling
+ * thread, as far as every group having its row (a few groups are found
+ * in the first rows); the rest on the pool, each row lowering its group's
+ * first row.  A null key is a group of its own; F64 keys compare as
+ * canonical bits (-0.0 as +0.0), as the grouping does.
+ * ────────────────────────────────────────────────────────────────────── */
+typedef struct {
+    ray_t*          col;          /* the source key column */
+    const void*     data;
+    int8_t          kt;
+    uint8_t         attrs;
+    bool            nulls;        /* the source may hold nulls */
+    int64_t         null_gi;      /* the null group, or -1 */
+    const uint32_t* dmap;         /* direct table: key - dmin → group, UINT32_MAX none */
+    int64_t         dmin;
+    uint64_t        drange;
+    const uint32_t* ht;           /* hash table of group indices, UINT32_MAX empty */
+    uint32_t        mask;
+    const int64_t*  gk;           /* the groups' keys (canonical bits) */
+    const uint8_t*  gnull;        /* a group's key is null */
+    int64_t*        first;        /* [n_groups] first row, -1 none yet */
+    int64_t         base;         /* the pool's rows start here */
+    int64_t         nv;           /* the key read of a null cell (its sentinel) */
+    bool            nv_ok;        /* a null cell is the cell that reads nv */
+} keys_first_ctx_t;
+
+static inline int64_t keys_first_key(const keys_first_ctx_t* c, int64_t r) {
+    if (c->kt == RAY_F64) {
+        double dv = clear_neg_zero(((const double*)c->data)[r]);
+        int64_t v;
+        memcpy(&v, &dv, 8);
+        return v;
+    }
+    return read_col_i64(c->data, r, c->kt, c->attrs);
+}
+
+static inline uint64_t keys_first_hash(int8_t kt, int64_t v) {
+    if (kt == RAY_F64) {
+        double dv;
+        memcpy(&dv, &v, 8);
+        return ray_hash_f64(dv);
+    }
+    return ray_hash_i64(v);
+}
+
+/* The group of key v (not null), or -1. */
+static inline int64_t keys_first_of(const keys_first_ctx_t* c, int64_t v) {
+    if (c->dmap) {
+        uint64_t o = (uint64_t)v - (uint64_t)c->dmin;
+        return o < c->drange && c->dmap[o] != UINT32_MAX ? (int64_t)c->dmap[o] : -1;
+    }
+    uint32_t slot = (uint32_t)(keys_first_hash(c->kt, v) & c->mask);
+    while (c->ht[slot] != UINT32_MAX) {
+        uint32_t cand = c->ht[slot];
+        if (!c->gnull[cand] && c->gk[cand] == v) return cand;
+        slot = (slot + 1) & c->mask;
+    }
+    return -1;
+}
+
+/* Row r's group, or -1.  A null cell is its sentinel (ray_raw_is_null):
+ * read as nv where the key reads it so, tested by ray_vec_is_null
+ * otherwise (F64, F32). */
+static inline int64_t keys_first_group(const keys_first_ctx_t* c, int64_t r) {
+    if (c->nulls && !c->nv_ok && ray_vec_is_null(c->col, r)) return c->null_gi;
+    int64_t v = keys_first_key(c, r);
+    if (c->nulls && c->nv_ok && v == c->nv) return c->null_gi;
+    return keys_first_of(c, v);
+}
+
+/* Lower group gi's first row to r. */
+static inline void keys_first_lower(const keys_first_ctx_t* c, int64_t gi, int64_t r) {
+    if (gi < 0) return;
+    int64_t cur = __atomic_load_n(&c->first[gi], __ATOMIC_RELAXED);
+    while ((cur < 0 || r < cur) &&
+           !__atomic_compare_exchange_n(&c->first[gi], &cur, r, true,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+
+static void keys_first_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const keys_first_ctx_t* c = raw;
+    int64_t r0 = c->base + start, r1 = c->base + end;
+    /* A key of a cell type read whole: the cell's type fixed for the loop. */
+#define KEYS_FIRST_ROWS(T) do {                                                   \
+        const T* d = (const T*)c->data;                                           \
+        for (int64_t r = r0; r < r1; r++) {                                       \
+            int64_t v = (int64_t)d[r];                                            \
+            keys_first_lower(c, c->nulls && v == c->nv ? c->null_gi : keys_first_of(c, v), r); \
+        }                                                                         \
+        return;                                                                   \
+    } while (0)
+    if (c->nv_ok) {
+        switch (c->kt) {
+            case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: KEYS_FIRST_ROWS(int64_t);
+            case RAY_I32: case RAY_DATE: case RAY_TIME: KEYS_FIRST_ROWS(int32_t);
+            case RAY_I16: KEYS_FIRST_ROWS(int16_t);
+            case RAY_BOOL: case RAY_U8: KEYS_FIRST_ROWS(uint8_t);
+            case RAY_SYM:
+                switch (c->attrs & RAY_SYM_W_MASK) {
+                    case RAY_SYM_W8:  KEYS_FIRST_ROWS(uint8_t);
+                    case RAY_SYM_W16: KEYS_FIRST_ROWS(uint16_t);
+                    case RAY_SYM_W32: KEYS_FIRST_ROWS(uint32_t);
+                    default:          KEYS_FIRST_ROWS(int64_t);
+                }
+            default: break;
+        }
+    }
+#undef KEYS_FIRST_ROWS
+    for (int64_t r = r0; r < r1; r++) keys_first_lower(c, keys_first_group(c, r), r);
+}
+
+/* The groups' keys (keys_first_rows' first passes, on the pool). */
+typedef struct {
+    ray_t*           grp;
+    const void*      gdata;
+    int8_t           kt;
+    bool             gnulls;
+    int64_t*         gk;
+    uint8_t*         gn;
+    int64_t*         first;
+    uint32_t*        map;          /* the direct table, once sized */
+    int64_t          dmin;
+    _Atomic(int64_t) gmin, gmax;   /* the integer keys' range */
+    _Atomic(int64_t) null_gi;
+    int64_t          nv;           /* as keys_first_ctx_t */
+    bool             nv_ok;
+} keys_first_gk_t;
+
+static void keys_first_gk_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    keys_first_gk_t* c = raw;
+    int64_t lo = INT64_MAX, hi = INT64_MIN;
+    /* A key of a cell type read whole: the cell's type fixed for the loop. */
+#define KEYS_FIRST_GROUPS(T) do {                                                 \
+        const T* d = (const T*)c->gdata;                                          \
+        for (int64_t gi = start; gi < end; gi++) {                                \
+            int64_t v = (int64_t)d[gi];                                           \
+            c->first[gi] = -1;                                                    \
+            if (c->gnulls && v == c->nv) {                                        \
+                c->gn[gi] = 1; c->gk[gi] = 0;                                     \
+                atomic_store_explicit(&c->null_gi, gi, memory_order_relaxed);     \
+                continue;                                                         \
+            }                                                                     \
+            c->gk[gi] = v;                                                        \
+            lo = v < lo ? v : lo;                                                 \
+            hi = v > hi ? v : hi;                                                 \
+        }                                                                         \
+        goto range;                                                               \
+    } while (0)
+    if (c->nv_ok) {
+        switch (c->kt) {
+            case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: KEYS_FIRST_GROUPS(int64_t);
+            case RAY_I32: case RAY_DATE: case RAY_TIME: KEYS_FIRST_GROUPS(int32_t);
+            case RAY_I16: KEYS_FIRST_GROUPS(int16_t);
+            case RAY_BOOL: case RAY_U8: KEYS_FIRST_GROUPS(uint8_t);
+            case RAY_SYM:
+                switch (c->grp->attrs & RAY_SYM_W_MASK) {
+                    case RAY_SYM_W8:  KEYS_FIRST_GROUPS(uint8_t);
+                    case RAY_SYM_W16: KEYS_FIRST_GROUPS(uint16_t);
+                    case RAY_SYM_W32: KEYS_FIRST_GROUPS(uint32_t);
+                    default:          KEYS_FIRST_GROUPS(int64_t);
+                }
+            default: break;
+        }
+    }
+#undef KEYS_FIRST_GROUPS
+    for (int64_t gi = start; gi < end; gi++) {
+        c->first[gi] = -1;
+        if (c->gnulls && ray_vec_is_null(c->grp, gi)) {
+            c->gn[gi] = 1;
+            c->gk[gi] = 0;
+            atomic_store_explicit(&c->null_gi, gi, memory_order_relaxed);   /* one null group */
+            continue;
+        }
+        if (c->kt == RAY_F64) {
+            double dv = clear_neg_zero(((const double*)c->gdata)[gi]);
+            memcpy(&c->gk[gi], &dv, 8);
+            continue;
+        }
+        int64_t v = read_col_i64(c->gdata, gi, c->kt, c->grp->attrs);
+        c->gk[gi] = v;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+range:
+    ;
+    int64_t cur = atomic_load_explicit(&c->gmin, memory_order_relaxed);
+    while (lo < cur && !atomic_compare_exchange_weak_explicit(&c->gmin, &cur, lo,
+                                                             memory_order_relaxed, memory_order_relaxed)) {}
+    cur = atomic_load_explicit(&c->gmax, memory_order_relaxed);
+    while (hi > cur && !atomic_compare_exchange_weak_explicit(&c->gmax, &cur, hi,
+                                                             memory_order_relaxed, memory_order_relaxed)) {}
+}
+
+static void keys_first_map_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    keys_first_gk_t* c = raw;
+    for (int64_t gi = start; gi < end; gi++)   /* distinct keys: distinct cells */
+        if (!c->gn[gi]) c->map[(uint64_t)c->gk[gi] - (uint64_t)c->dmin] = (uint32_t)gi;
+}
+
+/* first[0, n_groups): each group's first row in src_key (rows nrows),
+ * the groups' keys read from grp_key (the grouped table's key column).
+ * NULL, or the error (oom, cancel). */
+static ray_t* keys_first_rows(ray_t* src_key, ray_t* grp_key, int64_t n_groups, int64_t* first) {
+    int64_t nrows = src_key->len;
+    int8_t kt = src_key->type;
+    keys_first_ctx_t c = {
+        .col = src_key, .data = ray_data(src_key), .kt = kt, .attrs = src_key->attrs,
+        .nulls = ray_vec_may_have_nulls(src_key), .null_gi = -1, .first = first,
+    };
+    switch (kt) {   /* the read of a null cell, as read_col_i64 reads it */
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: c.nv = NULL_I64; c.nv_ok = true; break;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: c.nv = NULL_I32; c.nv_ok = true; break;
+        case RAY_I16: c.nv = NULL_I16; c.nv_ok = true; break;
+        case RAY_SYM: c.nv = 0; c.nv_ok = true; break;
+        case RAY_BOOL: case RAY_U8: c.nulls = false; c.nv_ok = true; break;   /* non-nullable */
+        default: break;
+    }
+    ray_t* gk_hdr = NULL, *gn_hdr = NULL, *map_hdr = NULL;
+    int64_t* gk = (int64_t*)scratch_alloc(&gk_hdr, (size_t)n_groups * sizeof(int64_t));
+    uint8_t* gn = (uint8_t*)scratch_calloc(&gn_hdr, (size_t)n_groups);
+    if (!gk || !gn) { scratch_free(gk_hdr); scratch_free(gn_hdr); return ray_error("oom", NULL); }
+    /* The groups' keys, canonical as the rows' are read, and their range;
+     * then the direct table, when it serves: both on the pool. */
+    keys_first_gk_t kg = {
+        .grp = grp_key, .gdata = ray_data(grp_key), .kt = kt,
+        .gnulls = kt != RAY_BOOL && kt != RAY_U8 && ray_vec_may_have_nulls(grp_key),   /* BOOL, U8: non-nullable */
+        .gk = gk, .gn = gn, .first = first, .nv = c.nv, .nv_ok = c.nv_ok,
+    };
+    atomic_init(&kg.gmin, INT64_MAX);
+    atomic_init(&kg.gmax, INT64_MIN);
+    atomic_init(&kg.null_gi, -1);
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, n_groups, RAY_PARALLEL_THRESHOLD);
+    if (par) ray_pool_dispatch(pool, keys_first_gk_fn, &kg, n_groups);
+    else keys_first_gk_fn(&kg, 0, 0, n_groups);
+    if (pool_cancelled(pool) || ray_cancel_poll()) {
+        scratch_free(gk_hdr); scratch_free(gn_hdr);
+        return ray_error("cancel", NULL);
+    }
+    c.gk = gk;
+    c.gnull = gn;
+    c.null_gi = atomic_load_explicit(&kg.null_gi, memory_order_relaxed);
+    int64_t gmin = atomic_load_explicit(&kg.gmin, memory_order_relaxed);
+    int64_t gmax = atomic_load_explicit(&kg.gmax, memory_order_relaxed);
+    /* A direct table when the integer keys span at most twice the groups
+     * (and 64K values more); a hash table otherwise. */
+    uint64_t span = gmin <= gmax ? (uint64_t)gmax - (uint64_t)gmin + 1 : 0;
+    if (kt != RAY_F64 && span > 0 && span <= (uint64_t)n_groups * 2 + 65536 && n_groups < (int64_t)UINT32_MAX) {
+        uint32_t* map = (uint32_t*)scratch_alloc(&map_hdr, (size_t)span * sizeof(uint32_t));
+        if (map) {
+            memset(map, 0xFF, (size_t)span * sizeof(uint32_t));
+            kg.map = map;
+            kg.dmin = gmin;
+            if (par) ray_pool_dispatch(pool, keys_first_map_fn, &kg, n_groups);
+            else keys_first_map_fn(&kg, 0, 0, n_groups);
+            if (pool_cancelled(pool)) {
+                scratch_free(map_hdr); scratch_free(gk_hdr); scratch_free(gn_hdr);
+                return ray_error("cancel", NULL);
+            }
+            c.dmap = map;
+            c.dmin = gmin;
+            c.drange = span;
+        }
+    }
+    if (!c.dmap) {
+        uint32_t cap = 64;
+        while ((uint64_t)cap < (uint64_t)n_groups * 2 && cap < (1u << 30)) cap <<= 1;
+        uint32_t* ht = (uint32_t*)scratch_alloc(&map_hdr, (size_t)cap * sizeof(uint32_t));
+        if (!ht) { scratch_free(gk_hdr); scratch_free(gn_hdr); return ray_error("oom", NULL); }
+        memset(ht, 0xFF, (size_t)cap * sizeof(uint32_t));
+        uint32_t mask = cap - 1;
+        for (int64_t gi = 0; gi < n_groups; gi++) {
+            if ((gi & (RAY_CANCEL_ROWS - 1)) == 0 && ray_cancel_poll()) {
+                scratch_free(map_hdr); scratch_free(gk_hdr); scratch_free(gn_hdr);
+                return ray_error("cancel", NULL);
+            }
+            if (gn[gi]) continue;
+            uint32_t slot = (uint32_t)(keys_first_hash(kt, gk[gi]) & mask);
+            while (ht[slot] != UINT32_MAX) slot = (slot + 1) & mask;
+            ht[slot] = (uint32_t)gi;
+        }
+        c.ht = ht;
+        c.mask = mask;
+    }
+    /* The rows: the first block of them here, as far as every group has
+     * its row ... */
+    ray_t* err = ray_cancel_poll() ? ray_error("cancel", NULL) : NULL;
+    int64_t found = 0, r = 0;
+    for (int64_t end = nrows < RAY_CANCEL_ROWS ? nrows : RAY_CANCEL_ROWS;
+         !err && r < end && found < n_groups; r++) {
+        int64_t gi = keys_first_group(&c, r);
+        if (gi >= 0 && first[gi] < 0) { first[gi] = r; found++; }
+    }
+    /* ... and the rest on the pool, or here a block at a time. */
+    if (!err && found < n_groups && r < nrows) {
+        if (ray_pool_par_dispatch_ok(pool, nrows - r, RAY_PARALLEL_THRESHOLD)) {
+            c.base = r;
+            ray_pool_dispatch(pool, keys_first_fn, &c, nrows - r);
+            if (pool_cancelled(pool) || ray_cancel_poll()) err = ray_error("cancel", NULL);
+        } else {
+            for (; r < nrows && !err; r += RAY_CANCEL_ROWS) {
+                if (ray_cancel_poll()) { err = ray_error("cancel", NULL); break; }
+                keys_first_fn(&c, 0, r, r + RAY_CANCEL_ROWS < nrows ? r + RAY_CANCEL_ROWS : nrows);   /* base 0 */
+            }
+        }
+    }
+    scratch_free(map_hdr);
+    scratch_free(gk_hdr);
+    scratch_free(gn_hdr);
+    return err;
+}
+
+/* src's cells at rows[0, n), a column of src's type: in bulk
+ * (ray_group_gather) for a plain vector, a cell at a time otherwise (a
+ * parted or partition-value column). */
+static ray_t* keys_first_gather(ray_t* src, const int64_t* rows, int64_t n) {
+    if (!RAY_IS_PARTED(src->type) && src->type != RAY_MAPCOMMON)
+        return ray_group_gather(src, rows, n);
+    ray_t* dst = ray_vec_new(src->type, n);
+    if (!dst || RAY_IS_ERR(dst)) return dst ? dst : ray_error("oom", NULL);
+    /* len before the stores: store_typed_elem sets a null bit through
+     * ray_vec_set_null, which range-checks against len */
+    dst->len = n;
+    for (int64_t gi = 0; gi < n; gi++) {
+        if ((gi & (RAY_CANCEL_ROWS - 1)) == 0 && ray_cancel_poll()) {
+            ray_release(dst);
+            return ray_error("cancel", NULL);
+        }
+        int alloc = 0;
+        ray_t* val = collection_elem(src, rows[gi], &alloc);
+        store_typed_elem(dst, gi, val);
+        if (alloc) ray_release(val);
+    }
+    return dst;
+}
+
+
 /* Is `from_expr` a call of the left/inner/full join builtin itself?  Only
  * that join reads the published projection (join_narrow_inputs): any other
  * from: — a lambda whose body joins, a wrapper — may need every column. */
@@ -31592,8 +31940,6 @@ by_dict_done:
             if (grp_key_col && RAY_IS_ERR(grp_key_col)) {
                 ray_release(grouped); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return grp_key_col;
             }
-            int64_t nrows_orig = orig_key_col ? orig_key_col->len : 0;
-            int8_t kt = orig_key_col ? orig_key_col->type : 0;
             /* Both hold once key_sym names a column the grouping read (see
              * where key_sym is resolved); refuse rather than read unset keys. */
             if (!orig_key_col || !grp_key_col) {
@@ -31604,177 +31950,26 @@ by_dict_done:
                 return ray_error("domain", "select by: group key column not found");
             }
 
-            /* Heap-allocate gk_vals when n_groups > 256 */
-            int64_t gk_stack[256];
-            ray_t* gk_heap_hdr = NULL;
-            int64_t* gk_vals = gk_stack;
-            if (n_groups > 256) {
-                gk_heap_hdr = ray_alloc((size_t)n_groups * sizeof(int64_t));
-                if (!gk_heap_hdr) { ray_release(grouped); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL); }
-                gk_vals = (int64_t*)ray_data(gk_heap_hdr);
-            }
-
-            /* Copy group key values while grouped is still alive.
-             * STR/LIST/GUID keys are routed through eval-level fallback
-             * above, so only integer-like types reach here.  Use
-             * read_col_i64 for non-F64 types — it dispatches on the
-             * column type (I32/I16/I8/BOOL/SYM adaptive width etc.),
-             * whereas ray_read_sym interprets `attrs` as SYM width and
-             * silently truncates to 1 byte for plain integer columns
-             * where attrs doesn't carry width bits.
-             *
-             * We also record a per-group null flag.  The DAG GROUP path
-             * stores null keys with value=0 and differentiates via a
-             * null mask — if we hashed raw bits only, a null group would
-             * collide with non-null value 0 (for I64 / I32 / SYM / DATE /
-             * TIME etc.), and for F64 with +0.0, since an all-zero key slot
-             * reads back as +0.0.  The null flag keeps those groups
-             * distinct. */
-            uint8_t gk_null_stack[256];
-            ray_t*  gk_null_hdr = NULL;
-            uint8_t* gk_null = gk_null_stack;
-            if (n_groups > 256) {
-                gk_null_hdr = ray_alloc((size_t)n_groups * sizeof(uint8_t));
-                if (!gk_null_hdr) {
-                    if (gk_heap_hdr) ray_free(gk_heap_hdr);
-                    ray_release(grouped);
-                    if (filtered_tbl != tbl) ray_release(filtered_tbl);
-                    ray_release(tbl);
-                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
-                }
-                gk_null = (uint8_t*)ray_data(gk_null_hdr);
-            }
-            memset(gk_null, 0, (size_t)n_groups * sizeof(uint8_t));
-
-            if (grp_key_col) {
-                bool gk_has_nulls = ray_vec_may_have_nulls(grp_key_col);
-                if (gk_has_nulls) {
-                    for (int64_t gi = 0; gi < n_groups; gi++) {
-                        if (kt == RAY_F64) {
-                            /* -0.0 -> +0.0, matching group.c's key-read
-                             * normalisation (group_key_f64_bits, #407):
-                             * gk_vals is compared BIT-WISE against the source
-                             * column below while the probe hashes through
-                             * ray_hash_f64 (which normalises), so both sides
-                             * must carry canonical bits or a -0.0 row would
-                             * never match its own +0.0 group. */
-                            double dv = clear_neg_zero(((double*)ray_data(grp_key_col))[gi]);
-                            memcpy(&gk_vals[gi], &dv, 8);
-                        } else
-                            gk_vals[gi] = read_col_i64(ray_data(grp_key_col), gi, kt, grp_key_col->attrs);
-                        if (ray_vec_is_null(grp_key_col, gi))
-                            gk_null[gi] = 1;
-                    }
-                } else {
-                    for (int64_t gi = 0; gi < n_groups; gi++) {
-                        if (kt == RAY_F64) {           /* canonical -0.0, see above */
-                            double dv = clear_neg_zero(((double*)ray_data(grp_key_col))[gi]);
-                            memcpy(&gk_vals[gi], &dv, 8);
-                        } else
-                            gk_vals[gi] = read_col_i64(ray_data(grp_key_col), gi, kt, grp_key_col->attrs);
-                    }
-                }
-            }
-            ray_release(grouped); /* grp_key_col is now invalid */
-
-            /* Allocate first_idx */
+            /* Each group's first row (keys_first_rows), in the grouping's
+             * order, while grouped (its key column) is alive. */
             int64_t first_idx_stack[256];
             ray_t* fi_heap_hdr = NULL;
             int64_t* first_idx = first_idx_stack;
             if (n_groups > 256) {
                 fi_heap_hdr = ray_alloc((size_t)n_groups * sizeof(int64_t));
-                if (!fi_heap_hdr) { if (gk_heap_hdr) ray_free(gk_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL); }
+                if (!fi_heap_hdr) { ray_release(grouped); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL); }
                 first_idx = (int64_t*)ray_data(fi_heap_hdr);
             }
-
-            /* Build {key_bits -> group_index} hash table from gk_vals so the
-             * scan below is O(nrows_orig + n_groups) instead of
-             * O(nrows_orig * n_groups).  Without this a 1M-row / 1M-group
-             * float-key grouping hangs for tens of seconds — I64 has a
-             * low-cardinality direct-array fast path upstream, but F64
-             * and other non-GUID scalar keys fall through to this scan. */
-            for (int64_t gi = 0; gi < n_groups; gi++) first_idx[gi] = -1;
             {
-                uint32_t fi_cap = 64;
-                while ((uint64_t)fi_cap < (uint64_t)n_groups * 2 && fi_cap < (1u << 30))
-                    fi_cap <<= 1;
-                uint32_t fi_mask = fi_cap - 1;
-                ray_t* fi_ht_hdr = ray_alloc((size_t)fi_cap * sizeof(uint32_t));
-                if (!fi_ht_hdr) {
-                    if (gk_heap_hdr) ray_free(gk_heap_hdr);
+                ray_t* ferr = keys_first_rows(orig_key_col, grp_key_col, n_groups, first_idx);
+                ray_release(grouped); /* grp_key_col is now invalid */
+                if (ferr) {
                     if (fi_heap_hdr) ray_free(fi_heap_hdr);
                     if (filtered_tbl != tbl) ray_release(filtered_tbl);
                     ray_release(tbl);
-                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ferr;
                 }
-                uint32_t* fi_ht = (uint32_t*)ray_data(fi_ht_hdr);
-                memset(fi_ht, 0xFF, (size_t)fi_cap * sizeof(uint32_t));
-
-                /* Insert every group key into the HT keyed by bit pattern.
-                 * For F64 keys, hash via the float path; memcpy bit pattern
-                 * out of gk_vals to dodge strict-aliasing.  Null groups
-                 * get a distinct hash so they don't collide with zero-valued
-                 * groups (null keys are stored as an all-zero key slot,
-                 * which reads back as integer 0 / +0.0). */
-                for (int64_t gi = 0; gi < n_groups; gi++) {
-                    uint64_t h;
-                    if (gk_null[gi]) {
-                        h = ray_hash_i64((int64_t)0xDEADBEEFCAFEBABEULL);
-                    } else if (kt == RAY_F64) {
-                        double dv;
-                        memcpy(&dv, &gk_vals[gi], 8);
-                        h = ray_hash_f64(dv);
-                    } else {
-                        h = ray_hash_i64(gk_vals[gi]);
-                    }
-                    uint32_t slot = (uint32_t)(h & fi_mask);
-                    while (fi_ht[slot] != UINT32_MAX) slot = (slot + 1) & fi_mask;
-                    fi_ht[slot] = (uint32_t)gi;
-                }
-
-                /* Single linear scan of the source column; for each row
-                 * hash-lookup its group index and record the first row
-                 * that maps to it.  Terminate early once every group has
-                 * a first-row. */
-                bool orig_nulls_flag = orig_key_col
-                    && ray_vec_may_have_nulls(orig_key_col);
-                int64_t found = 0;
-                for (int64_t r = 0; r < nrows_orig && found < n_groups; r++) {
-                    bool r_null = orig_nulls_flag && ray_vec_is_null(orig_key_col, r);
-                    int64_t ov;
-                    if (kt == RAY_F64) {           /* canonical -0.0, see above */
-                        double dv = clear_neg_zero(((double*)ray_data(orig_key_col))[r]);
-                        memcpy(&ov, &dv, 8);
-                    } else ov = read_col_i64(ray_data(orig_key_col), r, kt, orig_key_col->attrs);
-                    uint64_t h;
-                    if (r_null) {
-                        h = ray_hash_i64((int64_t)0xDEADBEEFCAFEBABEULL);
-                    } else if (kt == RAY_F64) {
-                        double dv;
-                        memcpy(&dv, &ov, 8);
-                        h = ray_hash_f64(dv);
-                    } else {
-                        h = ray_hash_i64(ov);
-                    }
-                    uint32_t slot = (uint32_t)(h & fi_mask);
-                    while (fi_ht[slot] != UINT32_MAX) {
-                        uint32_t cand = fi_ht[slot];
-                        bool match = (r_null && gk_null[cand])
-                                     || (!r_null && !gk_null[cand] && gk_vals[cand] == ov);
-                        if (match) {
-                            if (first_idx[cand] < 0) {
-                                first_idx[cand] = r;
-                                found++;
-                            }
-                            break;
-                        }
-                        slot = (slot + 1) & fi_mask;
-                    }
-                }
-                ray_free(fi_ht_hdr);
             }
-            if (gk_null_hdr) ray_free(gk_null_hdr);
-            if (gk_heap_hdr) ray_free(gk_heap_hdr);
 
             /* Now build the result table using first_idx gathered above.
              * key_sym and n_groups are already set. */
@@ -31784,91 +31979,18 @@ by_dict_done:
             ray_t* result = ray_table_new(ncols);
             if (RAY_IS_ERR(result)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result; }
 
-            /* Add key column first */
-            ray_t* key_vec_src = orig_key_col;   /* ray_table_col(filtered_tbl, key_sym), read above */
-            if (key_vec_src->type == RAY_STR) {
-                ray_t* key_vec_dst = ray_vec_new(RAY_STR, n_groups);
-                if (!key_vec_dst || RAY_IS_ERR(key_vec_dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return key_vec_dst ? key_vec_dst : ray_error("oom", NULL); }
-                for (int64_t gi = 0; gi < n_groups; gi++) {
-                    size_t slen = 0;
-                    const char* sp = ray_str_vec_get(key_vec_src, first_idx[gi], &slen);
-                    key_vec_dst = ray_str_vec_append(key_vec_dst, sp ? sp : "", sp ? slen : 0);
-                    if (RAY_IS_ERR(key_vec_dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return key_vec_dst; }
-                }
-                result = ray_table_add_col(result, key_sym, key_vec_dst);
-                ray_release(key_vec_dst);
-            } else {
-                ray_t* key_vec_dst = ray_vec_new(key_vec_src->type, n_groups);
-                if (RAY_IS_ERR(key_vec_dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return key_vec_dst; }
-                /* Set len BEFORE the store loop: store_typed_elem routes
-                 * null atoms through ray_vec_set_null, which range-checks
-                 * idx against vec->len and silently returns RAY_ERR_RANGE
-                 * otherwise.  Postponing len=n_groups until after the loop
-                 * therefore dropped the null bit on every nullable key row
-                 * — the result would read back the raw zero/-0.0 bits with
-                 * no HAS_NULLS flag, corrupting the grouped key column. */
-                key_vec_dst->len = n_groups;
-                for (int64_t gi = 0; gi < n_groups; gi++) {
-                    int alloc = 0;
-                    ray_t* val = collection_elem(key_vec_src, first_idx[gi], &alloc);
-                    store_typed_elem(key_vec_dst, gi, val);
-                    if (alloc) ray_release(val);
-                }
-                result = ray_table_add_col(result, key_sym, key_vec_dst);
-                ray_release(key_vec_dst);
-            }
-
-            /* Add non-key columns */
-            for (int64_t c = 0; c < ncols; c++) {
-                int64_t col_name = ray_table_col_name(filtered_tbl, c);
-                if (col_name == key_sym) continue;
-                ray_t* src_col = ray_table_col_idx(filtered_tbl, c);
+            /* The key column first, then the others in the table's order,
+             * each gathered at the groups' first rows (keys_first_gather). */
+            for (int64_t c = -1; c < ncols; c++) {
+                int64_t col_name = c < 0 ? key_sym : ray_table_col_name(filtered_tbl, c);
+                if (c >= 0 && col_name == key_sym) continue;
+                ray_t* src_col = c < 0 ? orig_key_col   /* ray_table_col(filtered_tbl, key_sym), read above */
+                                       : ray_table_col_idx(filtered_tbl, c);
                 if (src_col && RAY_IS_ERR(src_col)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return src_col; }
-                int8_t ct = src_col->type;
-
-                if (ct == RAY_STR) {
-                    /* String column: build STR vector */
-                    ray_t* dst = ray_vec_new(RAY_STR, n_groups);
-                    if (!dst || RAY_IS_ERR(dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return dst ? dst : ray_error("oom", NULL); }
-                    for (int64_t gi = 0; gi < n_groups; gi++) {
-                        size_t slen = 0;
-                        const char* sp = ray_str_vec_get(src_col, first_idx[gi], &slen);
-                        dst = ray_str_vec_append(dst, sp ? sp : "", sp ? slen : 0);
-                        if (RAY_IS_ERR(dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return dst; }
-                    }
-                    result = ray_table_add_col(result, col_name, dst);
-                    ray_release(dst);
-                } else if (ct == RAY_LIST) {
-                    /* List column: pick items */
-                    ray_t* dst = ray_alloc(n_groups * sizeof(ray_t*));
-                    if (!dst) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL); }
-                    dst->type = RAY_LIST;
-                    dst->len = n_groups;
-                    ray_t** dout = (ray_t**)ray_data(dst);
-                    ray_t** src_items = (ray_t**)ray_data(src_col);
-                    for (int64_t gi = 0; gi < n_groups; gi++) {
-                        dout[gi] = src_items[first_idx[gi]];
-                        ray_retain(dout[gi]);
-                    }
-                    result = ray_table_add_col(result, col_name, dst);
-                    ray_release(dst);
-                } else {
-                    /* Typed vector: copy elements at first indices.
-                     * len must be set before the store loop so null bits
-                     * propagate through store_typed_elem → ray_vec_set_null
-                     * (same reason as the key column above). */
-                    ray_t* dst = ray_vec_new(ct, n_groups);
-                    if (RAY_IS_ERR(dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return dst; }
-                    dst->len = n_groups;
-                    for (int64_t gi = 0; gi < n_groups; gi++) {
-                        int alloc = 0;
-                        ray_t* val = collection_elem(src_col, first_idx[gi], &alloc);
-                        store_typed_elem(dst, gi, val);
-                        if (alloc) ray_release(val);
-                    }
-                    result = ray_table_add_col(result, col_name, dst);
-                    ray_release(dst);
-                }
+                ray_t* dst = keys_first_gather(src_col, first_idx, n_groups);
+                if (!dst || RAY_IS_ERR(dst)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); ray_release(result); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return dst ? dst : ray_error("oom", NULL); }
+                result = ray_table_add_col(result, col_name, dst);
+                ray_release(dst);
                 if (RAY_IS_ERR(result)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result; }
             }
 
