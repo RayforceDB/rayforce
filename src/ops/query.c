@@ -237,6 +237,7 @@ static ray_t* groups_to_pair_list(ray_t* d) {
             if (k) ray_retain(k);
         } else {
             void* base = ray_data(keys);
+            bool boxed = true;   /* false: a key type with no atom (a NULL key) */
             switch (keys->type) {
                 /* group-key cell becomes a SYM ATOM: runtime-domain by
                  * the atom rule (no-op while keys is runtime-domain). */
@@ -254,7 +255,14 @@ static ray_t* groups_to_pair_list(ray_t* d) {
                 case RAY_STR: { size_t sl = 0; const char* sp = ray_str_vec_get(keys, i, &sl);
                                  k = ray_str(sp ? sp : "", sp ? sl : 0); break; }
                 case RAY_GUID: k = ray_guid(((uint8_t*)base) + i * 16); break;
-                default: k = NULL; break;
+                default: k = NULL; boxed = false; break;
+            }
+            /* a key atom that failed to allocate is the failure, never a
+             * NULL key (#1848): out (owned here) goes, the atom's error is
+             * the answer */
+            if (boxed && (!k || RAY_IS_ERR(k))) {
+                ray_release(out);
+                return k ? k : ray_error("oom", NULL);
             }
         }
         out = ray_list_append(out, k);

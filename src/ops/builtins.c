@@ -3793,6 +3793,54 @@ int64_t ray_group_boxed_i64_runs(void) {
     return atomic_load_explicit(&group_boxed_i64_runs, memory_order_relaxed);
 }
 
+/* A new group's index vector, owned by ray_group_indices_fn until the
+ * dict takes it; NULL when it fails to allocate (its error is freed here),
+ * never an error object in the group's slot (#1848). */
+static inline ray_t* group_idx_new(void) {
+    ray_t* v = ray_vec_new(RAY_I64, 0);
+    if (!v || RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
+    return v;
+}
+
+/* Row i joins the group whose index vector is *slot.  A failed append
+ * leaves *slot as it was (an unshared vector is not copied), so the
+ * caller's exit releases it; the append's error is freed here. */
+static inline bool group_idx_add(ray_t** slot, int64_t i) {
+    ray_t* nv = ray_vec_append(*slot, &i);
+    /* an append in place answers the same vector: one compare per row,
+     * the error test only when it grew or failed */
+    if (RAY_LIKELY(nv == *slot)) return true;
+    if (!nv || RAY_IS_ERR(nv)) { ray_error_free(nv); return false; }
+    *slot = nv;
+    return true;
+}
+
+/* The groups' index vectors as a LIST, which takes each one over (owned
+ * here until then; its slot is cleared).  NULL when the list fails to
+ * allocate, its error freed: the vectors then stay in idx_vecs for the
+ * caller's exit.  The list holds ngroups slots, so nothing after its
+ * allocation can fail. */
+static ray_t* group_idx_list(ray_t** idx_vecs, int64_t ngroups) {
+    ray_t* l = ray_list_new(ngroups);
+    if (!l || RAY_IS_ERR(l)) { ray_error_free(l); return NULL; }
+    ray_t** d = (ray_t**)ray_data(l);
+    for (int64_t g = 0; g < ngroups; g++) { d[g] = idx_vecs[g]; idx_vecs[g] = NULL; }
+    l->len = ngroups;
+    return l;
+}
+
+/* ray_group_indices_fn's exit on a failed allocation: the index vectors
+ * made so far (owned here; a failed one is NULL), the hash table when it is
+ * live, and the scratch blocks (owned here; kblock only on the list path). */
+static ray_t* group_idx_fail(ray_t** idx_vecs, int64_t ngroups, group_ht_t* ht,
+                             ray_t* val_block, ray_t* ivblock, ray_t* kblock) {
+    for (int64_t g = 0; g < ngroups; g++) ray_release(idx_vecs[g]);
+    if (ht) group_ht_free(ht);
+    ray_free(val_block); ray_free(ivblock);
+    if (kblock) ray_free(kblock);
+    return ray_error("oom", NULL);
+}
+
 ray_t* ray_group_indices_fn(ray_t* x) {
     if (!ray_is_vec(x) && x->type != RAY_LIST)
         return ray_error("type", "group: argument must be a vector or list, got %s", ray_type_name(x->type));
@@ -3895,7 +3943,8 @@ ray_t* ray_group_indices_fn(ray_t* x) {
                 }
                 gi = ngroups++;
                 gkeys[gi] = elem;
-                idx_vecs[gi] = ray_vec_new(RAY_I64, 0);
+                idx_vecs[gi] = group_idx_new();
+                if (!idx_vecs[gi]) return group_idx_fail(idx_vecs, ngroups, &ht, val_block, ivblock, kblock);
                 ht.slots[slot] = (uint32_t)gi;
                 ht.count++;
                 if (ht.count * 2 > ht.cap) {
@@ -3907,22 +3956,26 @@ ray_t* ray_group_indices_fn(ray_t* x) {
                     }
                 }
             }
-            idx_vecs[gi] = ray_vec_append(idx_vecs[gi], &i);
+            if (!group_idx_add(&idx_vecs[gi], i))
+                return group_idx_fail(idx_vecs, ngroups, &ht, val_block, ivblock, kblock);
         }
         group_ht_free(&ht);
         /* Build dict: keys as RAY_LIST (heterogeneous atoms), vals as
          * RAY_LIST of I64 idx vectors. */
+        /* keys: each group's first element, borrowed from x and retained
+         * into a list of ngroups slots */
         ray_t* keys_lst = ray_list_new(ngroups);
-        if (RAY_IS_ERR(keys_lst)) { ray_free(kblock); goto gfail; }
-        ray_t* vals_lst = ray_list_new(ngroups);
-        if (RAY_IS_ERR(vals_lst)) { ray_release(keys_lst); ray_free(kblock); goto gfail; }
-        for (int64_t g = 0; g < ngroups; g++) {
-            keys_lst = ray_list_append(keys_lst, gkeys[g]);
-            if (RAY_IS_ERR(keys_lst)) { ray_release(vals_lst); ray_free(kblock); goto gfail; }
-            vals_lst = ray_list_append(vals_lst, idx_vecs[g]);
-            ray_release(idx_vecs[g]);
-            idx_vecs[g] = NULL;
-            if (RAY_IS_ERR(vals_lst)) { ray_release(keys_lst); ray_free(kblock); goto gfail; }
+        if (!keys_lst || RAY_IS_ERR(keys_lst)) {
+            ray_error_free(keys_lst);
+            return group_idx_fail(idx_vecs, ngroups, NULL, val_block, ivblock, kblock);
+        }
+        ray_t** kd = (ray_t**)ray_data(keys_lst);
+        for (int64_t g = 0; g < ngroups; g++) { kd[g] = gkeys[g]; if (kd[g]) ray_retain(kd[g]); }
+        keys_lst->len = ngroups;
+        ray_t* vals_lst = group_idx_list(idx_vecs, ngroups);
+        if (!vals_lst) {
+            ray_release(keys_lst);   /* owned here: its references go with it */
+            return group_idx_fail(idx_vecs, ngroups, NULL, val_block, ivblock, kblock);
         }
         ray_free(val_block); ray_free(ivblock); ray_free(kblock);
         return ray_dict_new(keys_lst, vals_lst);
@@ -3981,7 +4034,8 @@ ray_t* ray_group_indices_fn(ray_t* x) {
                 }
                 gi = ngroups++;
                 gvals[gi] = i;  /* store row index of first occurrence */
-                idx_vecs[gi] = ray_vec_new(RAY_I64, 0);
+                idx_vecs[gi] = group_idx_new();
+                if (!idx_vecs[gi]) return group_idx_fail(idx_vecs, ngroups, &ht, val_block, ivblock, NULL);
                 ht.slots[slot] = (uint32_t)gi;
                 ht.count++;
                 /* Grow at load factor 0.5 */
@@ -3994,22 +4048,23 @@ ray_t* ray_group_indices_fn(ray_t* x) {
                     }
                 }
             }
-            idx_vecs[gi] = ray_vec_append(idx_vecs[gi], &i);
+            if (!group_idx_add(&idx_vecs[gi], i))
+                return group_idx_fail(idx_vecs, ngroups, &ht, val_block, ivblock, NULL);
         }
         group_ht_free(&ht);
         /* Keys: dense GUID vector built from collected gvals; vals: LIST of idx vecs. */
         ray_t* keys_vec = ray_vec_new(RAY_GUID, ngroups);
-        if (RAY_IS_ERR(keys_vec)) goto gfail;
-        for (int64_t g = 0; g < ngroups; g++)
-            keys_vec = ray_vec_append(keys_vec, base + gvals[g] * 16);
-        if (RAY_IS_ERR(keys_vec)) goto gfail;
-        ray_t* vals_lst = ray_list_new(ngroups);
-        if (RAY_IS_ERR(vals_lst)) { ray_release(keys_vec); goto gfail; }
-        for (int64_t g = 0; g < ngroups; g++) {
-            vals_lst = ray_list_append(vals_lst, idx_vecs[g]);
-            ray_release(idx_vecs[g]);
-            idx_vecs[g] = NULL;
-            if (RAY_IS_ERR(vals_lst)) { ray_release(keys_vec); goto gfail; }
+        if (!keys_vec || RAY_IS_ERR(keys_vec)) {
+            ray_error_free(keys_vec);
+            return group_idx_fail(idx_vecs, ngroups, NULL, val_block, ivblock, NULL);
+        }
+        uint8_t* kd = (uint8_t*)ray_data(keys_vec);   /* ngroups slots */
+        for (int64_t g = 0; g < ngroups; g++) memcpy(kd + g * 16, base + gvals[g] * 16, 16);
+        keys_vec->len = ngroups;
+        ray_t* vals_lst = group_idx_list(idx_vecs, ngroups);
+        if (!vals_lst) {
+            ray_release(keys_vec);   /* owned here */
+            return group_idx_fail(idx_vecs, ngroups, NULL, val_block, ivblock, NULL);
         }
         ray_free(val_block); ray_free(ivblock);
         return ray_dict_new(keys_vec, vals_lst);
@@ -4067,7 +4122,8 @@ ray_t* ray_group_indices_fn(ray_t* x) {
                 }
                 gi = ngroups++;
                 gvals[gi] = i;
-                idx_vecs[gi] = ray_vec_new(RAY_I64, 0);
+                idx_vecs[gi] = group_idx_new();
+                if (!idx_vecs[gi]) return group_idx_fail(idx_vecs, ngroups, &ht, val_block, ivblock, NULL);
                 ht.slots[slot] = (uint32_t)gi;
                 ht.count++;
                 if (ht.count * 2 > ht.cap) {
@@ -4079,31 +4135,33 @@ ray_t* ray_group_indices_fn(ray_t* x) {
                     }
                 }
             }
-            idx_vecs[gi] = ray_vec_append(idx_vecs[gi], &i);
+            if (!group_idx_add(&idx_vecs[gi], i))
+                return group_idx_fail(idx_vecs, ngroups, &ht, val_block, ivblock, NULL);
         }
         group_ht_free(&ht);
 
         /* Build keys from each group's first source row, preserving encounter order. */
         ray_t* keys_vec = ray_vec_new(RAY_STR, ngroups);
-        if (RAY_IS_ERR(keys_vec)) {
-            for (int64_t g = 0; g < ngroups; g++) ray_release(idx_vecs[g]);
-            ray_free(val_block); ray_free(ivblock);
-            return ray_error("oom", NULL);
+        if (!keys_vec || RAY_IS_ERR(keys_vec)) {
+            ray_error_free(keys_vec);
+            return group_idx_fail(idx_vecs, ngroups, NULL, val_block, ivblock, NULL);
         }
         for (int64_t g = 0; g < ngroups; g++) {
             const ray_str_t* key = &desc[gvals[g]];
-            keys_vec = ray_str_vec_append(keys_vec,
-                                          ray_str_t_ptr(key, pool), key->len);
+            /* a failed append leaves keys_vec (owned here): released with
+             * the append's error freed */
+            ray_t* nk = ray_str_vec_append(keys_vec, ray_str_t_ptr(key, pool), key->len);
+            if (!nk || RAY_IS_ERR(nk)) {
+                ray_error_free(nk);
+                ray_release(keys_vec);
+                return group_idx_fail(idx_vecs, ngroups, NULL, val_block, ivblock, NULL);
+            }
+            keys_vec = nk;
         }
-        ray_t* vals_lst = ray_list_new(ngroups);
-        if (RAY_IS_ERR(vals_lst)) {
-            ray_release(keys_vec); goto gfail;
-        }
-        for (int64_t g = 0; g < ngroups; g++) {
-            vals_lst = ray_list_append(vals_lst, idx_vecs[g]);
-            ray_release(idx_vecs[g]);
-            idx_vecs[g] = NULL;
-            if (RAY_IS_ERR(vals_lst)) { ray_release(keys_vec); goto gfail; }
+        ray_t* vals_lst = group_idx_list(idx_vecs, ngroups);
+        if (!vals_lst) {
+            ray_release(keys_vec);   /* owned here */
+            return group_idx_fail(idx_vecs, ngroups, NULL, val_block, ivblock, NULL);
         }
         ray_free(val_block); ray_free(ivblock);
         return ray_dict_new(keys_vec, vals_lst);
@@ -4142,9 +4200,11 @@ ray_t* ray_group_indices_fn(ray_t* x) {
                 }
                 null_gi = ngroups++;
                 gvals[null_gi] = 0;          /* placeholder; key value set later */
-                idx_vecs[null_gi] = ray_vec_new(RAY_I64, 0);
+                idx_vecs[null_gi] = group_idx_new();
+                if (!idx_vecs[null_gi]) return group_idx_fail(idx_vecs, ngroups, &ht, val_block, ivblock, NULL);
             }
-            idx_vecs[null_gi] = ray_vec_append(idx_vecs[null_gi], &i);
+            if (!group_idx_add(&idx_vecs[null_gi], i))
+                return group_idx_fail(idx_vecs, ngroups, &ht, val_block, ivblock, NULL);
             continue;
         }
         int64_t v;
@@ -4191,8 +4251,9 @@ ray_t* ray_group_indices_fn(ray_t* x) {
                 }
                 int64_t gi_nan = ngroups++;
                 memcpy(&gvals[gi_nan], &f, sizeof(f));
-                idx_vecs[gi_nan] = ray_vec_new(RAY_I64, 0);
-                idx_vecs[gi_nan] = ray_vec_append(idx_vecs[gi_nan], &i);
+                idx_vecs[gi_nan] = group_idx_new();
+                if (!idx_vecs[gi_nan] || !group_idx_add(&idx_vecs[gi_nan], i))
+                    return group_idx_fail(idx_vecs, ngroups, &ht, val_block, ivblock, NULL);
                 continue;
             }
             f = clear_neg_zero(f);
@@ -4224,7 +4285,8 @@ ray_t* ray_group_indices_fn(ray_t* x) {
             }
             gi = ngroups++;
             gvals[gi] = v;
-            idx_vecs[gi] = ray_vec_new(RAY_I64, 0);
+            idx_vecs[gi] = group_idx_new();
+            if (!idx_vecs[gi]) return group_idx_fail(idx_vecs, ngroups, &ht, val_block, ivblock, NULL);
             ht.slots[slot] = (uint32_t)gi;
             ht.count++;
             if (ht.count * 2 > ht.cap) {
@@ -4236,7 +4298,8 @@ ray_t* ray_group_indices_fn(ray_t* x) {
                 }
             }
         }
-        idx_vecs[gi] = ray_vec_append(idx_vecs[gi], &i);
+        if (!group_idx_add(&idx_vecs[gi], i))
+            return group_idx_fail(idx_vecs, ngroups, &ht, val_block, ivblock, NULL);
     }
     group_ht_free(&ht);
 
@@ -4245,7 +4308,12 @@ ray_t* ray_group_indices_fn(ray_t* x) {
     ray_t* keys_vec;
     if (key_type == RAY_SYM) keys_vec = ray_sym_vec_new(RAY_SYM_W64, ngroups);
     else                     keys_vec = ray_vec_new(key_type, ngroups);
-    if (RAY_IS_ERR(keys_vec)) goto gfail;
+    if (!keys_vec || RAY_IS_ERR(keys_vec)) {
+        ray_error_free(keys_vec);
+        return group_idx_fail(idx_vecs, ngroups, NULL, val_block, ivblock, NULL);
+    }
+    /* keys_vec (owned here) holds ngroups slots and is unshared, so the
+     * appends below never reallocate and cannot fail */
 
     for (int64_t g = 0; g < ngroups; g++) {
         switch (key_type) {
@@ -4284,7 +4352,6 @@ ray_t* ray_group_indices_fn(ray_t* x) {
             }
             default:      keys_vec = ray_vec_append(keys_vec, &gvals[g]); break;
         }
-        if (RAY_IS_ERR(keys_vec)) goto gfail;
         /* If the source column had a null at any row in this group, mark
          * the group's key as null so dict rendering / lookup can recover
          * the null semantics (the integer-value key alone collides with a
@@ -4319,24 +4386,14 @@ ray_t* ray_group_indices_fn(ray_t* x) {
     /* SYM group keys are raw cell ids of x — resolve over x's domain. */
     if (key_type == RAY_SYM) ray_sym_vec_adopt_domain(keys_vec, x);
 
-    ray_t* vals_lst = ray_list_new(ngroups);
-    if (RAY_IS_ERR(vals_lst)) { ray_release(keys_vec); goto gfail; }
-    for (int64_t g = 0; g < ngroups; g++) {
-        vals_lst = ray_list_append(vals_lst, idx_vecs[g]);
-        ray_release(idx_vecs[g]);
-        idx_vecs[g] = NULL;
-        if (RAY_IS_ERR(vals_lst)) { ray_release(keys_vec); goto gfail; }
+    ray_t* vals_lst = group_idx_list(idx_vecs, ngroups);
+    if (!vals_lst) {
+        ray_release(keys_vec);   /* owned here */
+        return group_idx_fail(idx_vecs, ngroups, NULL, val_block, ivblock, NULL);
     }
     ray_free(val_block);
     ray_free(ivblock);
     return ray_dict_new(keys_vec, vals_lst);
-
-gfail:
-    for (int64_t g = 0; g < ngroups; g++)
-        if (idx_vecs[g]) ray_release(idx_vecs[g]);
-    ray_free(val_block);
-    ray_free(ivblock);
-    return ray_error("oom", NULL);
 }
 
 static ray_t* str_vec_concat_atom(ray_t* vec, ray_t* atom, bool atom_first) {
