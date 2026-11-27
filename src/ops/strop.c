@@ -148,6 +148,8 @@ ray_t* ray_strlen_fn(ray_t* x) {
     if (ray_is_vec(x)) return strlen_vec(x);
     if (x->type == RAY_MAPCOMMON) return strlen_mapcommon(x);
     if (RAY_IS_PARTED(x->type)) return strlen_parted(x);
+    ray_t* el_ = ray_empty_list_as(x, RAY_STR);   /* (list): as the empty STR vector (#1790) */
+    if (el_) { ray_t* r_ = ray_strlen_fn(el_); ray_release(el_); return r_; }
     return ray_error("type", "strlen: expected string or symbol");
 }
 
@@ -266,8 +268,10 @@ static ray_t* string_unary_fn(ray_t* x, uint16_t opcode,
     }
     if (ray_is_atom(x))
         return string_unary_atom(x, opcode);
-    if (!ray_is_vec(x) || (x->type != RAY_STR && x->type != RAY_SYM))
+    if (!ray_is_vec(x) || (x->type != RAY_STR && x->type != RAY_SYM)) {
+        if (ray_is_empty_list(x)) { ray_retain(x); return x; }   /* (list) in, (list) out (#1790) */
         return ray_error("type", "string transform: expected string or symbol, got %s", ray_type_name(x->type));
+    }
 
     ray_graph_t* g = ray_graph_new(NULL);
     if (!g) return ray_error("oom", NULL);
@@ -1021,8 +1025,11 @@ ray_t* ray_like_fn(ray_t* x, ray_t* pattern) {
     /* A string column matches row by row, as in a query (#1615); otherwise
      * the pattern is a string atom. */
     if (ray_like_pat_rows(pattern)) return ray_like_rows(x, pattern, false);
-    if (pattern->type != -RAY_STR)
+    if (pattern->type != -RAY_STR) {
+        ray_t* el_ = ray_empty_list_as(pattern, RAY_STR);   /* (list): as the empty STR vector (#1790) */
+        if (el_) { ray_t* r_ = ray_like_fn(x, el_); ray_release(el_); return r_; }
         return ray_error("type", "like: pattern must be a STR atom or a STR vector, got %s", ray_type_name(pattern->type));
+    }
     const char* pat = ray_str_ptr(pattern);
     size_t pat_len = ray_str_len(pattern);
 
@@ -1121,5 +1128,7 @@ ray_t* ray_sym_name_fn(ray_t* x) {
         ((x->type == RAY_I64 || x->type == RAY_SYM) && x->len == 0)) {
         ray_retain(x); return x;
     }
+    ray_t* el_ = ray_empty_list_as(x, RAY_I64);   /* (list): as the empty I64 vector (#1790) */
+    if (el_) { ray_t* r_ = ray_sym_name_fn(el_); ray_release(el_); return r_; }
     return ray_error("type", "sym-name: expected i64 or i64 vector");
 }

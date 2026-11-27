@@ -8136,30 +8136,42 @@ static ray_t* ts_moving_fn(ray_t* n, ray_t* x, uint16_t opcode) {
         return ray_error("range", "%s window must be >= 1", ts_moving_name(opcode));
     if (ray_is_lazy(x)) return ray_lazy_append_param(x, opcode, window);
     if (ray_is_vec(x)) return ts_start_lazy_moving(x, opcode, window);
+    /* (list): mcount and mvar answer for it what they answer for every
+     * empty vector, the others (their answer's type is the input's) the
+     * empty list itself (#1790) */
+    if (opcode == OP_MCOUNT || opcode == OP_MVAR) {
+        ray_t* el_ = ray_empty_list_as(x, RAY_I64);
+        if (el_) { ray_t* r_ = ts_moving_fn(n, el_, opcode); ray_release(el_); return r_; }
+    } else if (ray_is_empty_list(x)) { ray_retain(x); return x; }
     return ray_error("type", "%s expects a vector input, got %s", ts_moving_name(opcode), ray_type_name(x ? x->type : 0));
 }
 
 ray_t* ray_lag_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_LAG);
     if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_lag_op);
+    if (ray_is_empty_list(x)) { ray_retain(x); return x; }   /* (list) in, (list) out (#1790) */
     return ray_error("type", "lag expects a vector input, got %s", ray_type_name(x ? x->type : 0));
 }
 
 ray_t* ray_lead_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_LEAD);
     if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_lead_op);
+    if (ray_is_empty_list(x)) { ray_retain(x); return x; }   /* (list) in, (list) out (#1790) */
     return ray_error("type", "lead expects a vector input, got %s", ray_type_name(x ? x->type : 0));
 }
 
 ray_t* ray_deltas_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_DELTAS);
     if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_deltas_op);
+    if (ray_is_empty_list(x)) { ray_retain(x); return x; }   /* (list) in, (list) out (#1790) */
     return ray_error("type", "deltas expects a vector input, got %s", ray_type_name(x ? x->type : 0));
 }
 
 ray_t* ray_ratios_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_RATIOS);
     if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_ratios_op);
+    ray_t* el_ = ray_empty_list_as(x, RAY_I64);   /* (list): as the empty I64 vector (#1790) */
+    if (el_) { ray_t* r_ = ray_ratios_fn(el_); ray_release(el_); return r_; }
     return ray_error("type", "ratios expects a vector input, got %s", ray_type_name(x ? x->type : 0));
 }
 
@@ -8186,42 +8198,51 @@ ray_t* ray_fills_fn(ray_t* x) {
         }
         return out;
     }
+    if (ray_is_empty_list(x)) { ray_retain(x); return x; }   /* (list) in, (list) out (#1790) */
     return ray_error("type", "fills expects a vector or table input, got %s", ray_type_name(x ? x->type : 0));
 }
 
 ray_t* ray_sums_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_SUMS);
     if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_sums_op);
+    if (ray_is_empty_list(x)) { ray_retain(x); return x; }   /* (list) in, (list) out (#1790) */
     return ray_error("type", "sums expects a vector input, got %s", ray_type_name(x ? x->type : 0));
 }
 
 ray_t* ray_avgs_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_AVGS);
     if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_avgs_op);
+    ray_t* el_ = ray_empty_list_as(x, RAY_I64);   /* (list): as the empty I64 vector (#1790) */
+    if (el_) { ray_t* r_ = ray_avgs_fn(el_); ray_release(el_); return r_; }
     return ray_error("type", "avgs expects a vector input, got %s", ray_type_name(x ? x->type : 0));
 }
 
 ray_t* ray_mins_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_MINS);
     if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_mins_op);
+    if (ray_is_empty_list(x)) { ray_retain(x); return x; }   /* (list) in, (list) out (#1790) */
     return ray_error("type", "mins expects a vector input, got %s", ray_type_name(x ? x->type : 0));
 }
 
 ray_t* ray_maxs_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_MAXS);
     if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_maxs_op);
+    if (ray_is_empty_list(x)) { ray_retain(x); return x; }   /* (list) in, (list) out (#1790) */
     return ray_error("type", "maxs expects a vector input, got %s", ray_type_name(x ? x->type : 0));
 }
 
 ray_t* ray_prds_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_PRDS);
     if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_prds_op);
+    if (ray_is_empty_list(x)) { ray_retain(x); return x; }   /* (list) in, (list) out (#1790) */
     return ray_error("type", "prds expects a vector input, got %s", ray_type_name(x ? x->type : 0));
 }
 
 ray_t* ray_differ_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_DIFFER);
     if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_differ_op);
+    ray_t* el_ = ray_empty_list_as(x, RAY_I64);   /* (list): as the empty I64 vector (#1790) */
+    if (el_) { ray_t* r_ = ray_differ_fn(el_); ray_release(el_); return r_; }
     return ray_error("type", "differ expects a vector input, got %s", ray_type_name(x ? x->type : 0));
 }
 
@@ -8342,8 +8363,11 @@ ray_t* ray_rand_fn(ray_t* a, ray_t* b) {
 
 /* (bin sorted-vec val) → rightmost index where sorted[i] <= val, -1 if none */
 ray_t* ray_bin_fn(ray_t* sorted, ray_t* val) {
-    if (!ray_is_vec(sorted) || sorted->type != RAY_I64)
+    if (!ray_is_vec(sorted) || sorted->type != RAY_I64) {
+        ray_t* el_ = ray_empty_list_as(sorted, RAY_I64);   /* (list): as the empty I64 vector (#1790) */
+        if (el_) { ray_t* r_ = ray_bin_fn(el_, val); ray_release(el_); return r_; }
         return ray_error("type", "bin: sorted arg must be an i64 vector, got %s", ray_type_name(sorted->type));
+    }
     int64_t* d = (int64_t*)ray_data(sorted);
     int64_t n = sorted->len;
 
@@ -8381,8 +8405,11 @@ ray_t* ray_bin_fn(ray_t* sorted, ray_t* val) {
 
 /* (binr sorted-vec val) → leftmost index where sorted[i] >= val */
 ray_t* ray_binr_fn(ray_t* sorted, ray_t* val) {
-    if (!ray_is_vec(sorted) || sorted->type != RAY_I64)
+    if (!ray_is_vec(sorted) || sorted->type != RAY_I64) {
+        ray_t* el_ = ray_empty_list_as(sorted, RAY_I64);   /* (list): as the empty I64 vector (#1790) */
+        if (el_) { ray_t* r_ = ray_binr_fn(el_, val); ray_release(el_); return r_; }
         return ray_error("type", "binr: sorted arg must be an i64 vector, got %s", ray_type_name(sorted->type));
+    }
     int64_t* d = (int64_t*)ray_data(sorted);
     int64_t n = sorted->len;
 

@@ -3370,9 +3370,12 @@ static inline bool where_cancelled(ray_pool_t* pool) {
 }
 
 ray_t* ray_where_fn(ray_t* x) {
-    if (!ray_is_vec(x) || x->type != RAY_BOOL)
+    if (!ray_is_vec(x) || x->type != RAY_BOOL) {
+        ray_t* el_ = ray_empty_list_as(x, RAY_BOOL);   /* (list): as the empty B8 vector (#1790) */
+        if (el_) { ray_t* r_ = ray_where_fn(el_); ray_release(el_); return r_; }
         return ray_error("type", "where: argument must be a B8 vector, got %s%s",
                          ray_type_name(x->type), ray_is_atom(x) ? " atom" : "");
+    }
     const uint8_t* data = (const uint8_t*)ray_data(x);
     int64_t n = x->len;
 
@@ -5349,8 +5352,12 @@ ray_t* ray_ungroup_fn(ray_t* x) {
 
 /* (within vals [lo hi]) -> bool vector, true where lo <= val <= hi */
 ray_t* ray_within_fn(ray_t* vals, ray_t* range) {
-    if (!ray_is_vec(vals) || !ray_is_vec(range))
+    if (!ray_is_vec(vals) || !ray_is_vec(range)) {
+        /* (list) values: as the empty vector of the range's type (#1790) */
+        ray_t* el_ = ray_is_vec(range) ? ray_empty_list_as(vals, range->type) : NULL;
+        if (el_) { ray_t* r_ = ray_within_fn(el_, range); ray_release(el_); return r_; }
         return ray_error("type", "within: vals and range must be vectors, got %s and %s", ray_type_name(vals->type), ray_type_name(range->type));
+    }
     if (range->len != 2)
         return ray_error("length", "within: range must have 2 elements, got %lld", (long long)range->len);
     int64_t n = vals->len;

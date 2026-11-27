@@ -14,20 +14,22 @@
 (type (at z 'd)) -- 'F64
 (type (at z 'a)) -- 'F64
 
-;; Aliases take the generic unary route. Empty LIST aggregates reject direct
-;; invocation, but zero groups must not invoke an aggregate semantically.
+;; Aliases take the generic unary route.  Zero groups infer the column from
+;; the aggregate over the column's empty slice, here an empty LIST: min and
+;; max reject it (a LIST column), avg answers 0Nf for it (#1790, an F64
+;; column).
 (set empty_avg avg)
 (set empty_min min)
 (set empty_max max)
 (set t (table [k v] (list ["a" "b"] (list [1 2] [3 4]))))
 (set z (select {from:t by:k where:(== k "missing") a:(empty_avg v) lo:(empty_min v) hi:(empty_max v)}))
 (count z) -- 0
-(type (at z 'a)) -- 'LIST
+(type (at z 'a)) -- 'F64
 (type (at z 'lo)) -- 'LIST
 (type (at z 'hi)) -- 'LIST
 (set z (select {from:t by:k where:(== k "missing") c:(count k) a:(empty_avg v)}))
 (count z) -- 0
-(type (at z 'a)) -- 'LIST
+(type (at z 'a)) -- 'F64
 ;; Inference still succeeds for an alias with a typed source.
 (set empty_med med)
 (set t (table [k v] (list [1 2] (as 'TIME [1 2]))))

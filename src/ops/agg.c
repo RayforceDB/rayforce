@@ -1043,7 +1043,8 @@ ray_t* ray_avg_fn(ray_t* x) {
     }
     if (!is_list(x)) return ray_error("type", "avg expects a numeric vector, atom, or list, got %s", ray_type_name(x->type));
     int64_t len = ray_len(x);
-    if (len == 0) return ray_error("domain", "avg: empty list has no average");
+    /* the answer for every empty vector but a TIMESPAN one (#1790) */
+    if (len == 0) return ray_typed_null(-RAY_F64);
     ray_t** elems = (ray_t**)ray_data(x);
     double sum = 0.0;
     int64_t cnt = 0;

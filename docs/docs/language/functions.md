@@ -165,7 +165,12 @@ embedding model and Datalog program handles also remain boxed: their integer pay
 represent the handle's resource ownership. Mixed atom types (including
 integers mixed with floats), nested results and untyped `null` results
 remain a `LIST`. Empty input returns an empty `LIST`, since there is no
-result type to infer. A binary map with a scalar third argument still calls
+result type to infer. A builtin that takes a typed vector takes that empty
+`LIST` too: it gives what it gives an empty vector when every type it takes
+gives the same answer (`(where (list))` is `[]`, as `(where (as 'B8 []))`
+is), the empty `LIST` itself when its vector answer would take a type from
+its input (`(asc (list))`, `(sums (list))`), and `avg` gives `0Nf`; a
+non-empty `LIST` is still rejected. A binary map with a scalar third argument still calls
 the function once and returns its result directly. Callbacks run left to
 right, exactly once per input element; an error stops the walk. A later type
 mismatch converts the collected prefix to a list without repeating
