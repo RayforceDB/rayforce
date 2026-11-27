@@ -451,6 +451,7 @@ static test_result_t test_cow_take_sites_fail(void) {
         "(set Db9 (assert-fact (assert-fact (datoms) 1 'age 30) 2 'age 40))",
         "(set E9 (table [src dst] (list [0 1 2] [1 2 0])))",
         "(set V9 (list [1.0 0.0] [0.0 1.0] [1.0 1.0] [0.5 0.5]))",
+        "(set Z9 (.idx.zone [1.5 2.5 -3.0]))",
     };
     for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
         ray_t* r = ray_eval_str(setup[i]);
@@ -495,6 +496,8 @@ static test_result_t test_cow_take_sites_fail(void) {
         { "(.graph.info (.graph.build E9 'src 'dst))", false },                       /* ops/graph_builtin.c */
         { "(.mc.stats)", false },                                                     /* core/mcast.c */
         { "(count (.emb.hnsw.info (.emb.hnsw.build V9 'l2 8 100)))", false },         /* ops/embedding.c */
+        { "(.idx.info Z9)", false },                                                  /* ops/idxop.c, a float zone */
+        { "(.json.get [\"{\\\"a\\\":\\\"a string longer than inline one\\\"}\" \"{\\\"a\\\":\\\"another string longer than inline\\\"}\" \"{\\\"b\\\":1}\"] \"a\" 'STR)", false },   /* io/json.c, typed STR */
     };
     for (size_t i = 0; i < sizeof qs / sizeof *qs; i++)
         TEST_ASSERT_FMT(take_sweep_one(qs[i].q, qs[i].text) >= 0, "%s: an allocation failure answered other than the answer or oom keeping nothing", qs[i].q);
@@ -520,7 +523,7 @@ static test_result_t test_cow_take_sites_fail(void) {
     snprintf(q, sizeof q, "(count (.db.splayed.set \"%s/w/\" T9))", dir);               /* store/splay.c */
     TEST_ASSERT_FMT(take_sweep_one(q, false) >= 0, "%s", q);
     (void)ray_test_rm_rf(dir);
-    ray_t* z = ray_eval_str("(do (set T9 0) (set Db9 0) (set E9 0) (set V9 0))");
+    ray_t* z = ray_eval_str("(do (set T9 0) (set Db9 0) (set E9 0) (set V9 0) (set Z9 0))");
     if (z && !RAY_IS_ERR(z)) ray_release(z);
     PASS();
 }

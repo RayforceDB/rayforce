@@ -1332,8 +1332,9 @@ static ray_t* json_typed_vec(ray_t* list, int8_t t) {
     for (int64_t i = 0; out && !RAY_IS_ERR(out) && i < n; i++) {
         int k = json_kind(it[i]);
         if (t == RAY_STR) {
-            out = k == JK_STR ? ray_str_vec_append(out, ray_str_ptr(it[i]), ray_str_len(it[i]))
-                              : ray_str_vec_append(out, "", 0);
+            /* one consuming write: a failure releases out, never leaves it */
+            out = ray_str_vec_append_take(out, k == JK_STR ? ray_str_ptr(it[i]) : "",
+                                          k == JK_STR ? ray_str_len(it[i]) : 0);
         } else if (t == RAY_I64) {
             int64_t x = k == JK_INT ? it[i]->i64 : NULL_I64;
             any_null |= x == NULL_I64;
