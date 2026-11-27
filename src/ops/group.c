@@ -475,6 +475,13 @@ static inline void out_col_adopt_str_pool(ray_t* dst, const ray_t* src) {
         dst->str_pool = owner->str_pool;
     }
 }
+#ifdef DEBUG
+_Thread_local int64_t g_holistic_fail_nth;
+_Thread_local int64_t g_holistic_fail_regions;
+void ray_holistic_alloc_fail_for_test(int64_t nth) { g_holistic_fail_nth = nth; g_holistic_fail_regions = 0; }
+int64_t ray_holistic_fail_regions_for_test(void) { return g_holistic_fail_regions; }
+#endif
+
 /* WIDE_CANCELLED: the scan saw a cancel (#1780), apart from -1, no row. */
 #define WIDE_CANCELLED (-2)
 /* Scan rows [optionally via sel] and return the winning row index for
@@ -18691,10 +18698,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* Row-gathered min/max/first/last cannot be represented in
          * emit_agg_columns' fixed-width accumulator slots.  Recompute those
          * 1-row columns by materialising the winning row — mirroring
-         * exec_reduction — and override them in the result table.  A cancel
-         * in these recomputes, or in the holistic ones below, is the answer
-         * (#1780): the columns it left are the integer default, not the
-         * aggregate. */
+         * exec_reduction — and override them in the result table.  A failure
+         * in these recomputes, or in the holistic ones below (a cancel,
+         * #1780; an allocation), is the answer: the columns it left are the
+         * integer default, not the aggregate. */
         ray_t* recompute_err = NULL;
         for (uint32_t a = 0; a < n_aggs && !recompute_err; a++) {
             uint16_t aop = ext->agg_ops[a];
@@ -18706,7 +18713,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 ray_rowsel_t* sm = ray_rowsel_meta(g->selection);
                 if (sm && sm->nrows == nrows) {
                     wsel_blk = ray_rowsel_to_indices(g->selection);
-                    wsel = wsel_blk ? (const int64_t*)ray_data(wsel_blk) : NULL;
+                    if (!wsel_blk) { recompute_err = ray_error("oom", NULL); break; }
+                    wsel = (const int64_t*)ray_data(wsel_blk);
                     wscan = sm->total_pass;
                 }
             }
@@ -18717,7 +18725,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_t* col = agg_vecs[a]->type == RAY_LIST
                 ? ray_list_new(1)
                 : col_vec_new(agg_vecs[a], 1);
-            if (col && !RAY_IS_ERR(col)) {
+            if (!col || RAY_IS_ERR(col)) {
+                ray_release(atom);
+                recompute_err = col ? col : ray_error("oom", NULL);
+                break;
+            }
+            {
                 col->len = 1;
                 if (agg_vecs[a]->type == RAY_LIST) {
                     /* agg_wide_reduce returned an owned child reference,
@@ -18731,7 +18744,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     ray_vec_set_null(col, 0, true);
                 } else if (agg_vecs[a]->type == RAY_STR) {
                     ray_t* nv = ray_str_vec_set(col, 0, ray_str_ptr(atom), ray_str_len(atom));
-                    if (nv && !RAY_IS_ERR(nv)) col = nv;
+                    if (!nv || RAY_IS_ERR(nv)) {   /* col is still the caller's */
+                        ray_release(col); ray_release(atom);
+                        recompute_err = nv ? nv : ray_error("oom", NULL);
+                        break;
+                    }
+                    col = nv;
                 } else {
                     store_typed_elem(col, 0, atom);
                 }
@@ -18754,18 +18772,21 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     ext->agg_ops[a] == OP_QUANTILE ||
                     ext->agg_ops[a] == OP_MODE) { any_rank = true; break; }
             if (any_rank && !recompute_err) {
+                HOLISTIC_FAIL_ARM();
                 ray_t* hsel_blk = NULL; const int64_t* hsel = NULL; int64_t hscan = nrows;
                 if (g->selection) {
                     ray_rowsel_t* sm = ray_rowsel_meta(g->selection);
                     if (sm && sm->nrows == nrows) {
                         hsel_blk = ray_rowsel_to_indices(g->selection);
-                        hsel = hsel_blk ? (const int64_t*)ray_data(hsel_blk) : NULL;
+                        if (!hsel_blk) recompute_err = ray_error("oom", NULL);
+                        else hsel = (const int64_t*)ray_data(hsel_blk);
                         hscan = sm->total_pass;
                     }
                 }
                 ray_t* ix_hdr = NULL;
-                int64_t* idxb = (int64_t*)scratch_alloc(&ix_hdr,
+                int64_t* idxb = recompute_err ? NULL : (int64_t*)scratch_alloc(&ix_hdr,
                     (size_t)(hscan > 0 ? hscan : 1) * sizeof(int64_t));
+                if (!idxb && !recompute_err) recompute_err = ray_error("oom", NULL);
                 if (idxb) {
                     /* selection branch hoisted out of the fill loop */
                     if (hsel) { for (int64_t i = 0; i < hscan; i++) idxb[i] = hsel[i]; }
@@ -18787,15 +18808,16 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                         } else {
                             continue;
                         }
-                        if (hv && RAY_IS_ERR(hv) && strcmp(ray_err_code(hv), "cancel") == 0) {
-                            recompute_err = hv; break;
-                        }
-                        if (hv && !RAY_IS_ERR(hv)) ray_table_set_col_idx(result, a, hv);
+                        /* NULL: a type the kernel does not take, the column
+                         * as emitted; an error (oom, cancel) is the answer */
+                        if (hv && RAY_IS_ERR(hv)) { recompute_err = hv; break; }
+                        if (hv) ray_table_set_col_idx(result, a, hv);
                         if (hv) ray_release(hv);
                     }
                     scratch_free(ix_hdr);
                 }
                 if (hsel_blk) ray_release(hsel_blk);
+                HOLISTIC_FAIL_DISARM();
             }
         }
 
@@ -21942,7 +21964,13 @@ v2_emit:;
             ray_t* rg_hdr = NULL;
             int64_t* row_gid = (int64_t*)scratch_alloc(&rg_hdr,
                 (size_t)nrows * sizeof(int64_t));
-            if (!row_gid) { result = ray_error("oom", NULL); goto cleanup; }
+            /* An exit before the columns are attached discards the result
+             * under construction, as the R-FAIL exit below does. */
+            #define HOL_DISCARD_RESULT() do { \
+                for (uint32_t k_ = 0; k_ < n_keys; k_++) if (key_cols[k_]) ray_release(key_cols[k_]); \
+                for (uint32_t a_ = 0; a_ < n_aggs; a_++) if (agg_cols[a_]) ray_release(agg_cols[a_]); \
+                ray_release(result); } while (0)
+            if (!row_gid) { HOL_DISCARD_RESULT(); result = ray_error("oom", NULL); goto cleanup; }
             memset(row_gid, 0xff, (size_t)nrows * sizeof(int64_t));
 
             uint8_t reprobe_nullable = 0;   /* 0/1: any key may be null */
@@ -21971,7 +21999,7 @@ v2_emit:;
             if (ght_layout.any_wide_key) {
                 rp.key_pool = (const void**)scratch_alloc(&rp_kp_hdr,
                     (size_t)n_keys * sizeof(void*));
-                if (!rp.key_pool) { scratch_free(rg_hdr); result = ray_error("oom", NULL); goto cleanup; }
+                if (!rp.key_pool) { scratch_free(rg_hdr); HOL_DISCARD_RESULT(); result = ray_error("oom", NULL); goto cleanup; }
                 derive_key_pool(&ght_layout, key_vecs, rp.key_pool);
             }
             ray_scan_fail_init(&ht_fail);
@@ -22066,6 +22094,7 @@ v2_emit:;
                     uint16_t aop = ext->agg_ops[a];
                     ray_t* hol_vec = NULL;
                     const char* err_tag = "median: type";
+                    HOLISTIC_FAIL_ARM();
                     if (aop == OP_MEDIAN) {
                         hol_vec = ray_median_per_group_buf(
                             agg_vecs[a], idx_buf, offsets, grp_cnt, n_groups);
@@ -22093,6 +22122,7 @@ v2_emit:;
                             agg_vecs[a], aop, idx_buf, offsets, grp_cnt, n_groups);
                         err_tag = "minmax: type";
                     }
+                    HOLISTIC_FAIL_DISARM();
                     if (!hol_vec) {
                         if (hist_hdr) scratch_free(hist_hdr);
                         if (cur_hdr)  scratch_free(cur_hdr);
@@ -22100,6 +22130,7 @@ v2_emit:;
                         if (off_hdr)  scratch_free(off_hdr);
                         if (idx_hdr)  scratch_free(idx_hdr);
                         scratch_free(rg_hdr);
+                        HOL_DISCARD_RESULT();
                         result = ray_error("nyi", err_tag);
                         goto cleanup;
                     }
@@ -22110,6 +22141,7 @@ v2_emit:;
                         if (off_hdr)  scratch_free(off_hdr);
                         if (idx_hdr)  scratch_free(idx_hdr);
                         scratch_free(rg_hdr);
+                        HOL_DISCARD_RESULT();
                         result = hol_vec;
                         goto cleanup;
                     }
@@ -22130,6 +22162,7 @@ v2_emit:;
                 if (off_hdr)  scratch_free(off_hdr);
                 if (idx_hdr)  scratch_free(idx_hdr);
                 scratch_free(rg_hdr);
+                HOL_DISCARD_RESULT();
                 result = ray_error("oom", NULL);
                 goto cleanup;
             }
@@ -22140,6 +22173,7 @@ v2_emit:;
             if (off_hdr)  scratch_free(off_hdr);
             if (idx_hdr)  scratch_free(idx_hdr);
             scratch_free(rg_hdr);
+            #undef HOL_DISCARD_RESULT
         }
 
         /* Finalize null flags after parallel execution.  Holistic slots
@@ -22351,10 +22385,12 @@ sequential_fallback:;
      * Built lazily on first need and reused across all median slots. */
     ray_t** med_out = NULL;
     ray_t* med_hdr = NULL;
-    ray_t* hol_err = NULL;   /* the reprobe's range error or a cancel */
+    ray_t* hol_err = NULL;   /* the reprobe's range error, a cancel or an oom */
     if (ly->agg_flags_any & GHT_AF_HOLISTIC) {
+        HOLISTIC_FAIL_ARM();
         med_out = (ray_t**)scratch_calloc(&med_hdr,
             (size_t)n_aggs * sizeof(ray_t*));
+        if (!med_out) hol_err = ray_error("oom", NULL);
         if (med_out) {
             /* Build row_gid + grp_cnt + idx_buf sequentially.  The
              * seq path runs at small nrows so a single-thread pass is
@@ -22372,6 +22408,7 @@ sequential_fallback:;
             ray_t* pos_hdr_s = NULL;
             int64_t* pos_s = (int64_t*)scratch_alloc(&pos_hdr_s,
                 (size_t)grp_count * sizeof(int64_t));
+            if (!(row_gid && grp_cnt_s && offsets_s && pos_s)) hol_err = ray_error("oom", NULL);
             if (row_gid && grp_cnt_s && offsets_s && pos_s) {
                 uint8_t reprobe_nullable_s = 0;   /* 0/1: any key may be null */
                 for (uint32_t k = 0; k < n_keys; k++)
@@ -22385,9 +22422,10 @@ sequential_fallback:;
                     reprobe_pool = (const void**)scratch_alloc(&hol_stage_hdr,
                         (size_t)n_keys * sizeof(void*));
                     if (!reprobe_pool) {
-                        scratch_free(rg_hdr); scratch_free(cnt_hdr_s);
-                        scratch_free(off_hdr_s); scratch_free(pos_hdr_s);
-                        result = ray_error("oom", NULL); goto cleanup;
+                        /* the fill's own exit: its buffers below, then the
+                         * columns and the result with hol_err */
+                        hol_err = ray_error("oom", NULL);
+                        goto hol_fill_done;
                     }
                 }
                 derive_key_pool(ly, key_vecs, reprobe_pool);
@@ -22427,6 +22465,7 @@ sequential_fallback:;
                 ray_t* ix_hdr_s = NULL;
                 int64_t* idx_buf_s = hol_err ? NULL : (int64_t*)scratch_alloc(&ix_hdr_s,
                     (size_t)(total_s > 0 ? total_s : 1) * sizeof(int64_t));
+                if (!idx_buf_s && !hol_err) hol_err = ray_error("oom", NULL);
                 if (idx_buf_s) {
                     for (int64_t i = 0; i < n_scan; i++) {
                         int64_t row = match_idx ? match_idx[i] : i;
@@ -22467,20 +22506,28 @@ sequential_fallback:;
                                 agg_vecs[a], aop, idx_buf_s, offsets_s,
                                 grp_cnt_s, (int64_t)grp_count);
                         }
-                        med_out[a] = hol_vec;  /* NULL or RAY_IS_ERR handled below */
+                        /* NULL: a type the kernel does not take, the
+                         * column skipped below; an error (oom, cancel) is
+                         * the answer */
+                        if (hol_vec && RAY_IS_ERR(hol_vec)) { hol_err = hol_vec; break; }
+                        med_out[a] = hol_vec;
                     }
                     scratch_free(ix_hdr_s);
                 }
                 scratch_free(hol_stage_hdr);   /* NULL (inline staging) → no-op */
             }
+        hol_fill_done:
             scratch_free(rg_hdr);
             scratch_free(cnt_hdr_s);
             scratch_free(off_hdr_s);
             scratch_free(pos_hdr_s);
         }
+        HOLISTIC_FAIL_DISARM();
     }
     if (hol_err) {
-        scratch_free(med_hdr);   /* no column was filled */
+        /* the columns filled before the failure */
+        for (uint32_t a = 0; med_out && a < n_aggs; a++) ray_release(med_out[a]);
+        scratch_free(med_hdr);
         ray_release(result);
         result = hol_err;
         goto cleanup;

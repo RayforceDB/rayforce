@@ -29863,6 +29863,7 @@ by_dict_done:
                          * loop below.  Uses out_groups so a preapplied
                          * take limits the work to the kept prefix. */
                         if (!agg_err && is_med_call(val_expr_item)) {
+                            HOLISTIC_FAIL_ARM();
                             ray_t* ix_hdr = NULL;
                             ray_t* off_hdr = NULL;
                             ray_t* cnt_hdr = NULL;
@@ -29889,10 +29890,14 @@ by_dict_done:
                                 }
                                 agg_vec = ray_median_per_group_buf(
                                     src_col_val, ix, off, cnt, out_groups);
+                                /* NULL: a type miss, the loop below; an
+                                 * error (oom, cancel) is the query's */
+                                if (agg_vec && RAY_IS_ERR(agg_vec)) { agg_err = agg_vec; agg_vec = NULL; }
                             }
                             if (ix_hdr) scratch_free(ix_hdr);
                             if (off_hdr) scratch_free(off_hdr);
                             if (cnt_hdr) scratch_free(cnt_hdr);
+                            HOLISTIC_FAIL_DISARM();
                         }
                         if (!agg_err && !agg_vec) {
                             for (int64_t gi = 0; gi < out_groups; gi++) {
@@ -30539,6 +30544,7 @@ by_dict_done:
                      * ray_median_per_group_buf kernel.  See twin site
                      * above for the design rationale. */
                     if (n_groups > 0 && is_med_call(val_expr_item)) {
+                        HOLISTIC_FAIL_ARM();
                         ray_t* ix_hdr = NULL;
                         ray_t* off_hdr = NULL;
                         ray_t* cnt_hdr = NULL;
@@ -30569,6 +30575,7 @@ by_dict_done:
                         if (ix_hdr) scratch_free(ix_hdr);
                         if (off_hdr) scratch_free(off_hdr);
                         if (cnt_hdr) scratch_free(cnt_hdr);
+                        HOLISTIC_FAIL_DISARM();
                         if (agg_vec && !RAY_IS_ERR(agg_vec)) {
                             ray_release(src_col_val);
                             agg_names[n_agg_out] = kid;
@@ -30576,13 +30583,23 @@ by_dict_done:
                             n_agg_out++;
                             continue;
                         }
-                        agg_vec = NULL;  /* type miss → fall through */
+                        if (agg_vec) {   /* an error (oom, cancel) is the query's */
+                            ray_release(src_col_val);
+                            for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
+                            scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
+                            ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return agg_vec;
+                        }
+                        /* NULL: a type miss → the per-group loop below */
                     }
 
+                    /* A group's error is the query's, as on the route above
+                     * (#1284): skipping it left the slot unwritten. */
+                    ray_t* agg_err = NULL;
                     for (int64_t gi = 0; gi < n_groups; gi++) {
                         ray_t* idx_list = grp_items[gi * 2 + 1];
                         ray_t* subset = ray_at_fn(src_col_val, idx_list);
-                        if (RAY_IS_ERR(subset)) continue;
+                        if (!subset || RAY_IS_ERR(subset)) { agg_err = subset ? subset : ray_error("oom", NULL); break; }
                         ray_t* agg_val = NULL;
                         ray_t* fn_obj = ray_env_get(agg_fn_name->i64);
                         if (fn_obj && fn_obj->type == RAY_UNARY) {
@@ -30592,16 +30609,32 @@ by_dict_done:
                         ray_release(subset);
                         if (agg_val && !RAY_IS_ERR(agg_val) && ray_is_lazy(agg_val))
                             agg_val = ray_lazy_materialize(agg_val);
-                        if (!agg_val || RAY_IS_ERR(agg_val)) continue;
+                        if (!agg_val || RAY_IS_ERR(agg_val)) {
+                            agg_err = agg_val ? agg_val : ray_error("domain", "select by: aggregation failed");
+                            break;
+                        }
 
                         if (!agg_vec) {
                             int8_t vt = -(agg_val->type);
                             agg_vec = ray_vec_new(vt, n_groups);
-                            if (RAY_IS_ERR(agg_vec)) { ray_release(agg_val); break; }
+                            if (!agg_vec || RAY_IS_ERR(agg_vec)) {
+                                ray_release(agg_val);
+                                agg_err = agg_vec ? agg_vec : ray_error("oom", NULL);
+                                agg_vec = NULL;
+                                break;
+                            }
                             agg_vec->len = n_groups;
                         }
                         store_typed_elem(agg_vec, gi, agg_val);
                         ray_release(agg_val);
+                    }
+                    if (agg_err) {
+                        if (agg_vec) ray_release(agg_vec);
+                        ray_release(src_col_val);
+                        for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
+                        scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
+                        ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return agg_err;
                     }
                     if (!agg_vec && n_groups == 0) agg_vec = empty_agg_column(agg_fn_name, src_col_val);
                     ray_release(src_col_val);

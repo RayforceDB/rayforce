@@ -3512,6 +3512,97 @@ static int64_t aw_live_blocks(void) {
     return (int64_t)st.alloc_count - (int64_t)st.free_count;
 }
 
+/* A failed allocation in a median, quantile or mode answers `oom`, never a
+ * table with the aggregate's default column or without it.  The whole-table
+ * recompute after the shared reduction kept the integer default (0) when
+ * its per-group kernel or its row-index buffer failed, and the grouped
+ * holistic fill dropped the column.  The seam fails the nth allocation of
+ * the code that computes those columns (HOLISTIC_FAIL_ARM, ops/internal.h),
+ * for n = 1 to 48: each run answers `oom` or the reference answer, and
+ * keeps nothing.  "Keeps nothing" is the process's allocation trace over
+ * the run, its answer's release and a GC (every heap, workers' too): the
+ * calling thread's own count misses a block a worker allocated and keeps,
+ * and counts one it frees for a worker as a free (#1804 review). */
+static test_result_t test_holistic_oom(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    aw_eval_ok("(set i (til 262144))");
+    aw_eval_ok("(set T (table [k v] (list (% i 1000) (+ 17 (% (* i 7919) 100003)))))");
+    aw_eval_ok("(set S (table [k v] (list (% (til 2000) 10) (+ 17 (% (* (til 2000) 7919) 1003)))))");
+    aw_eval_ok("(set U (table [k v s] (list (% (til 20000) 100) (+ 17 (% (* (til 20000) 7919) 100003)) (as 'SYM (% (til 20000) 50)))))");
+    /* nine keys: the hash route's fill carves its key-pool table (> 8) */
+    aw_eval_ok("(set w2 (% (til 2000) 2))");
+    aw_eval_ok("(set w3 (% (til 2000) 3))");
+    aw_eval_ok("(set W (table [a b c d e f g h j v] (list w2 w3 w2 w3 w2 w3 w2 w3 w2 (til 2000))))");
+    /* a global vector key: select-by's eval-level route over a dict of groups */
+    aw_eval_ok("(set K (% (til 2000) 13))");
+    static const char* const qs[] = {
+        "(select {m: (med v) t: (sum v) from: T})",
+        "(select {m: (quantile v 0.5) t: (sum v) from: T})",
+        "(select {m: (mode v) t: (sum v) from: T})",
+        "(select {m: (med v) t: (sum v) from: T where: (> v 100)})",
+        "(select {m: (med v) t: (sum v) from: T by: k})",
+        "(select {m: (quantile v 0.25) from: T by: k})",
+        "(select {m: (mode v) from: T by: k})",
+        "(select {m: (med v) t: (sum v) from: S by: k})",
+        "(select {m: (mode v) from: S by: k})",
+        /* eval-level grouping: a non-aggregate output over two keys */
+        "(select {m: (med v) x: (+ v 1) from: U by: [k s]})",
+        "(select {m: (med v) from: W by: [a b c d e f g h j]})",
+        "(select {m: (med v) x: (+ v 1) from: S by: K})",
+    };
+    /* with the v2 group engine (agg_indexed_run's kernels) and without it
+     * (exec_group's holistic fills) */
+    for (int v2 = 1; v2 >= 0; v2--)
+    for (size_t q = 0; q < sizeof qs / sizeof *qs; q++) {
+        ray_agg_engine_v2 = v2;
+        char setq[200];
+        snprintf(setq, sizeof setq, "(set R0 %s)", qs[q]);
+        aw_eval_ok(setq);
+        int failed = 0;
+        int64_t regions = 0;
+        for (int64_t n = 1; n <= 48; n++) {
+            ray_heap_gc();
+            bool traced = ray_mem_trace_begin();
+            ray_holistic_alloc_fail_for_test(n);
+            ray_t* got = aw_eval(qs[q]);
+            regions = ray_holistic_fail_regions_for_test();
+            ray_holistic_alloc_fail_for_test(0);
+            if (got && RAY_IS_ERR(got)) {
+                char code[32];
+                snprintf(code, sizeof code, "%s", ray_err_code(got));
+                ray_error_free(got);
+                ray_heap_gc();
+                ray_mem_trace_t tr = {0};
+                if (traced) ray_mem_trace_end(&tr);
+                int64_t kept = tr.net_bytes;
+                if (!traced || strcmp(code, "oom") != 0 || kept > 0) ray_agg_engine_v2 = true;
+                TEST_ASSERT_FMT(traced, "no allocation trace");
+                TEST_ASSERT_FMT(strcmp(code, "oom") == 0, "%s (v2 %d), allocation %lld fails: %s, not oom", qs[q], v2, (long long)n, code);
+                TEST_ASSERT_FMT(kept <= 0, "%s (v2 %d), allocation %lld fails: %lld bytes kept", qs[q], v2, (long long)n, (long long)kept);
+                failed++;
+                continue;
+            }
+            if (traced) { ray_mem_trace_t t0; ray_mem_trace_end(&t0); }
+            if (!got) ray_agg_engine_v2 = true;
+            TEST_ASSERT_NOT_NULL(got);
+            ray_env_set(ray_sym_intern("Q", 1), got);
+            ray_release(got);
+            ray_t* v = ray_eval_str("(and (== (count (ser Q)) (count (ser R0))) (all (== (ser Q) (ser R0))))");
+            bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+            if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+            if (!ok) ray_agg_engine_v2 = true;
+            TEST_ASSERT_FMT(ok, "%s (v2 %d), allocation %lld fails: an answer, not the reference", qs[q], v2, (long long)n);
+        }
+        if (regions <= 0 || failed <= 0) ray_agg_engine_v2 = true;
+        TEST_ASSERT_FMT(regions > 0, "%s (v2 %d): never reached a holistic region", qs[q], v2);
+        TEST_ASSERT_FMT(failed > 0, "%s (v2 %d): no allocation failed", qs[q], v2);
+    }
+    ray_agg_engine_v2 = true;
+    aw_eval_ok("(set Q 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set T 0)"); aw_eval_ok("(set S 0)"); aw_eval_ok("(set U 0)"); aw_eval_ok("(set W 0)"); aw_eval_ok("(set w2 0)"); aw_eval_ok("(set w3 0)"); aw_eval_ok("(set K 0)"); aw_eval_ok("(set i 0)");
+    PASS();
+}
+
 /* #1780: a cancel that lands while a group runs answers `cancel`, never
  * `oom` and never an answer it did not finish.  For each query, the nth
  * pool dispatch finds the query cancelled (mode 0: a cancel request; mode
@@ -6566,6 +6657,7 @@ const test_entry_t aware_entries[] = {
     { "aware/sort_head_late_chunked", test_sort_head_late_chunked, aw_setup, aw_teardown },
     { "aware/topk_cancel_at_dispatch", test_topk_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/group_cancel_status", test_group_cancel_status, aw_setup, aw_teardown },
+    { "aware/holistic_oom", test_holistic_oom, aw_setup, aw_teardown },
     { "aware/sel_compact_cancel_at_dispatch", test_sel_compact_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/distinct_str_cancel", test_distinct_str_cancel, aw_setup, aw_teardown },
     { "aware/group_keys_only_cancel", test_group_keys_only_cancel, aw_setup, aw_teardown },

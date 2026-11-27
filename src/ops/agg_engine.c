@@ -11797,12 +11797,15 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * scattered rows: a cold mapped column is requested first, whole
          * (scan read-ahead). */
         if (src && ray_pool_scan_on()) ray_col_want_rows(src, rows, nrows);
-        if (kind == OP_MEDIAN) col = ray_median_per_group_buf(src, rows, offsets, counts, ng);
-        else if (kind == OP_QUANTILE) {
-            double q = 0.5; if (ext->agg_k) memcpy(&q, &param, sizeof(q));
-            col = ray_quantile_per_group_buf(src, rows, offsets, counts, ng, q);
-        } else if (kind == OP_MODE) col = ray_mode_per_group_buf(src, rows, offsets, counts, ng);
-        else if (kind == OP_TOP_N || kind == OP_BOT_N)
+        if (kind == OP_MEDIAN || kind == OP_QUANTILE || kind == OP_MODE) {
+            HOLISTIC_FAIL_ARM();
+            if (kind == OP_MEDIAN) col = ray_median_per_group_buf(src, rows, offsets, counts, ng);
+            else if (kind == OP_QUANTILE) {
+                double q = 0.5; if (ext->agg_k) memcpy(&q, &param, sizeof(q));
+                col = ray_quantile_per_group_buf(src, rows, offsets, counts, ng, q);
+            } else col = ray_mode_per_group_buf(src, rows, offsets, counts, ng);
+            HOLISTIC_FAIL_DISARM();
+        } else if (kind == OP_TOP_N || kind == OP_BOT_N)
             col = ray_topk_per_group_buf(src, param, kind == OP_TOP_N, rows, offsets, counts, ng);
         else if (agg_indexed_supported(kind, src ? src->type : RAY_I64)) {
             col = ray_wide_minmax_per_group_buf(src, kind, rows, offsets, counts, ng);
