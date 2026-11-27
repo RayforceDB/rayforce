@@ -25,31 +25,31 @@
 ;; (0,0)→(1,0) dispatch in src/ops/temporal.c.  Nulls in the I64 result
 ;; flow through as 0Nl.
 (set TPn (table [ts] (list (as 'TIMESTAMP [86400000000000 0N 172800000000000]))))
-(at (at (select {y: (year ts) from: TPn}) 'y) 0)        -- 2000
-(at (at (select {y: (year ts) from: TPn}) 'y) 1)        -- 0Nl
-(at (at (select {m: (month ts) from: TPn}) 'm) 1)       -- 0Nl
-(at (at (select {h: (hour ts) from: TPn}) 'h) 1)        -- 0Nl
+(at (at (select {y: (yyyy ts) from: TPn}) 'y) 0)        -- 2000
+(at (at (select {y: (yyyy ts) from: TPn}) 'y) 1)        -- 0Nl
+(at (at (select {m: (mm ts) from: TPn}) 'm) 1)       -- 0Nl
+(at (at (select {h: (hh ts) from: TPn}) 'h) 1)        -- 0Nl
 (at (at (select {n: (minute ts) from: TPn}) 'n) 1)      -- 0Nl
-(at (at (select {s: (second ts) from: TPn}) 's) 1)      -- 0Nl
+(at (at (select {s: (ss ts) from: TPn}) 's) 1)      -- 0Nl
 
 ;; DATE column with embedded null.  IN32=1, HAS_NULLS=1 dispatch path.
 ;; Days since 2000-01-01 = 8766 → 2024-01-01; the null slot at index 1
 ;; remains null in the I64 output.
 (set TDn (table [d] (list (as 'DATE [8766 0N 8767]))))
-(at (at (select {y: (year d) from: TDn}) 'y) 0)         -- 2024
-(at (at (select {y: (year d) from: TDn}) 'y) 1)         -- 0Nl
-(at (at (select {dd: (day d) from: TDn}) 'dd) 1)        -- 0Nl
-(at (at (select {dy: (dayofyear d) from: TDn}) 'dy) 1)  -- 0Nl
+(at (at (select {y: (yyyy d) from: TDn}) 'y) 0)         -- 2024
+(at (at (select {y: (yyyy d) from: TDn}) 'y) 1)         -- 0Nl
+(at (at (select {dd: (dd d) from: TDn}) 'dd) 1)        -- 0Nl
+(at (at (select {dy: (doy d) from: TDn}) 'dy) 1)  -- 0Nl
 
 ;; TIME column with embedded null.  IN32=1, HAS_NULLS=1, in_type=RAY_TIME so
 ;; the IN32 ternary picks the `raw32 * 1000` arm (vs DATE's `* USEC_PER_DAY`).
 ;; Previously this entire combination ran 0 hits.
 (set TTn (table [t] (list (as 'TIME [3723000 0N 86399000]))))
-(at (at (select {h: (hour t) from: TTn}) 'h) 0)         -- 1
-(at (at (select {h: (hour t) from: TTn}) 'h) 1)         -- 0Nl
-(at (at (select {h: (hour t) from: TTn}) 'h) 2)         -- 23
+(at (at (select {h: (hh t) from: TTn}) 'h) 0)         -- 1
+(at (at (select {h: (hh t) from: TTn}) 'h) 1)         -- 0Nl
+(at (at (select {h: (hh t) from: TTn}) 'h) 2)         -- 23
 (at (at (select {n: (minute t) from: TTn}) 'n) 0)       -- 2
-(at (at (select {s: (second t) from: TTn}) 's) 0)       -- 3
+(at (at (select {s: (ss t) from: TTn}) 's) 0)       -- 3
 
 ;; ──────────────────────── exec_date_trunc (HAS_NULLS=1) ─────────────────────
 ;; TIMESTAMP column with embedded null routed through `.date` (DAY bucket).
@@ -77,8 +77,8 @@
 ;; in EXTRACT_INNER's `days_since_2000` block (year-decompose branch).
 ;; 1999-12-31 = -1 day relative to the 2000 epoch.
 (set TPre (table [d] (list (as 'DATE [1999.12.31 2000.01.01]))))
-(at (at (select {y: (year d) from: TPre}) 'y) 0)        -- 1999
-(at (at (select {y: (year d) from: TPre}) 'y) 1)        -- 2000
+(at (at (select {y: (yyyy d) from: TPre}) 'y) 0)        -- 1999
+(at (at (select {y: (yyyy d) from: TPre}) 'y) 1)        -- 2000
 
 ;; ─────────── pre-epoch TIMESTAMP in DAG (EXTRACT_INNER negative ns) ──────────
 ;; 1999-12-31T23:30:45 stored as negative ns relative to 2000-01-01.
@@ -88,20 +88,20 @@
 ;;   • EXTRACT_INNER line 393-395: day_us < 0 for MINUTE field
 ;;   • EXTRACT_INNER line 397-399: day_us < 0 for SECOND field
 (set TpreTS (table [ts] (list [1999.12.31D23:30:45.000000000 1999.12.30D00:00:00.000000000])))
-(at (at (select {h: (hour ts) from: TpreTS}) 'h) 0)     -- 23
-(at (at (select {h: (hour ts) from: TpreTS}) 'h) 1)     -- 0
+(at (at (select {h: (hh ts) from: TpreTS}) 'h) 0)     -- 23
+(at (at (select {h: (hh ts) from: TpreTS}) 'h) 1)     -- 0
 (at (at (select {mi: (minute ts) from: TpreTS}) 'mi) 0) -- 30
-(at (at (select {s: (second ts) from: TpreTS}) 's) 0)   -- 45
-(at (at (select {y: (year ts) from: TpreTS}) 'y) 0)     -- 1999
-(at (at (select {m: (month ts) from: TpreTS}) 'm) 0)    -- 12
+(at (at (select {s: (ss ts) from: TpreTS}) 's) 0)   -- 45
+(at (at (select {y: (yyyy ts) from: TpreTS}) 'y) 0)     -- 1999
+(at (at (select {m: (mm ts) from: TpreTS}) 'm) 0)    -- 12
 
 ;; ─────── leap year DOY in exec_extract (doy_jan++ branch, line 429) ──────────
 ;; 2024 is a leap year.  Dates in months > 2 must add 1 to doy_jan.
 ;; Exercises: EXTRACT_INNER line 429: mo > 2 && leap → doy_jan++
 (set TleapTS (table [ts] (list [2024.02.29D12:00:00.000000000 2024.03.01D00:00:00.000000000 2024.12.31D00:00:00.000000000])))
-(at (at (select {dy: (dayofyear ts) from: TleapTS}) 'dy) 0) -- 60
-(at (at (select {dy: (dayofyear ts) from: TleapTS}) 'dy) 1) -- 61
-(at (at (select {dy: (dayofyear ts) from: TleapTS}) 'dy) 2) -- 366
+(at (at (select {dy: (doy ts) from: TleapTS}) 'dy) 0) -- 60
+(at (at (select {dy: (doy ts) from: TleapTS}) 'dy) 1) -- 61
+(at (at (select {dy: (doy ts) from: TleapTS}) 'dy) 2) -- 366
 
 ;; ─────── DATE+HAS_NULLS with dd/dw/dy/minute (EXTRACT_INNER(1,1)) ────────────
 ;; DATE column bearing a null slot.  IN32=1, HAS_NULLS=1 dispatch (line 450).
@@ -109,24 +109,24 @@
 ;; day / dayofweek / dayofyear / minute to cover remaining EXTRACT_INNER arms.
 ;; 8766 = 2024-01-01 (Mon=1), 8767 = 2024-01-02.
 (set TDn2 (table [d] (list (as 'DATE [8766 0N 8767]))))
-(at (at (select {dd: (day d) from: TDn2}) 'dd) 0)           -- 1
-(at (at (select {dd: (day d) from: TDn2}) 'dd) 1)           -- 0Nl
-(at (at (select {dw: (dayofweek d) from: TDn2}) 'dw) 0)     -- 1
-(at (at (select {dw: (dayofweek d) from: TDn2}) 'dw) 1)     -- 0Nl
-(at (at (select {dy: (dayofyear d) from: TDn2}) 'dy) 0)     -- 1
-(at (at (select {dy: (dayofyear d) from: TDn2}) 'dy) 1)     -- 0Nl
+(at (at (select {dd: (dd d) from: TDn2}) 'dd) 0)           -- 1
+(at (at (select {dd: (dd d) from: TDn2}) 'dd) 1)           -- 0Nl
+(at (at (select {dw: (dow d) from: TDn2}) 'dw) 0)     -- 1
+(at (at (select {dw: (dow d) from: TDn2}) 'dw) 1)     -- 0Nl
+(at (at (select {dy: (doy d) from: TDn2}) 'dy) 0)     -- 1
+(at (at (select {dy: (doy d) from: TDn2}) 'dy) 1)     -- 0Nl
 (at (at (select {mi: (minute d) from: TDn2}) 'mi) 0)        -- 0
 (at (at (select {mi: (minute d) from: TDn2}) 'mi) 1)        -- 0Nl
 
 ;; TIME+HAS_NULLS with dd/dw/dy/minute — IN32=1, HAS_NULLS=1, in_type=RAY_TIME.
 ;; 3723000 ms = 01:02:03.000 (epoch day → day=1 dow=6 doy=1 from time zero).
 (set TTn2 (table [t] (list (as 'TIME [3723000 0N 86399000]))))
-(at (at (select {dd: (day t) from: TTn2}) 'dd) 0)           -- 1
-(at (at (select {dd: (day t) from: TTn2}) 'dd) 1)           -- 0Nl
-(at (at (select {dw: (dayofweek t) from: TTn2}) 'dw) 0)     -- 6
-(at (at (select {dw: (dayofweek t) from: TTn2}) 'dw) 1)     -- 0Nl
-(at (at (select {dy: (dayofyear t) from: TTn2}) 'dy) 0)     -- 1
-(at (at (select {dy: (dayofyear t) from: TTn2}) 'dy) 1)     -- 0Nl
+(at (at (select {dd: (dd t) from: TTn2}) 'dd) 0)           -- 1
+(at (at (select {dd: (dd t) from: TTn2}) 'dd) 1)           -- 0Nl
+(at (at (select {dw: (dow t) from: TTn2}) 'dw) 0)     -- 6
+(at (at (select {dw: (dow t) from: TTn2}) 'dw) 1)     -- 0Nl
+(at (at (select {dy: (doy t) from: TTn2}) 'dy) 0)     -- 1
+(at (at (select {dy: (doy t) from: TTn2}) 'dy) 1)     -- 0Nl
 (at (at (select {mi: (minute t) from: TTn2}) 'mi) 0)        -- 2
 (at (at (select {mi: (minute t) from: TTn2}) 'mi) 1)        -- 0Nl
 
@@ -172,16 +172,16 @@
 ;; -3723000000000 ns = 1999-12-31T22:57:57 (3723 s before midnight of 2000-01-01)
 ;; us = -3723000000 µs; day_us = -3723000000 µs (negative); hour = 22, minute = 57, ss = 57
 (set TPnPre (table [ts] (list (as 'TIMESTAMP [-3723000000000 0N 86400000000000]))))
-(at (at (select {h: (hour ts) from: TPnPre}) 'h) 0)     -- 22
-(at (at (select {h: (hour ts) from: TPnPre}) 'h) 1)     -- 0Nl
+(at (at (select {h: (hh ts) from: TPnPre}) 'h) 0)     -- 22
+(at (at (select {h: (hh ts) from: TPnPre}) 'h) 1)     -- 0Nl
 (at (at (select {mi: (minute ts) from: TPnPre}) 'mi) 0) -- 57
 (at (at (select {mi: (minute ts) from: TPnPre}) 'mi) 1) -- 0Nl
-(at (at (select {s: (second ts) from: TPnPre}) 's) 0)   -- 57
-(at (at (select {y: (year ts) from: TPnPre}) 'y) 0)     -- 1999
-(at (at (select {m: (month ts) from: TPnPre}) 'm) 0)    -- 12
-(at (at (select {dd: (day ts) from: TPnPre}) 'dd) 0)    -- 31
-(at (at (select {dw: (dayofweek ts) from: TPnPre}) 'dw) 0) -- 5
-(at (at (select {dy: (dayofyear ts) from: TPnPre}) 'dy) 0) -- 365
+(at (at (select {s: (ss ts) from: TPnPre}) 's) 0)   -- 57
+(at (at (select {y: (yyyy ts) from: TPnPre}) 'y) 0)     -- 1999
+(at (at (select {m: (mm ts) from: TPnPre}) 'm) 0)    -- 12
+(at (at (select {dd: (dd ts) from: TPnPre}) 'dd) 0)    -- 31
+(at (at (select {dw: (dow ts) from: TPnPre}) 'dw) 0) -- 5
+(at (at (select {dy: (doy ts) from: TPnPre}) 'dy) 0) -- 365
 
 ;; ─── EXTRACT_INNER(1,0): DOY leap-year branch for null-bearing TIMESTAMP ──────
 ;; Covers `mo > 2 && leap → doy_jan++` inside EXTRACT_INNER(1,0).
@@ -189,18 +189,18 @@
 ;; Nanoseconds: 2024-03-01 = 8826 days = 762566400000000000 ns;
 ;;              2024-12-31 = 9131 days = 788918400000000000 ns.
 (set TleapTSn (table [ts] (list (as 'TIMESTAMP [762566400000000000 0N 788918400000000000]))))
-(at (at (select {dy: (dayofyear ts) from: TleapTSn}) 'dy) 0) -- 61
-(at (at (select {dy: (dayofyear ts) from: TleapTSn}) 'dy) 1) -- 0Nl
-(at (at (select {dy: (dayofyear ts) from: TleapTSn}) 'dy) 2) -- 366
+(at (at (select {dy: (doy ts) from: TleapTSn}) 'dy) 0) -- 61
+(at (at (select {dy: (doy ts) from: TleapTSn}) 'dy) 1) -- 0Nl
+(at (at (select {dy: (doy ts) from: TleapTSn}) 'dy) 2) -- 366
 
 ;; ─── EXTRACT_INNER(1,1): DOY leap-year for null-bearing DATE ─────────────────
 ;; Covers `mo > 2 && leap → doy_jan++` in EXTRACT_INNER(1,1) (IN32, HAS_NULLS).
 ;; 2024-03-15 = doy 75 (leap year, mo=3 > 2), 2024-07-04 = doy 186.
 ;; Days from epoch: 2024-03-15 = 8840, 2024-07-04 = 8951.
 (set TleapDn (table [d] (list (as 'DATE [8840 0N 8951]))))
-(at (at (select {dy: (dayofyear d) from: TleapDn}) 'dy) 0) -- 75
-(at (at (select {dy: (dayofyear d) from: TleapDn}) 'dy) 1) -- 0Nl
-(at (at (select {dy: (dayofyear d) from: TleapDn}) 'dy) 2) -- 186
+(at (at (select {dy: (doy d) from: TleapDn}) 'dy) 0) -- 75
+(at (at (select {dy: (doy d) from: TleapDn}) 'dy) 1) -- 0Nl
+(at (at (select {dy: (doy d) from: TleapDn}) 'dy) 2) -- 186
 
 ;; ─── exec_date_trunc DATE_TRUNC_INNER(1,0): null-bearing TIMESTAMP + pre-epoch ─
 ;; Covers DATE_TRUNC_INNER(HAS_NULLS=1, IN32=0) r < 0 branches for DAY and SECOND.
@@ -249,11 +249,11 @@
 ;; of 7305 rows (the days since 2000.01.01), and an update with it turned a
 ;; 4-row table into a 7305-row one.
 (set TyL (table [x] (list (til 4))))
-(at (update {y: (year 2020.01.01) from: TyL}) 'y) -- [2020 2020 2020 2020]
-(count (update {x: (if true (year 2020.01.01) x) from: TyL})) -- 4
-(at (update {x: (if true (year 2020.01.01) x) from: TyL}) 'x) -- [2020 2020 2020 2020]
-(at (select {m: (month 2020.03.15) y: x from: TyL}) 'm) -- [3 3 3 3]
-(at (select {d: (day 2020.03.15) y: x from: TyL}) 'd) -- [15 15 15 15]
+(at (update {y: (yyyy 2020.01.01) from: TyL}) 'y) -- [2020 2020 2020 2020]
+(count (update {x: (if true (yyyy 2020.01.01) x) from: TyL})) -- 4
+(at (update {x: (if true (yyyy 2020.01.01) x) from: TyL}) 'x) -- [2020 2020 2020 2020]
+(at (select {m: (mm 2020.03.15) y: x from: TyL}) 'm) -- [3 3 3 3]
+(at (select {d: (dd 2020.03.15) y: x from: TyL}) 'd) -- [15 15 15 15]
 
 ;; The accessor builtins themselves compile as the extract (`(dd d)` is
 ;; `d.dd`), matched on the binding: a name rebound to a user function is
@@ -289,19 +289,19 @@
 ;; builtin's type error inside a query; they used to read the payload as
 ;; nanoseconds (and, over a parted SYM column, past the narrow cells)
 (set TnT (table [i f sp] (list [1 2] [1.5 2.5] (as 'TIMESPAN [1000000000 2000000000]))))
-(select {v: (year i) from: TnT}) !- type
-(select {v: (dayofweek i) from: TnT}) !- type
-(select {v: (day f) from: TnT}) !- type
+(select {v: (yyyy i) from: TnT}) !- type
+(select {v: (dow i) from: TnT}) !- type
+(select {v: (dd f) from: TnT}) !- type
 (select {v: f.dd from: TnT}) !- type
 (select {v: (minute sp) from: TnT}) !- type
-(select {v: (year sp) from: TnT}) !- type
+(select {v: (yyyy sp) from: TnT}) !- type
 (.sys.exec "rm -rf /tmp/rfl_dag_ext_parted")
 (.db.splayed.set "/tmp/rfl_dag_ext_parted/2024.01.01/t/" (table [a s] (list [1 2] [x y])) "/tmp/rfl_dag_ext_parted/.sym")
 (.db.splayed.set "/tmp/rfl_dag_ext_parted/2024.01.02/t/" (table [a s] (list [3 4] [z w])) "/tmp/rfl_dag_ext_parted/.sym")
 (set TnP (.db.parted.get "/tmp/rfl_dag_ext_parted/" 't))
-(select {v: (year s) from: TnP}) !- type
+(select {v: (yyyy s) from: TnP}) !- type
 (select {v: s.dd from: TnP}) !- type
-(select {v: (month a) from: TnP}) !- type
+(select {v: (mm a) from: TnP}) !- type
 (.sys.exec "rm -rf /tmp/rfl_dag_ext_parted")
 
 ;; zero-row table: a temporal column gives an empty I64 vector (not an

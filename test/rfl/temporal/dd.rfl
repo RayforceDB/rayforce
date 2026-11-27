@@ -21,22 +21,17 @@
 (set TT (table [k t] (list K T)))
 (set TTS (table [k ts] (list K TS)))
 (set eqv (fn [a b] (and (== (type a) (type b)) (if (== (count a) (count b)) (all (== a b)) false))))
-(set SD (select {from: TD x: (dd d) y: (mm d) z: (yyyy d) w: (dow d) v: (doy d) x2: (day d) y2: (month d) z2: (year d)}))
+(set SD (select {from: TD x: (dd d) y: (mm d) z: (yyyy d) w: (dow d) v: (doy d)}))
 (eqv (at SD 'x) (dd D)) -- true
 (eqv (at SD 'y) (mm D)) -- true
 (eqv (at SD 'z) (yyyy D)) -- true
 (eqv (at SD 'w) (dow D)) -- true
 (eqv (at SD 'v) (doy D)) -- true
-(eqv (at SD 'x) (at SD 'x2)) -- true
-(eqv (at SD 'y) (at SD 'y2)) -- true
-(eqv (at SD 'z) (at SD 'z2)) -- true
 (at SD 'x) -- [1 0Nl 2 24 16 1]
-(set ST (select {from: TT x: (hh t) y: (ss t) z: (minute t) x2: (hour t) y2: (second t)}))
+(set ST (select {from: TT x: (hh t) y: (ss t) z: (minute t)}))
 (eqv (at ST 'x) (hh T)) -- true
 (eqv (at ST 'y) (ss T)) -- true
 (eqv (at ST 'z) (minute T)) -- true
-(eqv (at ST 'x) (at ST 'x2)) -- true
-(eqv (at ST 'y) (at ST 'y2)) -- true
 (set STS (select {from: TTS x: (dd ts) y: (hh ts) z: (ss ts) w: (yyyy ts) v: (dow ts) u: (doy ts) m: (mm ts)}))
 (eqv (at STS 'x) (dd TS)) -- true
 (eqv (at STS 'y) (hh TS)) -- true
@@ -95,3 +90,8 @@
 (eqv (at GW 'a) (at OW 'a)) -- true
 (eqv (at GW 'b) (at OW 'b)) -- true
 (eqv (at GW 'c) (at OW 'c)) -- true
+;; the query-only spellings year, month, day, hour, second, dayofweek and
+;; dayofyear are removed: yyyy, mm, dd, hh, ss, dow and doy are the names (#1826)
+(select {from: TD x: (year d)}) !- name
+(select {from: TD x: (dayofweek d)}) !- name
+(select {from: TT x: (second t)}) !- name

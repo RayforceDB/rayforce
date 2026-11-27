@@ -13851,7 +13851,7 @@ static test_result_t test_select_gen2_ranged_no_decode(void) {
 #define GR_ALL 1
         { "(select {from: %s by: {u: u m: (minute et) s: s16} c: (count u)})", GR_ALL },
         { "(select {from: %s by: {m: (minute et) s: s8} c: (count u)})", GR_ALL },
-        { "(select {from: %s by: {s: s32 h: (+ (hour et) r)} c: (count u)})", GR_ALL },
+        { "(select {from: %s by: {s: s32 h: (+ (hh et) r)} c: (count u)})", GR_ALL },
         { "(select {from: %s by: (minute et) d: (count (distinct u))})", GR_ALL },
         { "(count (distinct (at %s 'u)))", GR_ALL },
         { "(count (distinct (at %s 'r)))", GR_ALL },

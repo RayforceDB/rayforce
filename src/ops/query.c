@@ -2150,7 +2150,7 @@ bool ray_query_rowwise_builtin(int64_t id) {
     /* reverse/asc/desc reorder a column but keep every row of it. */
     static const char* const names[] = {
         "as", "if", "and", "or", "cond", "pow", "substr", "replace", "xbar", "within",
-        "day", "dayofweek", "dayofyear", "hour", "minute", "month", "second", "year",
+        "minute",
         "reverse", "asc", "desc", "at",
     };
     enum { N = sizeof names / sizeof *names };
@@ -3218,20 +3218,14 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             return ray_and(g, &g->nodes[ge_id], le);
         }
 
-        /* Temporal extract: (year col), (month col), (day col), ... */
+        /* Temporal extract: (yyyy col), (mm col), (dd col), ... by the
+         * accessor builtins themselves: (dd col) is col.dd, unless a column
+         * of that name shadows the builtin (as in eval).  The query-only
+         * spellings year, month, day, hour, second, dayofweek and dayofyear
+         * are removed (#1826). */
         if (n == 2) {
             int64_t field = -1;
-            if (fname_len == 4 && memcmp(fname, "year",  4) == 0) field = RAY_EXTRACT_YEAR;
-            else if (fname_len == 5 && memcmp(fname, "month", 5) == 0) field = RAY_EXTRACT_MONTH;
-            else if (fname_len == 3 && memcmp(fname, "day",   3) == 0) field = RAY_EXTRACT_DAY;
-            else if (fname_len == 4 && memcmp(fname, "hour",  4) == 0) field = RAY_EXTRACT_HOUR;
-            else if (fname_len == 6 && memcmp(fname, "minute",6) == 0) field = RAY_EXTRACT_MINUTE;
-            else if (fname_len == 6 && memcmp(fname, "second",6) == 0) field = RAY_EXTRACT_SECOND;
-            else if (fname_len == 9 && memcmp(fname, "dayofweek",9) == 0) field = RAY_EXTRACT_DOW;
-            else if (fname_len == 9 && memcmp(fname, "dayofyear",9) == 0) field = RAY_EXTRACT_DOY;
-            /* the accessor builtins themselves: (dd col) is col.dd, unless
-             * a column of that name shadows the builtin (as in eval) */
-            else {
+            {
                 ray_col_meta_t shadow;
                 if (!(g->table && g->table->type == RAY_TABLE &&
                       ray_table_col_meta(g->table, fn_sym, &shadow)))

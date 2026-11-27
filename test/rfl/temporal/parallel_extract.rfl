@@ -92,16 +92,16 @@
 (set TN (table [ts] (list NB)))
 
 (all (== (at (select {m: (minute ts) from: TF}) 'm) (% (div (til N) 60) 60))) -- true
-(all (== (at (select {s: (second ts) from: TF}) 's) (% (til N) 60)))          -- true
-(all (== (at (select {h: (hour ts) from: TF}) 'h) (% (div (til N) 3600) 24))) -- true
+(all (== (at (select {s: (ss ts) from: TF}) 's) (% (til N) 60)))          -- true
+(all (== (at (select {h: (hh ts) from: TF}) 'h) (% (div (til N) 3600) 24))) -- true
 
-(nil? (at (at (select {s: (second ts) from: TN}) 's) 163840)) -- true
-(nil? (at (at (select {s: (second ts) from: TN}) 's) 163843)) -- true
-(at (at (select {s: (second ts) from: TN}) 's) 163841)        -- 41
-(at (at (select {s: (second ts) from: TN}) 's) 163844)        -- 44
+(nil? (at (at (select {s: (ss ts) from: TN}) 's) 163840)) -- true
+(nil? (at (at (select {s: (ss ts) from: TN}) 's) 163843)) -- true
+(at (at (select {s: (ss ts) from: TN}) 's) 163841)        -- 41
+(at (at (select {s: (ss ts) from: TN}) 's) 163844)        -- 44
 
 ;; DAG-path HAS_NULLS fold, same argument as Section 2.
-(min (at (select {s: (second ts) from: TN}) 's)) -- 0
+(min (at (select {s: (ss ts) from: TN}) 's)) -- 0
 
 (nil? (at (at (select {s: ts.date from: TN}) 's) 163840)) -- true
 (at (at (select {s: ts.time from: TN}) 's) 163841) -- 21:30:41.000
