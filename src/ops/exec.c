@@ -6983,12 +6983,24 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
          * a keyless select.  The group path computes it per group; here the
          * whole input, as the builtin does (#1814). */
         case OP_MEDIAN: {
-            /* under a where: the rows it keeps would have to be read, as
-             * exec_reduction reads them for the other reductions: not done
-             * here, so that stays a refusal (#1814) */
-            if (g->selection) return ray_error("nyi", NULL);
             ray_t* in = exec_node(g, op_child(g, op, 0));
             if (!in || RAY_IS_ERR(in)) return in;
+            /* Under a where: the rows it keeps, as exec_reduction reads them
+             * for the other reductions: when the selection covers the
+             * input's rows, its indices -- `total_pass` of them, which is
+             * the count, not the index block's len (#1831). */
+            if (g->selection && ray_is_vec(in)) {
+                ray_rowsel_t* sm = ray_rowsel_meta(g->selection);
+                if (sm->nrows == in->len) {
+                    ray_t* ix = ray_rowsel_to_indices(g->selection);
+                    if (!ix) { ray_release(in); return ray_error("oom", NULL); }
+                    ray_t* kept = gather_by_idx(in, (int64_t*)ray_data(ix), sm->total_pass);
+                    ray_release(ix);
+                    ray_release(in);
+                    if (!kept || RAY_IS_ERR(kept)) return kept ? kept : ray_error("oom", NULL);
+                    in = kept;
+                }
+            }
             ray_t* r = ray_med_fn(in);
             ray_release(in);
             return r;
