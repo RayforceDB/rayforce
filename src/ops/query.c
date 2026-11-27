@@ -14608,10 +14608,16 @@ static ray_t* query_eval_rowwise_if(ray_t* e, ray_t* tbl) {
 }
 
 /* ray_eval of a query expression with its columns bound: an `if` over a
- * column chooses per row (query_eval_rowwise_if). */
+ * column chooses per row (query_eval_rowwise_if).  The value is the
+ * query's data, so a lazy one is materialized here: a grouped select
+ * broadcast a lazy local as its handle into every group's cell, and one
+ * that fails to materialize answered cells of it where the same query
+ * without by: raised its error (#1881). */
 static ray_t* query_eval_bound(ray_t* e, ray_t* tbl) {
     ray_t* v = query_eval_rowwise_if(e, tbl);
-    return v ? v : ray_eval(e);
+    if (!v) v = ray_eval(e);
+    if (v && !RAY_IS_ERR(v) && ray_is_lazy(v)) v = ray_lazy_materialize(v);   /* consumes v */
+    return v;
 }
 
 /* The planner's refusal of an `if` in `e` whose arms have no common type
