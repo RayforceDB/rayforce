@@ -1608,9 +1608,9 @@ static void csv_progress_probe_cb(const ray_progress_t* p, void* user) {
 }
 
 /* Cancellation must be observed while pool workers are inside the CSV row
- * loop, and cleanup must only inspect initialized strrefs.  Sparse escaped
- * fields exercise ownership cleanup without turning the fixture into an
- * allocation benchmark. */
+ * loop, and cleanup must free the escaped copies the workers kept (#1890).
+ * Sparse escaped fields exercise that cleanup without turning the fixture
+ * into an allocation benchmark. */
 static test_result_t test_csv_interrupt_mid_parse(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -2613,6 +2613,109 @@ static test_result_t test_csv_strict_matrix(void) {
     PASS();
 }
 
+/* A failed allocation of a block for escaped text cells (#1894) fails the
+ * load with oom, freeing what it kept, in every route: the serial and the
+ * parallel parse, lenient and strict, and the splayed and parted imports.
+ * Each shape is run once to count its block allocations, then once with
+ * each of them failing in turn; after each run no block is live. */
+static void csv_escoom_write(const char* path, int rows) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    fputs("id,note\n", f);
+    for (int i = 0; i < rows; i++) {
+        if (i == 3 || i == rows / 2 || i == rows - 1) {
+            /* a cell too big for the rest of a block: a block of its own */
+            fprintf(f, "%d,\"", i);
+            for (int k = 0; k < 350000; k++) fputs("ab", f);
+            fputs("\"\"\"\n", f);
+        } else {
+            fprintf(f, "%d,\"n,%d\"\"x\"\n", i, i);
+        }
+    }
+    fclose(f);
+}
+
+/* shape: 0 read, 1 splayed, 2 parted; returns the error code (NULL: ok) */
+static const char* csv_escoom_run(int shape, bool strict, const char* path,
+                                  const char* dir, char* code, size_t code_sz) {
+    int8_t types[2] = { RAY_I64, RAY_STR };
+    ray_csv_opts_t opts = { .strict = strict, .op = ".csv.read" };
+    if (shape == 0) {
+        ray_t* r = ray_read_csv_ex(path, ',', true, types, 2, NULL, 0, &opts);
+        if (r && !RAY_IS_ERR(r)) { ray_release(r); return NULL; }
+        snprintf(code, code_sz, "%s", r ? ray_err_code(r) : "null");
+        ray_error_free(r);
+        return code;
+    }
+    char rm[400];
+    snprintf(rm, sizeof rm, "rm -rf '%s' '%s.csv-partial'", dir, dir);
+    if (system(rm) != 0) { snprintf(code, code_sz, "rm"); return code; }
+    ray_err_t e = shape == 1
+        ? ray_csv_save_splayed_ex(path, ',', true, types, 2, NULL, 0, dir, 6000,
+                                  RAY_COMPRESS_ABSENT, &opts)
+        : ray_csv_save_parted_ex(path, ',', true, types, 2, NULL, 0, dir, "t", 6000,
+                                 RAY_COMPRESS_ABSENT, &opts);
+    if (opts.err) ray_error_free(opts.err);
+    if (system(rm) != 0) { snprintf(code, code_sz, "rm"); return code; }
+    if (e == RAY_OK) return NULL;
+    snprintf(code, code_sz, "%s", ray_err_code_str(e));
+    return code;
+}
+
+static test_result_t test_csv_escaped_alloc_fail(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    char path[96], dir[96], code[32], msg[256];
+    snprintf(path, sizeof path, "/tmp/rayforce_escoom_%d.csv", (int)getpid());
+    snprintf(dir, sizeof dir, "/tmp/rayforce_escoom_%d", (int)getpid());
+    static const int sizes[2] = { 50, 20000 };          /* serial; parallel */
+    int failed = 0;
+    for (int z = 0; z < 2; z++) {
+        csv_escoom_write(path, sizes[z]);
+        for (int shape = 0; shape < 3; shape++) {
+            for (int strict = 0; strict < 2; strict++) {
+                /* armed past them: count the blocks, and a warm-up for the
+                 * heap and the symbol table */
+                ray_csv_esc_fail_for_test(INT64_MAX);
+                const char* rc = csv_escoom_run(shape, strict, path, dir, code, sizeof code);
+                int64_t total = ray_csv_esc_allocs_for_test();
+                ray_csv_esc_fail_for_test(0);
+                if (rc) { snprintf(msg, sizeof msg, "rows %d shape %d strict %d: unarmed run failed: %s", sizes[z], shape, strict, rc); FAIL(strdup(msg)); }
+                if (total < 3) { snprintf(msg, sizeof msg, "rows %d shape %d: %lld blocks", sizes[z], shape, (long long)total); FAIL(strdup(msg)); }
+                if (ray_csv_esc_live_for_test() != 0) {
+                    snprintf(msg, sizeof msg, "rows %d shape %d strict %d: %lld blocks live after a success",
+                             sizes[z], shape, strict, (long long)ray_csv_esc_live_for_test());
+                    FAIL(strdup(msg));
+                }
+                for (int64_t n = 1; n <= total; n++) {
+                    ray_csv_esc_fail_for_test(n);
+                    rc = csv_escoom_run(shape, strict, path, dir, code, sizeof code);
+                    ray_csv_esc_fail_for_test(0);
+                    if (!rc || strcmp(rc, "oom") != 0) {
+                        snprintf(msg, sizeof msg, "rows %d shape %d strict %d, block %lld of %lld fails: %s, not oom",
+                                 sizes[z], shape, strict, (long long)n, (long long)total, rc ? rc : "success");
+                        FAIL(strdup(msg));
+                    }
+                    /* every block kept is freed: the blocks are mapped pages,
+                     * which the leak checker does not see, so they are counted */
+                    int64_t live = ray_csv_esc_live_for_test();
+                    if (live != 0) {
+                        snprintf(msg, sizeof msg, "rows %d shape %d strict %d, block %lld of %lld fails: %lld blocks live",
+                                 sizes[z], shape, strict, (long long)n, (long long)total, (long long)live);
+                        FAIL(strdup(msg));
+                    }
+                    failed++;
+                }
+            }
+        }
+    }
+    unlink(path);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    TEST_ASSERT_TRUE(failed > 30);
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
     { "csv/splayed_cancel", test_csv_splayed_cancel, NULL, NULL },
     { "csv/splayed_cancel_hash", test_csv_splayed_cancel_hash, NULL, NULL },
@@ -2681,5 +2784,6 @@ const test_entry_t csv_entries[] = {
     { "csv/sym_id_order",         test_csv_sym_id_order,                    NULL, NULL },
     { "csv/streaming_infers_like_read", test_csv_streaming_infers_like_read, NULL, NULL },
     { "csv/strict_matrix",        test_csv_strict_matrix,                   NULL, NULL },
+    { "csv/escaped_alloc_fail",   test_csv_escaped_alloc_fail,              NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

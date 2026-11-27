@@ -1260,6 +1260,7 @@ static const char* const exclusive_tests[] = {
  * hundreds of tests holds several hundred MB more than a fresh one. */
 static const char* const fresh_tests[] = {
     "agg_contract/dense_wide_budget",   /* also _sel: per-worker slab budget */
+    "rfl/io/csv_escaped_cells",         /* bounds the read's rise of the anon peak */
     NULL,
 };
 static bool fresh_test(const char* name) {

@@ -1942,25 +1942,69 @@ static bool csv_intern_dicts(csv_dedup_ctx_t* dd, int n_sym,
     return ok;
 }
 
-/* Free strref pointers that were heap-allocated for escaped CSV fields.
- * Any strref whose ptr falls outside the mmap buffer [buf, buf+buf_size)
- * was allocated by the parse loop and must be freed here. */
-static void csv_free_escaped_strrefs(csv_strref_t** str_refs, int n_cols,
-                                      const csv_type_t* col_types,
-                                      int64_t n_rows,
-                                      const char* buf, size_t buf_size,
-                                      const uint8_t* row_done,
-                                      const bool* col_had_escaped) {
-    const char* buf_end = buf + buf_size;
-    for (int c = 0; c < n_cols; c++) {
-        if (col_types[c] != CSV_TYPE_STR || !str_refs[c]) continue;
-        if (col_had_escaped && !col_had_escaped[c]) continue;
-        for (int64_t r = 0; r < n_rows; r++) {
-            if (row_done && !row_done[r]) continue;
-            const char* p = str_refs[c][r].ptr;
-            if (p && (p < buf || p >= buf_end))
-                ray_sys_free((void*)p);
-        }
+/* Escaped STR cells (#1890).  A quoted cell with a doubled quote is
+ * unescaped into a stack buffer that dies with the cell, so the parse keeps a
+ * copy until the strings are filled in.  The copies go into blocks a worker
+ * fills in turn and the load frees at the end: one page mapping per cell, as
+ * they were, cost about 6.5 microseconds a cell.  A copy larger than a
+ * quarter block gets a block of its own, linked behind the current one. */
+typedef struct csv_esc_block {
+    struct csv_esc_block* next;
+    size_t                cap, used;
+    char                  data[];
+} csv_esc_block_t;
+
+#define CSV_ESC_BLOCK ((size_t)1 << 20)
+
+#ifdef DEBUG
+/* Test seam (ray_csv_esc_fail_for_test): the nth block allocation from now,
+ * on any thread, fails; the count says how many were made since arming,
+ * and the live count how many are allocated and not yet freed. */
+static _Atomic int64_t g_csv_esc_fail_at, g_csv_esc_allocs, g_csv_esc_live;
+void ray_csv_esc_fail_for_test(int64_t nth) {
+    atomic_store(&g_csv_esc_allocs, 0);
+    atomic_store(&g_csv_esc_fail_at, nth);
+}
+int64_t ray_csv_esc_allocs_for_test(void) { return atomic_load(&g_csv_esc_allocs); }
+int64_t ray_csv_esc_live_for_test(void) { return atomic_load(&g_csv_esc_live); }
+#define CSV_ESC_LIVE(d) atomic_fetch_add(&g_csv_esc_live, (d))
+static bool csv_esc_fails_for_test(void) {
+    int64_t k = atomic_fetch_add(&g_csv_esc_allocs, 1) + 1;
+    return k == atomic_load(&g_csv_esc_fail_at);
+}
+#else
+#define csv_esc_fails_for_test() false
+#define CSV_ESC_LIVE(d) ((void)0)
+#endif
+
+static const char* csv_keep_escaped(csv_esc_block_t** head, const char* p, size_t n) {
+    csv_esc_block_t* b = *head;
+    if (b && b->cap - b->used >= n) {
+        char* d = b->data + b->used;
+        memcpy(d, p, n);
+        b->used += n;
+        return d;
+    }
+    bool own = n > CSV_ESC_BLOCK / 4;
+    size_t cap = own ? n : CSV_ESC_BLOCK;
+    if (RAY_UNLIKELY(csv_esc_fails_for_test())) return NULL;
+    csv_esc_block_t* nb = (csv_esc_block_t*)ray_sys_alloc(sizeof(*nb) + cap);
+    if (!nb) return NULL;
+    CSV_ESC_LIVE(1);
+    nb->cap = cap;
+    nb->used = n;
+    memcpy(nb->data, p, n);
+    if (own && b) { nb->next = b->next; b->next = nb; }
+    else          { nb->next = b; *head = nb; }
+    return nb->data;
+}
+
+static void csv_esc_free(csv_esc_block_t* b) {
+    while (b) {
+        csv_esc_block_t* next = b->next;
+        ray_sys_free(b);
+        CSV_ESC_LIVE(-1);
+        b = next;
     }
 }
 
@@ -2219,8 +2263,8 @@ typedef struct {
     void**            col_data;     /* non-const: workers write parsed values into columns */
     csv_strref_t**    str_refs;     /* [n_cols] — strref arrays for string columns, NULL for others */
     bool*             worker_had_null; /* [n_workers * n_cols] */
-    bool*             worker_had_escaped; /* [n_workers * n_cols] */
-    uint8_t*          row_done;     /* [n_rows], marks initialized strref rows */
+    csv_esc_block_t** worker_esc;   /* [n_workers]: escaped STR copies each kept */
+    _Atomic(bool)*    esc_oom;      /* set when a copy could not be kept: the load fails */
     /* strict only (#1885); last, so the default parse's offsets are as they were */
     csv_bad_t*        worker_bad;   /* [n_workers]: the first bad row each saw */
     size_t            rows_end;     /* where the last row ends: the next chunk's start */
@@ -2272,7 +2316,7 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
     char esc_buf[8192];
     const char* buf_end = ctx->buf + ctx->buf_size;
     bool* my_had_null = &ctx->worker_had_null[(size_t)worker_id * (size_t)ctx->n_cols];
-    bool* my_had_escaped = &ctx->worker_had_escaped[(size_t)worker_id * (size_t)ctx->n_cols];
+    csv_esc_block_t** my_esc = &ctx->worker_esc[worker_id];
 
     for (int64_t row = start; row < end_row; row++) {
         if (RAY_UNLIKELY(((row - start) & 1023) == 0 && ray_interrupted()))
@@ -2418,16 +2462,15 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                         ctx->str_refs[c][row].len = 0;
                         my_had_null[c] = true;
                     } else {
-                        /* fld may point into esc_buf (stack) or dyn_esc
-                         * (freed below) — both die before csv_fill_str_cols
-                         * reads the strref.  Persist escaped fields. */
+                        /* fld may point into esc_buf (stack) or dyn_esc (freed
+                         * below), both gone before csv_fill_str_col reads the
+                         * strref: keep a copy (#1890).  Out of memory the load
+                         * fails with oom; the cell is never kept wrong. */
                         if (fld < ctx->buf || fld >= buf_end) {
-                            my_had_escaped[c] = true;
-                            if (dyn_esc && fld == dyn_esc) {
-                                dyn_esc = NULL; /* transfer ownership */
-                            } else {
-                                char* cp = (char*)ray_sys_alloc(flen);
-                                if (cp) { memcpy(cp, fld, flen); fld = cp; }
+                            fld = csv_keep_escaped(my_esc, fld, flen);
+                            if (RAY_UNLIKELY(!fld)) {
+                                flen = 0;
+                                atomic_store_explicit(ctx->esc_oom, true, memory_order_relaxed);
                             }
                         }
                         ctx->str_refs[c][row].ptr = fld;
@@ -2444,7 +2487,6 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
             }
             if (RAY_UNLIKELY(dyn_esc != NULL)) ray_sys_free(dyn_esc);
         }
-        if (ctx->row_done) ctx->row_done[row] = 1;
     }
 }
 
@@ -2583,12 +2625,11 @@ static void csv_parse_fn_strict(void* arg, uint32_t worker_id,
     const int8_t* const        resolved_types = ctx->resolved_types;
     void* const* const         col_data = ctx->col_data;
     csv_strref_t* const* const str_refs = ctx->str_refs;
-    uint8_t* const             row_done = ctx->row_done;
     char esc_buf[8192];
     const char* buf_end = buf + ctx->buf_size;
     const char* last_end = buf + ctx->rows_end;
     bool* my_had_null = &ctx->worker_had_null[(size_t)worker_id * (size_t)n_cols];
-    bool* my_had_escaped = &ctx->worker_had_escaped[(size_t)worker_id * (size_t)n_cols];
+    csv_esc_block_t** my_esc = &ctx->worker_esc[worker_id];
 
     for (int64_t row = start; row < end_row; row++) {
         if (RAY_UNLIKELY(((row - start) & 1023) == 0 && ray_interrupted()))
@@ -2819,16 +2860,15 @@ static void csv_parse_fn_strict(void* arg, uint32_t worker_id,
                         str_refs[c][row].len = 0;
                         my_had_null[c] = true;
                     } else {
-                        /* fld may point into esc_buf (stack) or dyn_esc
-                         * (freed below) — both die before csv_fill_str_cols
-                         * reads the strref.  Persist escaped fields. */
+                        /* fld may point into esc_buf (stack) or dyn_esc (freed
+                         * below), both gone before csv_fill_str_col reads the
+                         * strref: keep a copy (#1890).  Out of memory the load
+                         * fails with oom; the cell is never kept wrong. */
                         if (fld < buf || fld >= buf_end) {
-                            my_had_escaped[c] = true;
-                            if (dyn_esc && fld == dyn_esc) {
-                                dyn_esc = NULL; /* transfer ownership */
-                            } else {
-                                char* cp = (char*)ray_sys_alloc(flen);
-                                if (cp) { memcpy(cp, fld, flen); fld = cp; }
+                            fld = csv_keep_escaped(my_esc, fld, flen);
+                            if (RAY_UNLIKELY(!fld)) {
+                                flen = 0;
+                                atomic_store_explicit(ctx->esc_oom, true, memory_order_relaxed);
                             }
                         }
                         str_refs[c][row].ptr = fld;
@@ -2845,7 +2885,6 @@ static void csv_parse_fn_strict(void* arg, uint32_t worker_id,
             }
             if (RAY_UNLIKELY(dyn_esc != NULL)) ray_sys_free(dyn_esc);
         }
-        if (row_done) row_done[row] = 1;
         {
             /* A malformed quote is reported first: it is what cut the
              * cells.  Then a wrong cell count, then an unparsed cell. */
@@ -2887,8 +2926,8 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                               void** col_data,
                               csv_strref_t** str_refs,
                               bool* col_had_null,
-                              bool* col_had_escaped,
-                              uint8_t* row_done) {
+                              csv_esc_block_t** my_esc,
+                              _Atomic(bool)* esc_oom) {
     char esc_buf[8192];
     const char* buf_end = buf + buf_size;
 
@@ -3034,16 +3073,15 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                         str_refs[c][row].len = 0;
                         col_had_null[c] = true;
                     } else {
-                        /* fld may point into esc_buf (stack) or dyn_esc
-                         * (freed below) — both die before csv_fill_str_cols
-                         * reads the strref.  Persist escaped fields. */
+                        /* fld may point into esc_buf (stack) or dyn_esc (freed
+                         * below), both gone before csv_fill_str_col reads the
+                         * strref: keep a copy (#1890).  Out of memory the load
+                         * fails with oom; the cell is never kept wrong. */
                         if (fld < buf || fld >= buf_end) {
-                            col_had_escaped[c] = true;
-                            if (dyn_esc && fld == dyn_esc) {
-                                dyn_esc = NULL; /* transfer ownership */
-                            } else {
-                                char* cp = (char*)ray_sys_alloc(flen);
-                                if (cp) { memcpy(cp, fld, flen); fld = cp; }
+                            fld = csv_keep_escaped(my_esc, fld, flen);
+                            if (RAY_UNLIKELY(!fld)) {
+                                flen = 0;
+                                atomic_store_explicit(esc_oom, true, memory_order_relaxed);
                             }
                         }
                         str_refs[c][row].ptr = fld;
@@ -3058,7 +3096,6 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
             }
             if (RAY_UNLIKELY(dyn_esc != NULL)) ray_sys_free(dyn_esc);
         }
-        if (row_done) row_done[row] = 1;
     }
     return true;
 }
@@ -3074,21 +3111,23 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
 static void csv_parse_all(csv_par_ctx_t* ctx, bool strict, csv_bad_t* bad) {
     bad->row = INT64_MAX; bad->col = -1; bad->kind = 0;
     bool* col_had_null = ctx->worker_had_null;
-    bool* col_had_escaped = ctx->worker_had_escaped;
+    csv_esc_block_t** esc_out = ctx->worker_esc;
     int ncols = ctx->n_cols;
     ray_pool_t* pool = ray_pool_get();
     if (pool && ctx->n_rows > 8192) {
         uint32_t n_workers = ray_pool_total_workers(pool);
         size_t flags_sz = (size_t)n_workers * (size_t)ncols * sizeof(bool);
         size_t bad_sz = strict ? (size_t)n_workers * sizeof(csv_bad_t) : 0;
-        /* [bad: n_workers, strict only][had_null][had_escaped] */
-        char* scratch = (char*)ray_sys_alloc(bad_sz + flags_sz * 2);
+        size_t esc_sz = (size_t)n_workers * sizeof(csv_esc_block_t*);
+        /* [bad: n_workers, strict only][esc: n_workers][had_null] */
+        char* scratch = (char*)ray_sys_alloc(bad_sz + esc_sz + flags_sz);
         if (scratch) {
-            bool* worker_flags = (bool*)(void*)(scratch + bad_sz);
-            memset(worker_flags, 0, flags_sz * 2);
+            csv_esc_block_t** worker_esc = (csv_esc_block_t**)(void*)(scratch + bad_sz);
+            bool* worker_flags = (bool*)(void*)(scratch + bad_sz + esc_sz);
+            memset(worker_esc, 0, esc_sz + flags_sz);
             csv_par_ctx_t pctx = *ctx;
             pctx.worker_had_null = worker_flags;
-            pctx.worker_had_escaped = worker_flags + (size_t)n_workers * (size_t)ncols;
+            pctx.worker_esc = worker_esc;
             pctx.worker_bad = NULL;
             if (strict) {
                 pctx.worker_bad = (csv_bad_t*)(void*)scratch;
@@ -3100,8 +3139,13 @@ static void csv_parse_all(csv_par_ctx_t* ctx, bool strict, csv_bad_t* bad) {
                 for (int c = 0; c < ncols; c++) {
                     if (pctx.worker_had_null[(size_t)w * (size_t)ncols + (size_t)c])
                         col_had_null[c] = true;
-                    if (pctx.worker_had_escaped[(size_t)w * (size_t)ncols + (size_t)c])
-                        col_had_escaped[c] = true;
+                }
+                /* the workers' blocks go to the caller, freed with the load */
+                for (csv_esc_block_t* b = worker_esc[w]; b; ) {
+                    csv_esc_block_t* next = b->next;
+                    b->next = *esc_out;
+                    *esc_out = b;
+                    b = next;
                 }
                 if (strict && pctx.worker_bad[w].row < bad->row) *bad = pctx.worker_bad[w];
             }
@@ -3117,7 +3161,7 @@ static void csv_parse_all(csv_par_ctx_t* ctx, bool strict, csv_bad_t* bad) {
         (void)csv_parse_serial(ctx->buf, ctx->buf_size, ctx->row_offsets, ctx->n_rows,
                                ctx->n_cols, ctx->delim, ctx->col_types,
                                ctx->resolved_types, ctx->col_data, ctx->str_refs,
-                               col_had_null, col_had_escaped, ctx->row_done);
+                               col_had_null, esc_out, ctx->esc_oom);
     }
 }
 
@@ -3534,8 +3578,9 @@ static ray_t* csv_materialize_rows(const char* path,
      * (sym id 0 / zero-length descriptor) — see csv_note_empty. */
     bool col_wrote_null[CSV_MAX_COLS];
     if (ncols > 0) memset(col_wrote_null, 0, (size_t)ncols * sizeof(bool));
-    bool col_had_escaped[CSV_MAX_COLS];
-    memset(col_had_escaped, 0, sizeof(col_had_escaped));
+    csv_esc_block_t* esc = NULL;   /* escaped STR copies, freed with the load */
+    _Atomic(bool) esc_oom;         /* one of them could not be kept */
+    atomic_init(&esc_oom, false);
 
     csv_type_t parse_types[CSV_MAX_COLS];
     for (int c = 0; c < ncols; c++) {
@@ -3571,14 +3616,6 @@ static ray_t* csv_materialize_rows(const char* path,
     ray_t* str_ref_hdrs[CSV_MAX_COLS];
     memset(str_ref_bufs, 0, sizeof(str_ref_bufs));
     memset(str_ref_hdrs, 0, sizeof(str_ref_hdrs));
-    ray_t* row_done_hdr = NULL;
-    uint8_t* row_done = has_text_cols
-        ? (uint8_t*)scratch_calloc(&row_done_hdr, (size_t)n_rows)
-        : NULL;
-    if (has_text_cols && !row_done) {
-        for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
-        return NULL;
-    }
     for (int c = 0; c < ncols; c++) {
         if (parse_types[c] == CSV_TYPE_STR) {
             size_t sz = (size_t)n_rows * sizeof(csv_strref_t);
@@ -3586,7 +3623,6 @@ static ray_t* csv_materialize_rows(const char* path,
             if (!str_ref_bufs[c]) {
                 for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
                 for (int j = 0; j < c; j++) scratch_free(str_ref_hdrs[j]);
-                scratch_free(row_done_hdr);
                 return NULL;
             }
         }
@@ -3607,28 +3643,31 @@ static ray_t* csv_materialize_rows(const char* path,
             .col_data           = col_data,
             .str_refs           = str_ref_bufs,
             .worker_had_null    = col_had_null,
-            .worker_had_escaped = col_had_escaped,
-            .row_done           = row_done,
+            .worker_esc         = &esc,
+            .esc_oom            = &esc_oom,
         };
         csv_parse_all(&ctx, strict, &bad);
     }
 
     if (ray_interrupted()) {
-        csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
-                                 buf, file_size, row_done, col_had_escaped);
+        csv_esc_free(esc);
         for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
-        scratch_free(row_done_hdr);
         for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
         return ray_error("cancel", "interrupted");
+    }
+
+    if (RAY_UNLIKELY(atomic_load_explicit(&esc_oom, memory_order_relaxed))) {
+        csv_esc_free(esc);
+        for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
+        for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
+        return ray_error("oom", NULL);
     }
 
     if (RAY_UNLIKELY(bad.row != INT64_MAX)) {
         ray_t* e = csv_strict_error(opts, path, buf, file_size, rows_end, row_offsets, n_rows,
                                     &bad, ncols, delimiter, col_name_ids, resolved_types);
-        csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
-                                 buf, file_size, row_done, col_had_escaped);
+        csv_esc_free(esc);
         for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
-        scratch_free(row_done_hdr);
         for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
         return e;
     }
@@ -3652,19 +3691,15 @@ static ray_t* csv_materialize_rows(const char* path,
         bool fin_ok = csv_finalize_run(&fctx, fill_cols, fill_ok,
                                        sym_cols, col_wrote_null, 0, 0);
         if (!fin_ok || ray_interrupted()) {
-            csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
-                                     buf, file_size, row_done, col_had_escaped);
+            csv_esc_free(esc);
             for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
-            scratch_free(row_done_hdr);
             for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
             return ray_interrupted() ? ray_error("cancel", "interrupted") : NULL;
         }
     }
 
-    csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
-                             buf, file_size, NULL, col_had_escaped);
+    csv_esc_free(esc);
     for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
-    scratch_free(row_done_hdr);
     if (ray_interrupted()) {
         for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
         return ray_error("cancel", "interrupted");
@@ -4013,8 +4048,9 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
     bool col_wrote_null[CSV_MAX_COLS];
     if (ncols > 0) memset(col_wrote_null, 0, (size_t)ncols * sizeof(bool));
 
-    bool col_had_escaped[CSV_MAX_COLS];
-    memset(col_had_escaped, 0, sizeof(col_had_escaped));
+    csv_esc_block_t* esc = NULL;   /* escaped STR copies, freed with the load */
+    _Atomic(bool) esc_oom;         /* one of them could not be kept */
+    atomic_init(&esc_oom, false);
 
     /* Build csv_type_t array for parse functions (maps td types → csv types) */
     csv_type_t parse_types[CSV_MAX_COLS];
@@ -4053,14 +4089,6 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
     ray_t* str_ref_hdrs[CSV_MAX_COLS];
     memset(str_ref_bufs, 0, sizeof(str_ref_bufs));
     memset(str_ref_hdrs, 0, sizeof(str_ref_hdrs));
-    ray_t* row_done_hdr = NULL;
-    uint8_t* row_done = has_text_cols
-        ? (uint8_t*)scratch_calloc(&row_done_hdr, (size_t)n_rows)
-        : NULL;
-    if (has_text_cols && !row_done) {
-        for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
-        goto fail_offsets;
-    }
     for (int c = 0; c < ncols; c++) {
         if (parse_types[c] == CSV_TYPE_STR) {
             size_t sz = (size_t)n_rows * sizeof(csv_strref_t);
@@ -4068,7 +4096,6 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
             if (!str_ref_bufs[c]) {
                 for (int j = 0; j < ncols; j++) ray_release(col_vecs[j]);
                 for (int j = 0; j < c; j++) scratch_free(str_ref_hdrs[j]);
-                scratch_free(row_done_hdr);
                 goto fail_offsets;
             }
         }
@@ -4090,13 +4117,17 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
             .col_data           = col_data,
             .str_refs           = str_ref_bufs,
             .worker_had_null    = col_had_null,
-            .worker_had_escaped = col_had_escaped,
-            .row_done           = row_done,
+            .worker_esc         = &esc,
+            .esc_oom            = &esc_oom,
         };
         csv_parse_all(&ctx, strict, &bad);
     }
 
     if (ray_interrupted()) goto fail_parsed_cancel;
+    if (RAY_UNLIKELY(atomic_load_explicit(&esc_oom, memory_order_relaxed))) {
+        result = ray_error("oom", NULL);
+        goto fail_parsed;
+    }
     if (RAY_UNLIKELY(bad.row != INT64_MAX)) {
         result = csv_strict_error(opts, path, buf, file_size, file_size, row_offsets, n_rows,
                                   &bad, ncols, delimiter, col_name_ids, resolved_types);
@@ -4133,20 +4164,16 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
                                        (uint64_t)file_size - prog_parse_end);
         if (!fin_ok || ray_interrupted()) {
             if (ray_interrupted()) goto fail_parsed_cancel;
-            csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
-                                     buf, file_size, NULL, col_had_escaped);
+            csv_esc_free(esc);
             for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
-            scratch_free(row_done_hdr);
             for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
             goto fail_offsets;
         }
     }
 
     /* Free heap-allocated escaped string copies, then strref buffers */
-    csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
-                             buf, file_size, NULL, col_had_escaped);
+    csv_esc_free(esc);
     for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
-    scratch_free(row_done_hdr);
 
     /* ---- 9c. Set HAS_NULLS for columns that saw a canonical null ----
      *
@@ -4234,19 +4261,15 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
 
     /* Error paths */
 fail_parsed:            /* every row parsed; `result` is the error */
-    csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
-                             buf, file_size, row_done, col_had_escaped);
+    csv_esc_free(esc);
     for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
-    scratch_free(row_done_hdr);
     for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
     scratch_free(row_offsets_hdr);
     ray_vm_unmap_file(buf, file_size);
     return result;
 fail_parsed_cancel:
-    csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows,
-                             buf, file_size, row_done, col_had_escaped);
+    csv_esc_free(esc);
     for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
-    scratch_free(row_done_hdr);
 fail_cols_cancel:
     for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
 fail_offsets_cancel:
