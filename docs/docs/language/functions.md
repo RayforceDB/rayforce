@@ -480,7 +480,6 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 |---|---|---|---|
 | `date` | unary | Current date, or extract date from timestamp; answers a DATE | `(date 0)` → today's date |
 | `time` | unary | Current wall-clock time (millisecond resolution), or extract time from timestamp; answers a TIME | `(time 0)` → current time |
-| `timestamp` | unary | Current wall-clock timestamp at the system clock's full resolution (nanoseconds on Linux) | `(timestamp 0)` |
 
 ### Calendar/Clock Field Extraction
 
@@ -625,7 +624,9 @@ spills exactly as it did before.
 | `.os.setenv` | binary | Set environment variable | `(.os.setenv "KEY" "value")` |
 | `exit` | unary | Exit the process with status code | `(exit 0)` |
 | `timeit` | variadic, special | Evaluate an expression and return the elapsed time in milliseconds | `(timeit (sum (til 1000000)))` |
-| `.time.now` | variadic | Monotonic time in milliseconds | `(.time.now)` |
+| `.time.mono` | variadic | Monotonic clock in milliseconds from a platform-defined epoch, for intervals and timer deadlines | `(.time.mono)` |
+| `.time.utc` | variadic | Current wall-clock timestamp in UTC, at the system clock's full resolution (nanoseconds on Linux) | `(.time.utc)` |
+| `.time.local` | variadic | Current wall-clock timestamp in local time (a timestamp carries no zone), at the system clock's full resolution | `(.time.local)` |
 | `.time.timer.set` | variadic, restricted | Schedule callback every `ms`, `num` times (0 = forever); returns id | `(.time.timer.set 1000 0 (fn [t] (println t)))` |
 | `.time.timer.del` | unary, restricted | Cancel a scheduled timer by id; returns null | `(.time.timer.del 0)` |
 | `.time.sleep` | unary, restricted | Block the calling thread for `ms` milliseconds (an integer) or a timespan; returns null; a REPL Ctrl-C, an IPC cancel, a server-side `kill -INT`, or the client of a sync request hanging up ends it with `cancel`; an async one runs its full time; a journal replay skips it; it stalls a server's other connections while it waits | `(.time.sleep 500)` |

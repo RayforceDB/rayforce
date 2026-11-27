@@ -25,7 +25,7 @@
 ;;   `(date …)` calls.  See test/rfl/temporal/timestamp.rfl for the
 ;;   full string-parse matrix.
 ;;
-;;   The `(date 'local)` / `(timestamp 'global)` clock branches return
+;;   The `(date 'local)` / `(.time.utc)` clock branches return
 ;;   wall-clock dependent values; we exercise the call shape and only
 ;;   assert on the result type so the test is deterministic.
 
@@ -219,10 +219,10 @@
 ;; The is_global_arg helper inspects the sym text to pick the branch.
 (type (date 'local))                           -- 'date
 (type (time 'local))                           -- 'time
-(type (timestamp 'local))                      -- 'timestamp
+(type (.time.local))                           -- 'timestamp
 (type (date 'global))                          -- 'date
 (type (time 'global))                          -- 'time
-(type (timestamp 'global))                     -- 'timestamp
+(type (.time.utc))                             -- 'timestamp
 
 ;; The clock reads carry the system clock's sub-second part rather than
 ;; a whole-second value with a zero fraction.  Reads taken back to back
@@ -233,7 +233,7 @@
 ;; passes, while a clock that only moves in whole seconds still fails:
 ;; its distinct values are all whole seconds, or the read bound is hit.
 (set clock-samples (fn [f n] (do (set cs-acc (list (f))) (set cs-tries 0) (while (and (< (count cs-acc) n) (< cs-tries 5000000)) (do (set cs-v (f)) (if (!= cs-v (last cs-acc)) (set cs-acc (concat cs-acc (list cs-v))) 0) (set cs-tries (+ cs-tries 1)))) cs-acc)))
-(set clock-ts (concat (clock-samples (fn [] (as 'i64 (timestamp 'global))) 3) (list (as 'i64 (timestamp 'local)) (as 'i64 (timestamp 0)))))
+(set clock-ts (concat (clock-samples (fn [] (as 'i64 (.time.utc))) 3) (list (as 'i64 (.time.local)) (as 'i64 (.time.local)))))
 (any (!= 0 (% (as 'i64 clock-ts) 1000000000)))  -- true
 (set clock-tm (concat (clock-samples (fn [] (as 'i64 (time 'global))) 5) (list (as 'i64 (time 'local)) (as 'i64 (time 0)))))
 (any (!= 0 (% (as 'i64 clock-tm) 1000)))        -- true

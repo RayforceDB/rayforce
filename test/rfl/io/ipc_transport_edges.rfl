@@ -106,7 +106,7 @@ m -- 400
 ;; waiting send fails instead of waiting for ever.
 (set c (open-shm))
 (get (.ipc.handle c) 'transport) -- 'shm
-(.ipc.post c "(do (set s (.time.now)) (while (< (.time.now) (+ s 5000)) 0) 0)")
+(.ipc.post c "(do (set s (.time.mono)) (while (< (.time.mono) (+ s 5000)) 0) 0)")
 (.sys.exec "(sleep 1; kill -KILL $(cat /tmp/rftest_xport/pid)) >/dev/null 2>&1 &")
 (.ipc.send c (list 'count (til 6000000))) !- io
 

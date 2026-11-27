@@ -90,10 +90,10 @@
 (at (remove (dict ['a 'b 'c] [1 2 3]) 'b) 'c) -- 3
 
 ;; ══════════════════════════════════════════════════════════════════════
-;; .time.now (replaced old `timer` builtin in master)
+;; .time.mono (replaced old `timer` builtin in master)
 ;; ══════════════════════════════════════════════════════════════════════
-(>= (.time.now) 0) -- true
-(type (.time.now)) -- 'i64
+(>= (.time.mono) 0) -- true
+(type (.time.mono)) -- 'i64
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; ray_internals_fn (.sys.build)  (lines 674-700)

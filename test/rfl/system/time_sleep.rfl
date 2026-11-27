@@ -9,23 +9,23 @@
 
 ;; returns null, after at least the time asked for
 (nil? (.time.sleep 0)) -- true
-(set t0 (.time.now))
+(set t0 (.time.mono))
 (nil? (.time.sleep 200)) -- true
-(set dt (- (.time.now) t0))
+(set dt (- (.time.mono) t0))
 (>= dt 200) -- true
 (< dt 10000) -- true
 
 ;; any integer width counts milliseconds
-(set t0 (.time.now))
+(set t0 (.time.mono))
 (.time.sleep (as 'I32 50))
 (.time.sleep (as 'I16 50))
 (.time.sleep (as 'U8 50))
-(>= (- (.time.now) t0) 150) -- true
+(>= (- (.time.mono) t0) 150) -- true
 
 ;; a TIMESPAN is a duration: 150 ms here, and 1 ns rounds up to 1 ms
-(set t0 (.time.now))
+(set t0 (.time.mono))
 (nil? (.time.sleep 0D00:00:00.150000000)) -- true
-(set dt (- (.time.now) t0))
+(set dt (- (.time.mono) t0))
 (>= dt 150) -- true
 (< dt 10000) -- true
 (nil? (.time.sleep 0D00:00:00.000000001)) -- true

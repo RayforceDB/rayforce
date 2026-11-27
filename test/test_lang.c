@@ -14608,17 +14608,17 @@ static test_result_t test_temporal_extract_time_vector(void) {
     PASS();
 }
 
-/* ---- Test: timestamp clock function (timestamp 'local) and (timestamp 'global) ----
- * Exercises ray_timestamp_clock_fn, is_global_arg, ray_epoch_offset.
+/* ---- Test: the wall clocks (.time.local) and (.time.utc) ----
+ * Exercises ray_time_local_fn, ray_time_utc_fn, ray_epoch_offset.
  * We just verify it returns a TIMESTAMP atom (actual value depends on time). */
-static test_result_t test_temporal_timestamp_clock(void) {
-    ray_t* r_local = ray_eval_str("(timestamp 'local)");
+static test_result_t test_temporal_wall_clock(void) {
+    ray_t* r_local = ray_eval_str("(.time.local)");
     TEST_ASSERT_NOT_NULL(r_local);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r_local));
     TEST_ASSERT_EQ_I(r_local->type, -RAY_TIMESTAMP);
     ray_release(r_local);
 
-    ray_t* r_global = ray_eval_str("(timestamp 'global)");
+    ray_t* r_global = ray_eval_str("(.time.utc)");
     TEST_ASSERT_NOT_NULL(r_global);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r_global));
     TEST_ASSERT_EQ_I(r_global->type, -RAY_TIMESTAMP);
@@ -15146,8 +15146,8 @@ static test_result_t test_env_write_index_flags_and_capacity(void) {
     PASS();
 }
 
-/* (date 'local) was one day behind east of UTC and (timestamp 'local) was
- * identical to (timestamp 'global).  TZ is process-global and the cases run
+/* (date 'local) was one day behind east of UTC and the local timestamp
+ * clock (now .time.local) was identical to the UTC one (now .time.utc).  TZ is process-global and the cases run
  * in one process, so every observation is collected first, TZ is restored
  * (to unset if it was unset) unconditionally, and only then asserted. */
 static bool eval_is_true(const char* src) {
@@ -15175,12 +15175,12 @@ static test_result_t test_clock_local_follows_tz(void) {
         tzset();
         /* local - global stays within 2 s of the zone offset */
         snprintf(src, sizeof src,
-            "(< (abs (- (- (as 'I64 (timestamp 'local)) (as 'I64 (timestamp 'global))) %s)) 2000000000)",
+            "(< (abs (- (- (as 'I64 (.time.local)) (as 'I64 (.time.utc))) %s)) 2000000000)",
             zones[k].offset_ns);
         off_ok[k] = eval_is_true(src);
         /* the local date is the day of the local timestamp */
         date_ok[k] = eval_is_true(
-            "(== (as 'I64 (date 'local)) (div (as 'I64 (timestamp 'local)) 86400000000000))");
+            "(== (as 'I64 (date 'local)) (div (as 'I64 (.time.local)) 86400000000000))");
     }
     if (saved) setenv("TZ", saved, 1); else unsetenv("TZ");
     tzset();
@@ -15595,7 +15595,7 @@ static const char* const k_rs_skip[] = {
     "dl-stratify", "dl-eval", "dl-query", "dl-provenance", "dl-free", "println", "show",
     "print", "read", "write", "read-bytes", "write-bytes", "load", "exit",
     "read-value", "read-limits", "eval", "parse", "resolve", "timeit",
-    "env", "get", "del", "rc", "rand", "guid", "timestamp",
+    "env", "get", "del", "rc", "rand", "guid",
     ".emb.hnsw.build", ".emb.hnsw.free", ".emb.hnsw.set", ".emb.hnsw.get", ".emb.hnsw.info", ".emb.knn", ".emb.ann",
     ".emb.model.get", ".emb.model.info", ".emb.encode",
     "meta", NULL
@@ -16848,7 +16848,7 @@ const test_entry_t lang_entries[] = {
     { "lang/temporal/extract_builtins_fn",      test_temporal_extract_builtins_fn,      lang_setup, lang_teardown },
     { "lang/temporal/extract_time_atom",        test_temporal_extract_time_atom,        lang_setup, lang_teardown },
     { "lang/temporal/extract_time_vector",      test_temporal_extract_time_vector,      lang_setup, lang_teardown },
-    { "lang/temporal/timestamp_clock",          test_temporal_timestamp_clock,          lang_setup, lang_teardown },
+    { "lang/temporal/wall_clock",               test_temporal_wall_clock,          lang_setup, lang_teardown },
     { "lang/temporal/clock_global",             test_temporal_clock_global,             lang_setup, lang_teardown },
     { "lang/temporal/truncate_date_time_atoms", test_temporal_truncate_date_time_atoms, lang_setup, lang_teardown },
     { "lang/temporal/date_trunc_date_time_col", test_temporal_date_trunc_date_time_col, lang_setup, lang_teardown },

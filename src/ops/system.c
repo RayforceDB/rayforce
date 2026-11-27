@@ -1315,10 +1315,11 @@ ray_t* ray_remove_fn(ray_t* dict, ray_t* key) {
     return ray_dict_remove(dict, key);
 }
 
-/* (.time.now) -- current monotonic time in milliseconds */
-ray_t* ray_time_now_fn(ray_t** args, int64_t n) {
+/* (.time.mono) -- the monotonic clock in milliseconds, from a platform-
+ * defined epoch: for intervals and timer deadlines, never a date */
+ray_t* ray_time_mono_fn(ray_t** args, int64_t n) {
     (void)args;
-    if (n != 0) return ray_error("domain", ".time.now takes no arguments");
+    if (n != 0) return ray_error("domain", ".time.mono takes no arguments");
     return make_i64(ray_time_now_ms());
 }
 

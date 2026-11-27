@@ -621,7 +621,8 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b);
 /* Temporal builtins (formerly static in eval.c, now in temporal.c) */
 ray_t* ray_date_clock_fn(ray_t* arg);
 ray_t* ray_time_clock_fn(ray_t* arg);
-ray_t* ray_timestamp_clock_fn(ray_t* arg);
+ray_t* ray_time_utc_fn(ray_t** args, int64_t n);
+ray_t* ray_time_local_fn(ray_t** args, int64_t n);
 
 /* Sort builtins (formerly static in eval.c, now in sort.c) */
 ray_t* ray_asc_fn(ray_t* x);
@@ -694,7 +695,7 @@ ray_t* ray_rc_fn(ray_t* x);
 ray_t* ray_diverse_fn(ray_t* x);
 ray_t* ray_get_fn(ray_t* dict, ray_t* key);
 ray_t* ray_remove_fn(ray_t* dict, ray_t* key);
-ray_t* ray_time_now_fn       (ray_t** args, int64_t n);
+ray_t* ray_time_mono_fn      (ray_t** args, int64_t n);
 ray_t* ray_time_timer_set_fn (ray_t** args, int64_t n);
 ray_t* ray_time_timer_del_fn (ray_t*  id);
 ray_t* ray_time_sleep_fn     (ray_t*  x);

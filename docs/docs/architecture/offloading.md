@@ -162,7 +162,7 @@ What falls back to the flat path (the whole table in memory, the same answer):
 - a vector held by a lambda parameter, a `let` or a global, of any length (a mask, a projected vector), and anything computed to the table's or a partition's length (`til`, a helper returning a vector, a nested `select`);
 - aggregates, scans and windows (`avg`, `sums`, `deltas`, `fills`), also inside a helper or through a chain of helpers;
 - the set of `in`/`not-in` computed from columns;
-- forms the compiler does not lower: `rand`, `eval`, the clock functions `date`, `time` and `timestamp`, a computed callee, a closure, a path into a dict or table (`c.lo`, `(at c 'lo)`), a lookup `(at d x)`, `sym-name`, a cast to `STR`, elementwise `min`/`max`, `bin`/`binr`, `find`, `map`/`pmap`;
+- forms the compiler does not lower: `rand`, `eval`, the clocks (`date` and `time` of now, `.time.utc`, `.time.local`), a computed callee, a closure, a path into a dict or table (`c.lo`, `(at c 'lo)`), a lookup `(at d x)`, `sym-name`, a cast to `STR`, elementwise `min`/`max`, `bin`/`binr`, `find`, `map`/`pmap`;
 - a clause that reads no column and is not one scalar constant.
 
 ## Current Limitations

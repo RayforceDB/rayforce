@@ -16,7 +16,7 @@
   (fn [stream_id sn outlie orig_snrc orig_sn orig_cat body proxy_id]
     (insert 'sesslog
       (list
-        (timestamp 'utc)
+        (.time.utc)
         stream_id
         sn
         outlie

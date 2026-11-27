@@ -13,9 +13,9 @@
 (set h (.ipc.open addr))
 (.ipc.send h "(do (set T (table [a b] (list (% (til 16777216) 1000) (% (til 16777216) 7)))) 0)") -- 0
 (set q "(count (select {from: T by: [a b]}))")
-(set t0 (.time.now))
+(set t0 (.time.mono))
 (.ipc.send h q) -- 7000
-(set dl (max 2 (div (- (.time.now) t0) 4)))
+(set dl (max 2 (div (- (.time.mono) t0) 4)))
 (set n0 (at (.ipc.send h "(.sys.querylog.stats)") 'next))
 (set cut (fn [i] (do (set c (.ipc.open addr)) (try (.ipc.send c q dl) (fn [e] e)) (try (.ipc.close c) (fn [e] e)) i)))
 (map cut (til 5)) -- [0 1 2 3 4]

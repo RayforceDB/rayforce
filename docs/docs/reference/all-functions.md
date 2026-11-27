@@ -172,7 +172,6 @@ Every builtin registered in `src/` in this checkout, by arity, with its one-line
 | `tan` | Tangent, radians; returns f64 |
 | `til` | Generate range [0..n) |
 | `time` | Current wall-clock time (millisecond resolution), or extract time from timestamp; answers a TIME |
-| `timestamp` | Current wall-clock timestamp at the system clock's full resolution (nanoseconds on Linux) |
 | `trim` | Strip leading/trailing whitespace |
 | `type` | Get the type name of a value; a function value answers `UNARY`, `BINARY`, `VARY` or `LAMBDA` |
 | `ungroup` | Flatten a grouped table's nested list columns into one row per element |
@@ -358,8 +357,10 @@ Every builtin registered in `src/` in this checkout, by arity, with its one-line
 | `.sys.querylog.enable` | Toggle query-statistics logging; returns new state |
 | `.sys.querylog.stats` | The query-statistics ring's counters: `next` seq, rows `dropped` by the wrap, `capacity` |
 | `.sys.timeit` | Toggle / set the per-expression profiler |
-| `.time.now` | Monotonic time in milliseconds |
+| `.time.local` | Current wall-clock timestamp in local time (a timestamp carries no zone), at the system clock's full resolution |
+| `.time.mono` | Monotonic clock in milliseconds from a platform-defined epoch, for intervals and timer deadlines |
 | `.time.timer.set` | Schedule callback every `ms`, `num` times (0 = forever); returns id |
+| `.time.utc` | Current wall-clock timestamp in UTC, at the system clock's full resolution (nanoseconds on Linux) |
 | `alter` | Amend a named local or global binding and return its name |
 | `and` | Logical AND; element-wise on vectors and lists, each element by its truthiness (zero, null and NaN are false), in a query too (lengths must match) |
 | `anti-join` | Anti-semi-join — left rows with no right match |
@@ -1000,14 +1001,14 @@ Temporal constructors. Pass `0` to get the current clock value. Cross-temporal c
 |---|---|---|---|---|
 | `date` | unary | — | Current date, or extract date from timestamp; answers a DATE | `(date 0)` → today's date |
 | `time` | unary | — | Current wall-clock time (millisecond resolution), or extract time from timestamp; answers a TIME | `(time 0)` → current time |
-| `timestamp` | unary | — | Current wall-clock timestamp at the system clock's full resolution (nanoseconds on Linux) | `(timestamp 0)` |
 | `trunc` | binary | — | Floor a DATE, TIME or TIMESTAMP (atom or vector) to the start of the calendar or clock unit that holds it: `'year` `'quarter` `'month` `'week` `'day` `'hour` `'minute` `'second`. The result has the type of the second argument | `(trunc 'month 2024.05.17)` → `2024.05.01` |
 
 ```lisp
 ; Get current date/time
 (date 0)                    ; 2026.04.16
 (time 0)                    ; 14:30:00.000000000
-(timestamp 0)               ; 2026.04.16T14:30:00.000000000
+(.time.utc)                 ; 2026.04.16D13:30:00.000000000, UTC
+(.time.local)               ; 2026.04.16D14:30:00.000000000, local time (here UTC+1)
 ```
 
 ## Type & Introspection { #type-ops }
@@ -1087,7 +1088,9 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.os.setenv` | binary | restricted | Set environment variable | `(.os.setenv "KEY" "value")` |
 | `.sys.args` | nullary | — | Application arguments as a typed dict; `user` subdict holds post-`--` args | `(.sys.args)` |
 | `env` | unary | — | List all global environment bindings | `(env 0)` |
-| `.time.now` | variadic | — | Monotonic time in milliseconds | `(.time.now)` |
+| `.time.mono` | variadic | — | Monotonic clock in milliseconds from a platform-defined epoch, for intervals and timer deadlines | `(.time.mono)` |
+| `.time.utc` | variadic | — | Current wall-clock timestamp in UTC, at the system clock's full resolution (nanoseconds on Linux) | `(.time.utc)` |
+| `.time.local` | variadic | — | Current wall-clock timestamp in local time (a timestamp carries no zone), at the system clock's full resolution | `(.time.local)` |
 | `.time.timer.set` | variadic | restricted | Schedule callback every `ms`, `num` times (0 = forever); returns id | `(.time.timer.set 1000 0 (fn [t] (println t)))` |
 | `.time.timer.del` | unary | restricted | Cancel a scheduled timer by id; returns null | `(.time.timer.del 0)` |
 | `.time.sleep` | unary | restricted | Block the calling thread for `ms` milliseconds (an integer) or a timespan; returns null; a REPL Ctrl-C, an IPC cancel, a server-side `kill -INT`, or the client of a sync request hanging up ends it with `cancel`; an async one runs its full time; a journal replay skips it; it stalls a server's other connections while it waits | `(.time.sleep 500)` |
@@ -1114,9 +1117,9 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 (eval expr)                  ; 30
 
 ; Timing with monotonic millisecond clock
-(set t0 (.time.now))
+(set t0 (.time.mono))
 (sum (til 1000000))
-(println (format "%ms" (- (.time.now) t0)))
+(println (format "%ms" (- (.time.mono) t0)))
 
 ; System diagnostics
 (.sys.info)                    ; OS, CPU cores, memory budget

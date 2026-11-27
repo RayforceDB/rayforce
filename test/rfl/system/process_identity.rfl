@@ -67,7 +67,7 @@
 ;; ────────────── the reported use case, in one expression ──────────────
 ;; host + pid + wall clock is a diagnosable epoch: no temp file, no umask
 ;; dance, no cleanup, and reading it tells you which process it names.
-(> (count (format "%-%-%" (get (.sys.info) 'hostname) (get (.sys.info) 'pid) (timestamp 'global))) 0) -- true
+(> (count (format "%-%-%" (get (.sys.info) 'hostname) (get (.sys.info) 'pid) (.time.utc))) 0) -- true
 
 ;; A command the shell cannot run at all is an io error, not a decoded 255 —
 ;; otherwise it is indistinguishable from a command that genuinely exited 255.
