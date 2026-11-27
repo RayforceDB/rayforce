@@ -3032,6 +3032,11 @@ static bool distinct_ids_in_row_order(int64_t* idx, int64_t count, int64_t len) 
  * Factored out so the executor doesn't go through ray_distinct_fn, which
  * is now a lazy producer for vectors and would re-wrap into a chain.
  * Every typed vector keeps first-occurrence order (#1477). */
+/* The largest SYM domain distinct_vec_eager dedups with a presence array
+ * (a byte a symbol): past it the radix kernel's partitions beat the
+ * array's misses (#1795). */
+#define SYM_SEEN_MAX ((int64_t)1 << 23)
+
 ray_t* distinct_vec_eager(ray_t* x) {
     int64_t len = ray_len(x);
     if (len == 0) { ray_retain(x); return x; }
@@ -3081,13 +3086,17 @@ ray_t* distinct_vec_eager(ray_t* x) {
     if (!idx) return ray_error("oom", NULL);
 
     /* SYM presence-bitmap dedup: a SYM code is a position in [0, domain_count),
-     * so for a small domain a domain_count-byte "seen" array collects the
-     * first-occurrence row ids in O(n) with NO hashing — identical first-
-     * appearance order to the hashset path below.  Gate dc<=len so the array
-     * never costs more than the data it replaces; larger domains fall through. */
+     * so a domain_count-byte "seen" array collects the first-occurrence row
+     * ids in O(n) with NO hashing — identical first-appearance order to the
+     * hashset path below.  The domain is every symbol the vector's codes can
+     * name (for an in-memory vector, every symbol the runtime interned), not
+     * its distinct values.  Gate dc<=len so the array never costs more than
+     * the data it replaces, and dc<=SYM_SEEN_MAX; a larger domain takes the
+     * radix kernel below (it reads SYM codes too), a short vector the
+     * hashset. */
     if (x->type == RAY_SYM) {
         int64_t dc = ray_sym_domain_count(ray_sym_vec_domain(x));
-        if (dc > 0 && dc <= 65536 && dc <= len) {
+        if (dc > 0 && dc <= SYM_SEEN_MAX && dc <= len) {
             uint8_t* seen = (uint8_t*)ray_calloc_raw((size_t)dc);
             if (!seen) { if (idx != idx_stack) ray_free_raw(idx); return ray_error("oom", NULL); }
             const void* data = ray_data(x);
