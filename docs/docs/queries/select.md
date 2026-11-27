@@ -258,6 +258,28 @@ per-row call ([#1673](https://github.com/RayforceDB/rayforce/issues/1673)).
 (at (update {v: (H h) from: t}) 'v)         ; [2 2 2 2 2 2]
 ```
 
+A call whose head is computed rather than written as a name, such as a
+dictionary lookup `((at D 'f) i c)`, a helper's result `((rf) i)` or `first`
+of a list `((first (list reverse)) i)`, means the call of the function the head
+gives. In a select without `by:`, a head that reads no column and has no
+effect is evaluated once. A builtin it gives is called as if written by its
+name, when that name holds it there. A lambda it gives with nothing captured
+(no closure) is called as its text written in place. So
+`(sum ((at D 'f) i c))` with `D` holding `filter` gives what
+`(sum (filter i c))` gives, and `(first ((at D 'r) i))` under a `where:`
+gives the first of the kept rows reversed, not one cell. Any other computed
+head is called row by row: one that reads a column, or a name the select
+itself binds (an earlier output, a `let`), has an effect, fails, or gives a
+closure, and every computed head of a select that can have an effect in any
+clause (a helper that sets a global, a lambda the head gives that does) ([#1815](https://github.com/RayforceDB/rayforce/issues/1815)).
+
+```lisp
+(set T (table [i c] (list [10 20 30] [true false true])))
+(set D (dict ['f 'r] (list filter reverse)))
+(at (select {s: (sum ((at D 'f) i c)) from: T}) 's)               ; [40]
+(at (select {r: (first ((at D 'r) i)) from: T where: (> i 10)}) 'r)  ; [30]
+```
+
 Element-wise builtins work row by row on every route. The text renderers
 `format`, `repr` and `.json.format` are element-wise: over a column each gives
 one string per row in a projection, in `update`, in a `by:` output (each

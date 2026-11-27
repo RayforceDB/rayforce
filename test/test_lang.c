@@ -559,6 +559,89 @@ static test_result_t test_query_cd_group_expr_oom(void) {
 #endif
 
 #ifdef DEBUG
+/* #1815: a keyless select writes a computed call head as the builtin's
+ * name or the lambda's text it gives.  With each allocation of that
+ * rewrite failed in turn, once and twice running, it gives the rewritten
+ * expression, the expression as written (NULL: a head whose evaluation
+ * failed is left alone), or its owned oom error, and leaves nothing
+ * behind. */
+ray_t* ray_query_name_heads_for_test(ray_t* e, ray_t* tbl);
+ray_t* ray_select_plan_named_heads_for_test(ray_t* dict, ray_t* tbl);
+static test_result_t test_query_name_computed_heads_oom(void) {
+    ray_t* setup = ray_eval_str("(set D1815 (dict ['f 'l] (list filter (fn [x] (reverse x)))))");
+    TEST_ASSERT(setup && !RAY_IS_ERR(setup), "setup");
+    ray_release(setup);
+    ray_t* tbl = ray_eval_str("(table [c i] (list [true false true] [1 2 3]))");
+    TEST_ASSERT(tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE, "table");
+    ray_t* e = ray_parse("(+ (sum ((at D1815 'f) i c)) (first ((at D1815 'l) i)))");
+    TEST_ASSERT(e && !RAY_IS_ERR(e), "parse");
+    ray_t* want = ray_query_name_heads_for_test(e, tbl);
+    TEST_ASSERT(want && !RAY_IS_ERR(want) && want->type == RAY_LIST && want->len == 3, "both heads rewritten");
+    ray_t* named = ray_parse("(+ (sum (filter i c)) (first ((fn [x] (reverse x)) i)))");
+    TEST_ASSERT(named && !RAY_IS_ERR(named), "parse");
+    ray_t* wf = ray_fmt(want, 0);
+    ray_t* nf = ray_fmt(named, 0);
+    TEST_ASSERT(wf && !RAY_IS_ERR(wf) && nf && !RAY_IS_ERR(nf), "fmt");
+    TEST_ASSERT_STR_EQ(ray_str_ptr(wf), ray_str_ptr(nf));
+    ray_release(wf);
+    ray_release(nf);
+    ray_release(named);
+    ray_release(want);
+    for (int64_t nth = 1; nth <= 40; nth++) {
+        for (int64_t count = 1; count <= 2; count++) {
+            ray_heap_gc();
+            TEST_ASSERT_TRUE(ray_mem_trace_begin());
+            ray_alloc_fail_set_for_test(nth, count);
+            ray_t* r = ray_query_name_heads_for_test(e, tbl);
+            ray_alloc_fail_set_for_test(0, 0);
+            bool ok = !r || (RAY_IS_ERR(r) ? strcmp(ray_err_code(r), "oom") == 0
+                                           : r->type == RAY_LIST && r->len == 3);
+            if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+            ray_error_clear();
+            ray_heap_gc();
+            ray_mem_trace_t tr;
+            ray_mem_trace_end(&tr);
+            if (!ok || tr.net_bytes != 0)
+                fprintf(stderr, "  allocation %lld failed x%lld: %s, %lld bytes left\n", (long long)nth,
+                        (long long)count, ok ? "ok" : "wrong", (long long)tr.net_bytes);
+            TEST_ASSERT(ok, "the expression, as written or rewritten, or oom");
+            TEST_ASSERT(tr.net_bytes == 0, "nothing left behind");
+        }
+    }
+    ray_release(e);
+    /* the select the planner rewrites: its dict, from: the table */
+    ray_t* q = ray_parse("{from: T1815 r: (sum ((at D1815 'f) i c)) s: (first ((at D1815 'l) i))}");
+    TEST_ASSERT(q && !RAY_IS_ERR(q) && q->type == RAY_DICT, "query dict");
+    ray_t* plan = ray_select_plan_named_heads_for_test(q, tbl);
+    TEST_ASSERT(plan && !RAY_IS_ERR(plan) && plan->type == RAY_DICT, "rewritten");
+    ray_release(plan);
+    for (int64_t nth = 1; nth <= 60; nth++) {
+        for (int64_t count = 1; count <= 2; count++) {
+            ray_heap_gc();
+            TEST_ASSERT_TRUE(ray_mem_trace_begin());
+            ray_alloc_fail_set_for_test(nth, count);
+            ray_t* r = ray_select_plan_named_heads_for_test(q, tbl);
+            ray_alloc_fail_set_for_test(0, 0);
+            bool ok = !r || (RAY_IS_ERR(r) ? strcmp(ray_err_code(r), "oom") == 0 : r->type == RAY_DICT);
+            if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+            ray_error_clear();
+            ray_heap_gc();
+            ray_mem_trace_t tr;
+            ray_mem_trace_end(&tr);
+            if (!ok || tr.net_bytes != 0)
+                fprintf(stderr, "  select: allocation %lld failed x%lld: %s, %lld bytes left\n", (long long)nth,
+                        (long long)count, ok ? "ok" : "wrong", (long long)tr.net_bytes);
+            TEST_ASSERT(ok, "the query, as written or rewritten, or oom");
+            TEST_ASSERT(tr.net_bytes == 0, "nothing left behind");
+        }
+    }
+    ray_release(q);
+    ray_release(tbl);
+    PASS();
+}
+#endif
+
+#ifdef DEBUG
 /* A binary atomic builtin mapped over a collection, with each of its
  * allocations failed in turn, once and twice running, from the first: the
  * map's read of the first cells, the cells after it, the result.  The call
@@ -16029,6 +16112,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/binary_map_oom", test_eval_binary_map_oom, lang_setup, lang_teardown },
     { "lang/eval/typed_map_oom", test_eval_typed_map_oom, lang_setup, lang_teardown },
     { "lang/query/cd_group_expr_oom", test_query_cd_group_expr_oom, lang_setup, lang_teardown },
+    { "lang/query/name_computed_heads_oom", test_query_name_computed_heads_oom, lang_setup, lang_teardown },
     { "lang/eval/narrow_left_route", test_eval_narrow_left_route, lang_setup, lang_teardown },
     { "lang/eval/narrow_bounded_route", test_eval_narrow_bounded_route, lang_setup, lang_teardown },
 #endif

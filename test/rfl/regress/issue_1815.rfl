@@ -1,0 +1,93 @@
+;; #1815: in a keyless select, a call whose head is computed -- a dict
+;; lookup, a call's result, first of a list -- ran row by row, so an
+;; aggregate of such an operand raised `type` (filter of one cell) or read
+;; one cell where the named call reads the column (reverse).  A computed
+;; head that reads no column and has no effect is evaluated once: one that
+;; gives a builtin is written as the builtin's name (when that name holds
+;; it), one that gives a lambda with nothing captured as that lambda's
+;; text, so the select gives the named call's answer on every route.
+;; Under by: the outputs are left as written, and so is a head that reads
+;; a name the select binds (an output, a let), and every head of a select
+;; that can have an effect in any clause.
+(.sys.exec "rm -rf /tmp/rf_issue_1815 && mkdir -p /tmp/rf_issue_1815") -- 0
+(set T (table [g c i] (list ['a 'a 'b 'b 'b 'c 'a 'c 'b 'a] [true false true false true false true true false false] [10 20 30 40 50 60 70 80 90 15])))
+(set D (dict ['r 'f 'l 'x] (list reverse filter (fn [x] (reverse x)) (fn [x] (set zc (+ zc 1)) (reverse x)))))
+(set rf (fn [] reverse))
+(set ff (fn [] filter))
+(set rl (fn [x] (reverse x)))
+(set pick (fn [k] (at D k)))
+(.db.splayed.set "/tmp/rf_issue_1815/spl/t/" T "/tmp/rf_issue_1815/spl/.sym")
+(set S (.db.splayed.get "/tmp/rf_issue_1815/spl/t/" "/tmp/rf_issue_1815/spl/.sym"))
+(map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1815/par/%/t" (+ 2024.01.01 p)) T "/tmp/rf_issue_1815/par/.sym")) (til 2))
+(set P (.db.parted.get "/tmp/rf_issue_1815/par/" 't))
+;; the named calls, as on dev
+(at (select {from: T r: (sum (filter i c))}) 'r) -- [240]
+(at (select {from: T where: (> i 15) r: (max (filter i c))}) 'r) -- [80]
+(at (select {from: T where: (> i 15) r: (first (reverse i))}) 'r) -- [90]
+(at (select {from: T r: (first (reverse i))}) 'r) -- [15]
+(at (select {from: T r: (first (rl i))}) 'r) -- [15]
+(at (select {from: T r: (reverse i)}) 'r) -- [15 90 80 70 60 50 40 30 20 10]
+(at (select {from: T r: (sum ((fn [x m] (filter x m)) i c))}) 'r) -- [240]
+(at (select {from: T by: g r: (sum ((at D 'f) i c))}) 'r) -- [80 80 80]
+;; the issue's table: the named call's answer
+(at (select {from: T r: (sum ((at D 'f) i c))}) 'r) -- [240]
+(at (select {from: T r: (sum ((ff) i c))}) 'r) -- [240]
+(at (select {from: T r: (sum ((first (list filter)) i c))}) 'r) -- [240]
+(at (select {from: T r: (count ((at D 'f) i c))}) 'r) -- [5]
+(at (select {from: T where: (> i 15) r: (max ((at D 'f) i c))}) 'r) -- [80]
+(at (select {from: T where: (> i 15) r: (first ((at D 'r) i))}) 'r) -- [90]
+(at (select {from: T where: (> i 15) r: (last ((rf) i))}) 'r) -- [20]
+(at (select {from: T r: (first ((at D 'r) i))}) 'r) -- [15]
+(at (select {from: T r: ((at D 'r) i)}) 'r) -- [15 90 80 70 60 50 40 30 20 10]
+;; other computed heads: a helper given the key, first of a list of
+;; helpers, a lambda held in a dict, a head below another call
+(at (select {from: T r: (sum ((pick 'f) i c))}) 'r) -- [240]
+(at (select {from: T r: (first ((first (list rl)) i))}) 'r) -- [15]
+(at (select {from: T r: (first ((at D 'l) i))}) 'r) -- [15]
+(at (select {from: T where: (> i 15) r: ((at D 'l) i)}) 'r) -- [90 80 70 60 50 40 30 20]
+(at (select {from: T r: (sum (+ 1 ((at D 'f) i c)))}) 'r) -- [245]
+(at (select {from: T r: (count (distinct ((at D 'r) i)))}) 'r) -- [10]
+(select {from: T r: (sum ((at D 'f) i c)) s: (count i)}) -- (table [r s] (list [240] [10]))
+(select {from: T r: ((at D 'r) i) take: 3}) -- (table [r] (list [15 90 80]))
+((fn [d] (at (select {from: T r: (sum ((at d 'f) i c))}) 'r)) D) -- [240]
+;; a splayed and a parted table
+(at (select {from: S r: (sum ((at D 'f) i c))}) 'r) -- [240]
+(at (select {from: S where: (> i 15) r: (first ((at D 'r) i))}) 'r) -- [90]
+(at (select {from: P r: (sum ((at D 'f) i c))}) 'r) -- [480]
+(at (select {from: P r: (count ((rf) i))}) 'r) -- [20]
+;; a select that can have an effect anywhere is left as written: a lambda
+;; with an effect, row by row as on dev
+(set zc 0)
+(at (select {from: T r: (first ((at D 'x) i))}) 'r) -- [10]
+zc -- 10
+;; left as on dev: a head that reads a column, or has an effect, or fails
+(at (select {from: T r: (first ((do (set zz 1) (at D 'r)) i))}) 'r) -- [10]
+(at (select {from: T r: (first ((at D (first g)) i))}) 'r) !- type
+(at (select {from: T r: (first ((at D 'nope) i))}) 'r) !- type
+(at (select {from: (table [reverse i] (list [1 2 3] [4 5 6])) r: (first ((at D 'r) i))}) 'r) -- [4]
+;; a head that reads a name the select binds, an output before or after it
+;; or a let, is left as written: early, that name would be its global
+(set DV (dict ['rv 'as] (list reverse asc)))
+(set sel 'rv)
+(first (at (select {from: T sel: 'as x: (first sel)}) 'x)) -- 'as
+(at (select {from: T sel: 'as x: (first ((at DV sel) i))}) 'x) !- type
+(at (select {from: T where: (> i 15) sel: 'as x: (first ((at DV sel) i))}) 'x) !- type
+(at (select {from: T n: 1 x: (first ((at DV (if (== n 1) 'as 'rv)) i))}) 'x) !- type
+(at (select {from: T fs: (list asc) x: (first ((first fs) i))}) 'x) !- type
+(at (select {from: T x: (first ((at DV sel) i)) sel: 'as}) 'x) -- [15]
+(at (select {from: T x: (do (let sel 'as) (first ((at DV sel) i)))}) 'x) -- [10]
+;; a let in where: does not reach the outputs, which read the global
+(at (select {from: T where: (do (let sel 'as) (> i 15)) x: (first sel)}) 'x) -- ['rv]
+(at (select {from: T where: (do (let sel 'as) (> i 15)) x: (first ((at DV sel) i))}) 'x) -- [90]
+(at (select {from: T where: (> i 15) x: (first ((at DV sel) i))}) 'x) -- [90]
+;; an earlier output's helper that sets the name the head reads, called
+;; directly or through another helper: the head is not evaluated before it
+(set hs (fn [] (set sel 'as) 1))
+(set hn (fn [] (hs)))
+(at (select {from: T y: (hs) x: (first ((at DV sel) i))}) 'x) -- [10 10 10 10 10 10 10 10 10 10]
+(set sel 'rv)
+(at (select {from: T y: (hn) x: (first ((at DV sel) i))}) 'x) -- [10 10 10 10 10 10 10 10 10 10]
+(set sel 'rv)
+(at (select {from: T where: (> i (hs)) x: (first ((at DV sel) i))}) 'x) -- [10]
+(set sel 'rv)
+(.sys.exec "rm -rf /tmp/rf_issue_1815") -- 0

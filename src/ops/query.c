@@ -5470,6 +5470,221 @@ static bool fn_is_whole_col_projection_verb(const ray_t* fn) {
            f == (const void*)ray_idesc_fn || f == (const void*)ray_rank_fn;
 }
 
+static bool sym_names_col(ray_t* tbl, int64_t s);
+static bool builtin_runs_code(const ray_t* b);
+
+/* The names a select binds besides its table's columns, as an output sees
+ * them: the outputs before it and what a `let` or `set` in a clause binds
+ * (#1815).  Inside the query each is a value of the rows, or set while the
+ * query runs, so the early evaluation, which reads the global of that name,
+ * would not see the function the head gives there. */
+#define HEAD_BINDS_MAX 64
+typedef struct { int64_t ids[HEAD_BINDS_MAX]; int n; } head_binds_t;
+
+static bool head_binds_has(const head_binds_t* b, int64_t id) {
+    for (int i = 0; b && i < b->n; i++) if (b->ids[i] == id) return true;
+    return false;
+}
+
+/* Does the computed call head `h` read no column of `tbl`, as the
+ * evaluator would run it: no name of a column (quoted too, which a query
+ * resolves to the column), no call of code it does not show (a lambda
+ * literal, text evaluated at run time, a head itself computed), and a call
+ * of a global helper counted by what its body reads: `(rf)` with rf
+ * (fn [] reverse) reads none.  A lambda named as a value, as in
+ * `(first (list h))`, is data, not a call.  A helper with a closure, a
+ * helper parameter spelled as a column, and anything else this cannot
+ * read are taken as reading one. */
+static bool head_reads_no_column(ray_t* h, ray_t* tbl, const head_binds_t* binds, int depth) {
+    if (!h) return true;
+    if (depth > 16) return false;
+    if (h->type == -RAY_SYM) return !sym_names_col(tbl, h->i64) && !head_binds_has(binds, h->i64);
+    if (h->type == RAY_LAMBDA || h->type == RAY_DICT || builtin_runs_code(h)) return false;
+    if (h->type != RAY_LIST || (h->attrs & ATTR_QUOTED) || h->len < 1) return true;
+    ray_t** hs = (ray_t**)ray_data(h);
+    ray_t* h0 = hs[0];
+    if (!h0 || h0->type != -RAY_SYM || (h0->attrs & ATTR_QUOTED) || sym_names_col(tbl, h0->i64) ||
+        head_binds_has(binds, h0->i64)) return false;
+    ray_t* fn = ray_env_get(h0->i64);
+    if (!fn || RAY_IS_ERR(fn)) return false;
+    if (fn->type == RAY_VARY && (const void*)(uintptr_t)fn->i64 == (const void*)ray_quote_fn) return true;
+    if (fn->type == RAY_LAMBDA) {
+        if (LAMBDA_CLOSURE(fn)) return false;
+        ray_t* body = LAMBDA_BODY(fn);
+        if (!body || body->type != RAY_LIST) return false;
+        for (int64_t i = 0; i < body->len; i++)
+            if (!head_reads_no_column(((ray_t**)ray_data(body))[i], tbl, binds, depth + 1)) return false;
+    } else if (fn->type < RAY_UNARY || fn->type > RAY_VARY || builtin_runs_code(fn)) {
+        return false;
+    }
+    for (int64_t i = 1; i < h->len; i++)
+        if (!head_reads_no_column(hs[i], tbl, binds, depth + 1)) return false;
+    return true;
+}
+
+/* The function a computed call head gives (#1815): `h`, a head that is no
+ * name ((at D 'f), (first fs), (rf)), evaluated once, speculatively, when
+ * it has no effect and reads no column of `tbl` -- then it is the same
+ * function for every row, and the call is the named call of that function.
+ * An owned reference to a builtin, or to a lambda with nothing captured (no
+ * closure, made outside a query, not trusted by name), or NULL: the head is
+ * a name, a quote or lambda form, reads the rows or has an effect, its
+ * evaluation failed (the failure leaves no trace), or it gives anything
+ * else. */
+static ray_t* query_computed_head_fn(ray_t* h, ray_t* tbl, const head_binds_t* binds) {
+    if (!h || h->type != RAY_LIST || (h->attrs & ATTR_QUOTED) || ray_len(h) < 1) return NULL;
+    ray_t* h0 = ((ray_t**)ray_data(h))[0];   /* not-a-table */
+    if (h0 && h0->type == -RAY_SYM && !(h0->attrs & ATTR_QUOTED)) {
+        ray_t* f0 = ray_env_get(h0->i64);
+        /* (fn [...] ...) and (quote x) are the forms they write, not a head
+         * computed from values */
+        if (f0 && f0->type == RAY_VARY &&
+            ((const void*)(uintptr_t)f0->i64 == (const void*)ray_fn ||
+             (const void*)(uintptr_t)f0->i64 == (const void*)ray_quote_fn)) return NULL;
+    }
+    if (!tbl || !head_reads_no_column(h, tbl, binds, 0) || !query_expr_effect_free(h)) return NULL;
+    ray_error_state_t es;
+    ray_error_state_save(&es);
+    ray_t* trace0 = __VM ? __VM->trace : NULL;
+    ray_t* raise0 = __VM ? __VM->raise_val : NULL;
+    if (trace0) ray_retain(trace0);
+    if (raise0) ray_retain(raise0);
+    ray_t* v = ray_eval(h);
+    if (v && !RAY_IS_ERR(v) && ray_is_lazy(v)) v = ray_lazy_materialize(v);
+    bool failed = !v || RAY_IS_ERR(v);
+    if (failed) {
+        if (v) ray_error_free(v);
+        ray_error_state_restore(&es);
+        if (__VM && __VM->trace != trace0) {
+            if (__VM->trace) ray_release(__VM->trace);
+            __VM->trace = trace0;
+            trace0 = NULL;
+        }
+        if (__VM && __VM->raise_val != raise0) {
+            if (__VM->raise_val) ray_release(__VM->raise_val);
+            __VM->raise_val = raise0;
+            raise0 = NULL;
+        }
+    }
+    if (trace0) ray_release(trace0);
+    if (raise0) ray_release(raise0);
+    if (failed) return NULL;
+    bool lambda = v->type == RAY_LAMBDA && !LAMBDA_CLOSURE(v) && !LAMBDA_CAPROWS(v) &&
+                  !LAMBDA_CAPQ(v) && !LAMBDA_TRUSTED(v) && LAMBDA_PARAMS(v) &&
+                  LAMBDA_BODY(v) && LAMBDA_BODY(v)->type == RAY_LIST && LAMBDA_BODY(v)->len > 0;
+    bool builtin = v->type >= RAY_UNARY && v->type <= RAY_VARY && !(v->attrs & RAY_FN_SPECIAL_FORM);
+    if (!lambda && !builtin) {
+        ray_release(v);
+        return NULL;
+    }
+    return v;
+}
+
+/* Does `e` call through a head that is itself a call, not a quoted list or
+ * a lambda literal: the only shape query_name_computed_heads renames.  A
+ * walk of the text, so a query of named calls looks nothing up, and one of
+ * a lambda literal looks up its head's name alone. */
+static bool expr_has_list_head(ray_t* e, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1 || depth > 32) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (h && h->type == RAY_LIST && !(h->attrs & ATTR_QUOTED) && h->len > 0) {
+        ray_t* h0 = ((ray_t**)ray_data(h))[0];
+        ray_t* f0 = h0 && h0->type == -RAY_SYM && !(h0->attrs & ATTR_QUOTED) ? ray_env_get(h0->i64) : NULL;
+        bool form = f0 && f0->type == RAY_VARY &&
+                    ((const void*)(uintptr_t)f0->i64 == (const void*)ray_fn ||
+                     (const void*)(uintptr_t)f0->i64 == (const void*)ray_quote_fn);
+        if (!form) return true;
+    }
+    for (int64_t i = 1; i < e->len; i++) if (expr_has_list_head(es[i], depth + 1)) return true;
+    return false;
+}
+
+/* The text of the lambda `lam`, `(fn params body...)`: a call through it
+ * is the call of the lambda written in place, which a pure body inlines
+ * (one with an effect leaves the select as written,
+ * select_plan_named_heads).  Owned; NULL on oom. */
+static ray_t* query_lambda_form(ray_t* lam) {
+    ray_t* body = LAMBDA_BODY(lam);
+    ray_t* out = ray_list_new((int32_t)(body->len + 2));
+    ray_t* fs = out && !RAY_IS_ERR(out) ? ray_sym(ray_sym_intern("fn", 2)) : NULL;
+    if (!fs || RAY_IS_ERR(fs)) {
+        if (fs) ray_error_free(fs);
+        if (out && RAY_IS_ERR(out)) ray_error_free(out); else if (out) ray_release(out);
+        return NULL;
+    }
+    for (int64_t i = -2; i < body->len; i++) {
+        ray_t* item = i == -2 ? fs : i == -1 ? LAMBDA_PARAMS(lam) : ((ray_t**)ray_data(body))[i];
+        ray_t* nx = ray_list_append(out, item);
+        if (!nx || RAY_IS_ERR(nx)) {   /* a failed append leaves the list to the caller */
+            if (nx) ray_error_free(nx);
+            ray_release(out);
+            ray_release(fs);
+            return NULL;
+        }
+        out = nx;
+    }
+    ray_release(fs);
+    return out;
+}
+
+/* `e` with each computed call head that gives a function
+ * (query_computed_head_fn) written as the call of that function (#1815): a
+ * builtin as its name, when that name holds the same builtin here (no
+ * column or local of that spelling), so `(sum ((at D 'f) i c))` is
+ * `(sum (filter i c))`; a lambda as its text (query_lambda_form).  Every
+ * route then reads it as the named call.  Quoted forms and lambda literals
+ * are left as they are.  NULL when nothing is rewritten; else owned. */
+static ray_t* query_name_computed_heads(ray_t* e, ray_t* tbl, const head_binds_t* binds, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1 || depth > 32)
+        return NULL;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (wv_head_is_form(es[0], NULL, (const void*)ray_fn) ||
+        wv_head_is_form(es[0], NULL, (const void*)ray_quote_fn)) return NULL;
+    ray_t* out = NULL;
+    for (int64_t i = 0; i < e->len; i++) {
+        ray_t* sub = NULL;
+        if (i == 0 && es[0] && es[0]->type == RAY_LIST) {
+            ray_t* cf = query_computed_head_fn(es[0], tbl, binds);
+            if (cf && cf->type == RAY_LAMBDA) {
+                /* a lambda is called as its text written in place is */
+                sub = query_lambda_form(cf);
+                ray_release(cf);
+            } else if (cf) {
+                const char* nm = ray_fn_name(cf);
+                size_t nl = strlen(nm);
+                int64_t id = nl ? ray_sym_intern(nm, nl) : -1;
+                ray_t* named = id >= 0 && !tbl_has_col(tbl, id) && !ray_env_has_lexical_local(id)
+                             ? ray_env_get(id) : NULL;
+                if (named && named->type == cf->type && named->i64 == cf->i64) sub = ray_sym(id);
+                ray_release(cf);
+            }
+        }
+        if (!sub) sub = query_name_computed_heads(es[i], tbl, binds, depth + 1);
+        if (!sub) continue;
+        if (RAY_IS_ERR(sub)) { if (out) ray_release(out); return sub; }
+        if (!out) {
+            out = ray_list_new(e->len);
+            for (int64_t j = 0; j < e->len && out && !RAY_IS_ERR(out); j++) {
+                ray_t* nx = ray_list_append(out, es[j]);
+                if (!nx || RAY_IS_ERR(nx)) ray_release(out);
+                out = nx;
+            }
+            if (!out || RAY_IS_ERR(out)) { ray_release(sub); return out ? out : ray_error("oom", NULL); }
+            out->attrs = e->attrs;
+        }
+        ray_t** os = (ray_t**)ray_data(out);
+        ray_release(os[i]);
+        os[i] = sub;
+    }
+    return out;
+}
+
+#ifdef DEBUG
+/* Test seam (lang/query/name_computed_heads_oom): query_name_computed_heads. */
+ray_t* ray_query_name_heads_for_test(ray_t* e, ray_t* tbl) { return query_name_computed_heads(e, tbl, NULL, 0); }
+#endif
+
 static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return 0;
     if (ray_len(expr) < 2) return 0;
@@ -17604,6 +17819,7 @@ enum {
     SELECT_FREE_VECS_PLANNED   = 8,   /* free vectors read as rows made columns */
     SELECT_NO_PRUNE            = 16,  /* read every partition: the rows feed a by: key
                                        * with an effect (#1661) */
+    SELECT_HEADS_NAMED         = 32,  /* computed call heads named (#1815) */
 };
 static ray_t* ray_select_impl(ray_t** args, int64_t n, unsigned plan);
 ray_t* ray_update(ray_t** args, int64_t n);
@@ -23434,6 +23650,109 @@ static ray_t* refold_error(ray_t* dict, ray_t* tbl, const char* verb) {
     return NULL;
 }
 
+/* Add to `b` each name a `let` or `set` in `e` binds, wherever it stands
+ * (an `fn` body too: its lets are local, but a set is not, and the name is
+ * taken either way).  False when `b` is full or the walk too deep. */
+static bool head_binds_collect(ray_t* e, head_binds_t* b, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1) return true;
+    if (depth > 32) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED) && e->len >= 2 && es[1] &&
+        es[1]->type == -RAY_SYM && (wv_head_is_let(h) || wv_head_is_form(h, NULL, (const void*)ray_set_fn)) &&
+        !head_binds_has(b, es[1]->i64)) {
+        if (b->n >= HEAD_BINDS_MAX) return false;
+        b->ids[b->n++] = es[1]->i64;
+    }
+    for (int64_t i = 0; i < e->len; i++)
+        if (!head_binds_collect(es[i], b, depth + 1)) return false;
+    return true;
+}
+
+/* `engine` (consumed) with clause `kid` set to `v` (borrowed); an owned
+ * error, `engine` released, when an allocation fails. */
+static ray_t* named_heads_upsert(ray_t* engine, int64_t kid, ray_t* v) {
+    ray_t* k = ray_sym(kid);
+    if (!k || RAY_IS_ERR(k)) {
+        if (k) ray_error_free(k);
+        ray_release(engine);
+        return ray_error("oom", NULL);
+    }
+    engine = ray_dict_upsert(engine, k, v);
+    ray_release(k);
+    return engine;
+}
+
+/* A keyless select whose outputs call through a computed head that gives a
+ * function (query_name_computed_heads): the query with those heads written
+ * as the call of that function, reading `tbl`, so every route, planned or
+ * not, gives the named call's answer (#1815).  `((at D 'f) i c)` is the column
+ * `(filter i c)` gives, and `(first ((at D 'r) i))` under a where: the
+ * first of the kept rows reversed, not one cell each.  Under by: the
+ * outputs are left as written.  NULL when no head is renamed. */
+static ray_t* select_plan_named_heads(ray_t* dict, ray_t* tbl) {
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    /* the text first: a query of named calls looks nothing up */
+    bool any = false;
+    for (int64_t i = 0; i < vals->len && !any; i++)
+        any = expr_has_list_head(((ray_t**)ray_data(vals))[i], 0);
+    if (!any || dict_get(dict, "by")) return NULL;
+    const int64_t* rid = select_clause_ids();
+    int64_t nd = ray_dict_len(dict);
+    /* every let or set in a clause, then, output by output, the outputs
+     * before it (an output reads those, by name or quoted, and a global of
+     * its own name or a later one's); more than the set holds and nothing
+     * is rewritten */
+    head_binds_t binds = { .n = 0 };
+    for (int64_t i = 0; i < nd; i++)
+        if (sym_cell_runtime_id(keys, i) != rid[0] &&
+            !head_binds_collect(((ray_t**)ray_data(vals))[i], &binds, 0)) return NULL;
+    ray_t* engine = NULL;
+    for (int64_t i = 0; i < nd; i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        if (select_clause_key(rid, kid)) continue;
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        ray_t* nv = v && v->type == RAY_LIST && expr_has_list_head(v, 0)
+                  ? query_name_computed_heads(v, tbl, &binds, 0) : NULL;   /* where: is left as written */
+        if (nv && RAY_IS_ERR(nv)) { if (engine) ray_release(engine); return nv; }
+        if (nv) {
+            if (!engine) { engine = dict; ray_retain(engine); }
+            engine = named_heads_upsert(engine, kid, nv);   /* consumes engine */
+            ray_release(nv);
+            if (!engine || RAY_IS_ERR(engine)) return engine ? engine : ray_error("oom", NULL);
+        }
+        /* this output is bound for the ones after it */
+        if (!head_binds_has(&binds, kid)) {
+            if (binds.n >= HEAD_BINDS_MAX) { if (engine) ray_release(engine); return NULL; }
+            binds.ids[binds.n++] = kid;
+        }
+    }
+    if (!engine) return NULL;
+    /* Only a select free of effects is rewritten: an effect anywhere in it
+     * (a helper an earlier output calls that sets the name a head reads)
+     * could change what the head gives after the early evaluation.  The
+     * rewritten clauses are what is checked, a head being then the call of
+     * the function it gives; from: as written. */
+    ray_t* ek = ray_dict_keys(engine);
+    ray_t* ev = ray_dict_vals(engine);
+    bool pure = ek && ek->type == RAY_SYM && ev && ev->type == RAY_LIST;
+    for (int64_t i = 0; pure && i < ray_dict_len(engine); i++) {
+        int64_t kid = sym_cell_runtime_id(ek, i);
+        ray_t* v = kid == rid[0] ? dict_get(dict, "from") : ((ray_t**)ray_data(ev))[i];
+        pure = query_expr_effect_free(v);
+    }
+    if (!pure) { ray_release(engine); return NULL; }
+    engine = named_heads_upsert(engine, rid[0], tbl);
+    return engine ? engine : ray_error("oom", NULL);
+}
+
+#ifdef DEBUG
+/* Test seam (lang/query/name_computed_heads_oom): select_plan_named_heads. */
+ray_t* ray_select_plan_named_heads_for_test(ray_t* dict, ray_t* tbl) { return select_plan_named_heads(dict, tbl); }
+#endif
+
 /* A grouped output with an aggregate in an aggregate's argument is evaluated
  * per group (#1452).  A global vector as long as the table that it reads
  * elementwise, (max (+ W (count v))), stands for a column there, as it does
@@ -27559,6 +27878,18 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
     }
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "select: `from:` must evaluate to a table, got %s", ray_type_name(tbl_t)); }
     select_scan_register(args, dict, tbl, where_expr);
+
+    /* A computed head giving a function is its named call (#1815). */
+    if (!(plan & SELECT_HEADS_NAMED)) {
+        ray_t* engine = select_plan_named_heads(dict, tbl);
+        if (engine) {
+            ray_release(tbl);
+            if (RAY_IS_ERR(engine)) return engine;
+            ray_t* r = ray_select_impl(&engine, 1, plan | SELECT_HEADS_NAMED);
+            ray_release(engine);
+            return r;
+        }
+    }
 
     /* A free vector an aggregate reads is a column of the table (#1462). */
     if (!(plan & SELECT_FREE_VECS_PLANNED)) {
