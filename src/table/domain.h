@@ -130,6 +130,15 @@ ray_sym_domain_t* ray_sym_domain_new(void);
 void ray_sym_domain_retain(ray_sym_domain_t* dom);
 void ray_sym_domain_release(ray_sym_domain_t* dom);
 
+/* A private domain holding TEXT: the strings of a STR column a query keeps
+ * as symbol positions while it groups and sorts (a few bytes a row instead
+ * of a 16-byte descriptor), to be given back as a STR column when the query
+ * answers (ray_select_impl: sym_text_columns_to_str).  Set on the domain a
+ * derived key or projection interned its STR results into; never on a
+ * FILE or the runtime domain. */
+void ray_sym_domain_set_text(ray_sym_domain_t* dom);
+bool ray_sym_domain_is_text(const ray_sym_domain_t* dom);
+
 /* Borrowed string atom for position `pos` (NULL if out of range).
  * RUNTIME: delegates to ray_sym_str.  FILE: lazily materialized atom
  * owned by the domain (arena-backed, RAY_ATTR_ARENA) — valid for the

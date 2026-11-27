@@ -278,6 +278,7 @@ typedef struct {
 struct ray_sym_domain_s {
     uint8_t   kind;        /* dom_kind_t */
     bool      immortal;    /* runtime singleton: retain/release skip */
+    bool      text;        /* private: holds a STR column's strings (ray_sym_domain_set_text) */
     bool      replaced;    /* FILE: detached from the cache because its file was
                             * replaced at the path (#1497): the holders keep it,
                             * and it never writes to the path again */
@@ -2288,6 +2289,13 @@ ray_sym_domain_t* ray_sym_domain_new(void) {
     d->arena = ray_arena_new(64 * 1024);
     if (!d->arena) { ray_sys_free(d); return NULL; }
     return d;
+}
+
+void ray_sym_domain_set_text(ray_sym_domain_t* dom) {
+    if (dom && !dom->immortal && !dom->path) dom->text = true;
+}
+bool ray_sym_domain_is_text(const ray_sym_domain_t* dom) {
+    return dom && dom->text;
 }
 
 void ray_sym_domain_retain(ray_sym_domain_t* dom) {

@@ -1,0 +1,55 @@
+;; @requires: posix (fixture cleanup via .sys.exec)
+;; The per-symbol text projection of an inner select and the by-dict text
+;; key over a stored SYM column: a splayed table whose URL column reads
+;; over its FILE domain, and a parted table of two partitions.  Values
+;; against the materialized inner select grouped by the plain path, and
+;; the distinct counts against the tuple-distinct oracle.
+(.sys.exec "rm -rf /tmp/rfl_isp_storage") -- 0
+(set N 6000)
+(set i (til N))
+(set hosts ["Example.COM" "news.Site.org" "Shop.Market.NET" "Blog.Daily.com"])
+(set U (as 'SYM (map (fn [k] (format (if (== 0 (% k 3)) "http://www.%/p/%.html" "https://www.%/p/%.php") (at hosts (% k 4)) (% k 97))) i)))
+(set T (table [URL v w] (list U (% (* 7919 i) 2003) (% i 2))))
+(.db.splayed.set "/tmp/rfl_isp_storage/s/t/" T "/tmp/rfl_isp_storage/s/.sym")
+(set TS (.db.splayed.get "/tmp/rfl_isp_storage/s/t/" "/tmp/rfl_isp_storage/s/.sym"))
+(count TS) -- 6000
+(set runs (fn [] (at (.sys.mem) 'sym-map-runs)))
+(>= (runs) 0) -- true
+(set FP (fn [t] (ser (map (fn [c] (as 'STR (at t c))) (cols t)))))
+;; the inner select's text projection, an if over text literals coded a
+;; byte a row, its condition per symbol the FILE-domain column uses (no
+;; row-wise lower: no run), against the materialized inner select
+(set MS (select {from: TS lu: (lower URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}))
+(type (at MS 'kind)) -- 'STR
+(set OS (select {from: MS by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))
+(set m0 (runs))
+(set GS (select {from: (select {from: TS lu: (lower URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))
+(- (runs) m0) -- 0
+(type (at GS 'kind)) -- 'STR
+(all (== (FP GS) (FP OS))) -- true
+(at GS 'c) -- [1000 1000 2000 2000]
+(all (== (at GS 'd) (at (select {from: (select {from: MS by: [kind w v]}) by: [kind w] d: (count v) asc: [kind w]}) 'd))) -- true
+;; the by-dict text key over the FILE domain, against the same oracle
+(set MB (select {from: TS k: (if (like URL "*.html") "html" "php") w: w v: v}))
+(set OB (select {from: MB by: [k w] c: (count v) d: (count (distinct v)) asc: [k w]}))
+(set GB (select {from: TS by: {k: (if (like URL "*.html") "html" "php") w: w} c: (count v) d: (count (distinct v)) asc: [k w]}))
+(type (at GB 'k)) -- 'STR
+(all (== (FP GB) (FP OB))) -- true
+(all (== (at GB 'd) (at OS 'd))) -- true
+;; a where over the stored column, and a take
+(set GW (select {from: (select {from: TS lu: (lower URL) kind: (if (like lu "*.html") "html" "php") w: w v: v where: (== w 1)}) by: [kind] c: (count v) d: (count (distinct v)) asc: kind}))
+(all (== (FP GW) (FP (select {from: MS by: [kind] c: (count v) d: (count (distinct v)) where: (== w 1) asc: kind})))) -- true
+(at GW 'c) -- [1000 2000]
+;; a parted table of two partitions: the same shapes answer the same values
+(.db.splayed.set "/tmp/rfl_isp_storage/p/2024.01.01/t/" (table [URL v w] (list (take U 3000) (take (at T 'v) 3000) (take (at T 'w) 3000))) "/tmp/rfl_isp_storage/p/.sym")
+(.db.splayed.set "/tmp/rfl_isp_storage/p/2024.01.02/t/" (table [URL v w] (list (take U -3000) (take (at T 'v) -3000) (take (at T 'w) -3000))) "/tmp/rfl_isp_storage/p/.sym")
+(set TP (.db.parted.get "/tmp/rfl_isp_storage/p/" 't))
+(count TP) -- 6000
+(set MP (select {from: TP lu: (lower URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}))
+(set GP (select {from: (select {from: TP lu: (lower URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))
+(type (at GP 'kind)) -- 'STR
+(all (== (FP GP) (FP (select {from: MP by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]})))) -- true
+(all (== (FP GP) (FP OS))) -- true
+(set GPB (select {from: TP by: {k: (if (like URL "*.html") "html" "php") w: w} c: (count v) d: (count (distinct v)) asc: [k w]}))
+(all (== (FP GPB) (FP OB))) -- true
+(.sys.exec "rm -rf /tmp/rfl_isp_storage") -- 0

@@ -807,6 +807,13 @@ void ray_key_range_rows_set_for_test(int64_t rows);
 /* Bits kept of the derived-key grouping's key hash (ops/query.c dkh_hash),
  * so distinct keys collide; 0 restores the full 64 bits. */
 void ray_derived_key_hash_bits_set_for_test(int bits);
+void ray_derived_key_slot_budget_set_for_test(uint64_t bytes);
+void ray_derived_key_mem_budget_set_for_test(int64_t bytes);
+void ray_select_if_coded_off_for_test(bool off);
+/* The nth next ray_table_add_col (table/table.c) fails as an allocation in
+ * it would; 0 disarms.  The count left reads back: 0 once it ran. */
+void ray_table_add_col_fail_for_test(int nth);
+int  ray_table_add_col_fail_left_for_test(void);
 /* The two-pass grouping under a having cut (ops/query.c dk2_run): out[0]
  * its runs; of the last run, out[1] the groups emitted, out[2] the
  * candidate hashes, out[3] the groups made for colliding keys, out[4]

@@ -39,6 +39,7 @@ static void contract_teardown(void) {
     ray_agg_tablestack = true;
     ray_agg_radix_wave_bytes = 0;
     ray_agg_radix_spill = 0;
+    ray_select_if_coded_off_for_test(false);
     ray_runtime_destroy(contract_runtime);
     if (ray_pool_total_workers(ray_pool_get()) != contract_cores) {
         ray_pool_destroy();
@@ -514,6 +515,261 @@ static test_result_t test_derived_key_per_symbol_route(void) {
         TEST_ASSERT_FMT(agg_route_stats().key_domain_evals == cases[c].evals, "%s: %llu per-value evaluations",
                         cases[c].q, (unsigned long long)agg_route_stats().key_domain_evals);
     }
+    /* The per-symbol STR key is the row-wise key: same type, same groups. */
+    agg_route_reset();
+    r = ray_eval_str("(set DK (select {from: T by: {k: (if (like s \"h1*\") \"one\" \"rest\") m: (substr s 0 2)} c: (count v) d: (count (distinct v)) asc: [k m]}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    /* the STR key was kept as positions of a text domain while the query
+     * grouped and sorted (agg_route_stats().key_text_syms), and came back
+     * as the STR column checked below */
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    /* an inner select's text projection, which the outer reads as a key —
+     * per symbol too with no memory budget set (8192 rows, below the
+     * parallel threshold: one worker's share is every row, 16 symbols):
+     * one text key; and the row-wise oracle, the inner select materialized
+     * and grouped */
+    agg_route_reset();
+    r = ray_eval_str("(set RW (select {from: (select {from: T k: (if (like s \"h1*\") \"one\" \"rest\") m: (substr s 0 2) v: v}) by: [k m] c: (count v) d: (count (distinct v)) asc: [k m]}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    r = ray_eval_str("(do (set MRM (select {from: T k: (if (like s \"h1*\") \"one\" \"rest\") m: (substr s 0 2) v: v})) "
+                     "(set RM (select {from: MRM by: [k m] c: (count v) d: (count (distinct v)) asc: [k m]})))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    r = ray_eval_str("(and (== (type (at DK 'k)) 'STR) (== (type (at DK 'm)) 'SYM) (all (== (ser (map (fn [c] (as 'STR (at DK c))) (cols DK))) (ser (map (fn [c] (as 'STR (at RW c))) (cols RW))))) (all (== (ser (map (fn [c] (as 'STR (at RM c))) (cols RM))) (ser (map (fn [c] (as 'STR (at RW c))) (cols RW))))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the by-dict keys evaluated per symbol give the row-wise result");
+    ray_release(r);
+    /* the distinct counts, exactly: the distinct (k, m, v) tuples counted per
+     * (k, m) — a grouping with no outputs, not the count-distinct kernel —
+     * and by hand: 10 groups (h1 and h10..h15 share the key (one, h1)), v
+     * the 7 residues of i mod 7, every group sees them all */
+    r = ray_eval_str("(set OD (select {from: (select {from: T by: {k: (if (like s \"h1*\") \"one\" \"rest\") m: (substr s 0 2) vv: v}}) by: [k m] d: (count vv) asc: [k m]}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    r = ray_eval_str("(and (== (count DK) 10) (== (count OD) 10) (all (== (at DK 'd) (at OD 'd))) (all (== (at DK 'd) 7)) (all (== (at DK 'k) (at OD 'k))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the per-symbol keys' distinct counts are the oracle's: seven in each of the 10 groups");
+    ray_release(r);
+    /* The per-symbol route of a text projection from here on: the coded
+     * constant-arm if (test_if_coded_route) is off. */
+    ray_select_if_coded_off_for_test(true);
+    /* An inner select's text projection that is a function of one SYM column
+     * through its aliases (`kind` over `lu` over `s`), read by the outer
+     * select as a group key with a count distinct, under a memory budget
+     * its row-wise STR column (16 bytes a row: 128 KB here) takes more
+     * than an eighth of: evaluated once per symbol into a text domain
+     * (key_domain_evals, key_text_syms), the outer result STR, its groups
+     * and exact distinct counts those of the materialized inner select's
+     * distinct tuples.  With no budget set (the RAM's) too: 8192 rows are
+     * below the parallel threshold, one worker's share of them is every
+     * row, and the column uses 16 symbols.  The inner select alone and an
+     * outer that transforms the output (concat) take the row-wise
+     * projection. */
+    ray_derived_key_mem_budget_set_for_test(512 * 1024);
+    agg_route_reset();
+    r = ray_eval_str("(set P2 (select {from: (select {from: T lu: (lower s) kind: (if (like lu \"h1*\") \"one\" \"rest\") w: (as 'I64 (% v 2)) v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))");
+    ray_derived_key_mem_budget_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    /* the same query with no budget set: per symbol, the same groups */
+    agg_route_reset();
+    r = ray_eval_str("(set P2N (select {from: (select {from: T lu: (lower s) kind: (if (like lu \"h1*\") \"one\" \"rest\") w: (as 'I64 (% v 2)) v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    /* the oracles over the materialized inner select: grouped row-wise,
+     * and its distinct (kind, w, v) tuples */
+    r = ray_eval_str("(do (set MP2 (select {from: T kind: (if (like (lower s) \"h1*\") \"one\" \"rest\") w: (as 'I64 (% v 2)) v: v})) "
+                     "(set P2R (select {from: MP2 by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]})) "
+                     "(set P2O (select {from: (select {from: MP2 by: [kind w v]}) by: [kind w] d: (count v) asc: [kind w]})))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    r = ray_eval_str("(and (== (type (at P2 'kind)) 'STR) (== (count P2) 4) (all (== (ser (map (fn [c] (as 'STR (at P2 c))) (cols P2))) (ser (map (fn [c] (as 'STR (at P2R c))) (cols P2R))))) (all (== (at P2 'd) (at P2O 'd))) (all (== (at P2 'd) [4 3 4 3])) (== (sum (at P2 'c)) 8192) (== (type (at P2N 'kind)) 'STR) (all (== (ser (map (fn [c] (as 'STR (at P2 c))) (cols P2))) (ser (map (fn [c] (as 'STR (at P2N c))) (cols P2N))))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the per-symbol text projection groups as the row-wise one: STR key, 4 groups, the even and odd residues of v");
+    ray_release(r);
+    /* under the same budget: the inner select alone and an outer that
+     * transforms the output stay row-wise */
+    ray_derived_key_mem_budget_set_for_test(512 * 1024);
+    agg_route_reset();
+    r = ray_eval_str("(set P2A (select {from: T lu: (lower s) kind: (if (like lu \"h1*\") \"one\" \"rest\") v: v}))");
+    ray_derived_key_mem_budget_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 0);
+    r = ray_eval_str("(== (type (at P2A 'kind)) 'STR)");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the inner select alone keeps its STR projection");
+    ray_release(r);
+    ray_derived_key_mem_budget_set_for_test(512 * 1024);
+    agg_route_reset();
+    r = ray_eval_str("(set P2C (select {from: (select {from: T lu: (lower s) kind: (if (like lu \"h1*\") \"one\" \"rest\") v: v}) by: (concat kind \"!\") c: (count v) asc: kind}))");
+    ray_derived_key_mem_budget_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 0);
+    r = ray_eval_str("(and (== (count P2C) 2) (== (type (at P2C 'kind)) 'STR) (== (as 'STR (at (at P2C 'kind) 0)) \"one!\"))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "an outer select that transforms the output reads the row-wise STR projection");
+    ray_release(r);
+    /* Distinct counts of 1 and of 5 through the text projection: the "one"
+     * rows (s = h1.x: i = 1 mod 16, all odd) hold v = 3 alone, 512 times; the
+     * "rest" rows hold v = i mod 5, 3 among them (shared with "one"), split
+     * by w = i mod 2 into 4096 even and 3584 odd rows.  By hand, per
+     * (kind, w): (one 1) 512 rows 1 value, (rest 0) 4096 rows 5 values,
+     * (rest 1) 3584 rows 5 values; and by the distinct (kind, w, v) tuples
+     * of the materialized inner select.  Per symbol under the budget and
+     * without it (8192 rows, below the parallel threshold), the same
+     * answer. */
+    r = ray_eval_str("(do (set TD (table [s v w] (list s (map (fn [k] (if (== 1 (% k 16)) 3 (% k 5))) i) (% i 2)))) "
+                     "(set MQD (select {from: TD kind: (if (like (lower s) \"h1.*\") \"one\" \"rest\") w: w v: v})))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    static const char* const qd =
+        "(set QD (select {from: (select {from: TD lu: (lower s) kind: (if (like lu \"h1.*\") \"one\" \"rest\") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))";
+    for (int budgeted = 1; budgeted >= 0; budgeted--) {
+        if (budgeted) ray_derived_key_mem_budget_set_for_test(512 * 1024);
+        agg_route_reset();
+        r = ray_eval_str(qd);
+        ray_derived_key_mem_budget_set_for_test(0);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+        TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+        r = ray_eval_str("(and (== (type (at QD 'kind)) 'STR) "
+                         "(all (== (as 'STR (at QD 'kind)) [\"one\" \"rest\" \"rest\"])) "
+                         "(all (== (at QD 'w) [1 0 1])) (all (== (at QD 'c) [512 4096 3584])) (all (== (at QD 'd) [1 5 5])) "
+                         "(all (== (at QD 'd) (at (select {from: (select {from: MQD by: [kind w v]}) by: [kind w] d: (count v) asc: [kind w]}) 'd))))");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "budgeted %d: groups (one 1) (rest 0) (rest 1), 512/4096/3584 rows, 1/5/5 distinct", budgeted);
+        ray_release(r);
+    }
+#ifndef RAY_OS_WINDOWS
+    /* A FILE-domain column whose first 65536 rows read as near-unique (the
+     * 50000 distinct values come first) over 240000 rows, in a symfile the
+     * table's other text column fills with 240000 words of its own (the
+     * domain is 290000 entries — more than the rows — as a shared symfile
+     * is behind a URL column of 18M values over 100M rows): the column USES
+     * under a quarter as many symbols as it has rows, so an inner select's
+     * text projection is evaluated per symbol without the probe — under a
+     * memory budget its row-wise STR column (3.84 MB) takes more than an
+     * eighth of.  With no budget set, per symbol only while the 50000
+     * symbols fit one worker's share of the rows: at 4 workers (60000
+     * rows), not at 8 (30000: row-wise), with the same groups.  Eight
+     * workers from here on, whatever the host's count. */
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    r = ray_eval_str("(do (.sys.exec \"rm -rf /tmp/rf_agg_contract_dkgate\") "
+                     "(set j (til 240000)) "
+                     "(set uu (as 'SYMBOL (map (fn [k] (format (if (== 0 (% k 2)) \"http://a/%.html\" \"https://b/%.php\") (% k 50000))) j))) "
+                     "(set ww (as 'SYMBOL (map (fn [k] (format \"w%\" k)) j))) "
+                     "(.db.splayed.set \"/tmp/rf_agg_contract_dkgate/t\" (table [w u v] (list ww uu (% j 7)))) "
+                     "(set TF (.db.splayed.get \"/tmp/rf_agg_contract_dkgate/t\")) 0)");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    ray_derived_key_mem_budget_set_for_test(16 * 1024 * 1024);
+    agg_route_reset();
+    r = ray_eval_str("(set GF (select {from: (select {from: TF k: (if (like u \"*.html\") \"html\" \"php\") v: v}) by: [k] c: (count v) d: (count (distinct v)) asc: k}))");
+    ray_derived_key_mem_budget_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    agg_route_reset();
+    r = ray_eval_str("(set GFN (select {from: (select {from: TF k: (if (like u \"*.html\") \"html\" \"php\") v: v}) by: [k] c: (count v) d: (count (distinct v)) asc: k}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 0);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 0);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    agg_route_reset();
+    r = ray_eval_str("(set GFP (select {from: (select {from: TF k: (if (like u \"*.html\") \"html\" \"php\") v: v}) by: [k] c: (count v) d: (count (distinct v)) asc: k}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    r = ray_eval_str("(and (== (type (at GFN 'k)) 'STR) (== (type (at GFP 'k)) 'STR) (all (== (ser (map (fn [c] (as 'STR (at GF c))) (cols GF))) (ser (map (fn [c] (as 'STR (at GFN c))) (cols GFN))))) "
+                     "(all (== (ser (map (fn [c] (as 'STR (at GF c))) (cols GF))) (ser (map (fn [c] (as 'STR (at GFP c))) (cols GFP))))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "with no budget, row-wise at 8 workers and per symbol at 4, the same groups");
+    ray_release(r);
+    r = ray_eval_str("(and (== (count GF) 2) (== (type (at GF 'k)) 'STR) (all (== (at GF 'c) [120000 120000])) (all (== (at GF 'd) [7 7])) (all (== (at GF 'd) (at (select {from: (select {from: TF by: {k: (if (like u \"*.html\") \"html\" \"php\") vv: v}}) by: [k] d: (count vv) asc: k}) 'd))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the FILE-domain text projection groups exactly: two groups of 120000 rows, seven distinct values each");
+    ray_release(r);
+    /* The same key as a by-dict keeps the probe — `like` over SYM is
+     * already per distinct symbol row-wise — and reads the first rows as
+     * near-unique: row-wise. */
+    agg_route_reset();
+    r = ray_eval_str("(set GB (select {from: TF by: {k: (if (like u \"*.html\") \"html\" \"php\")} c: (count v) d: (count (distinct v)) asc: k}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 0);
+    r = ray_eval_str("(and (all (== (at GB 'c) (at GF 'c))) (all (== (at GB 'd) (at GF 'd))) (all (== (as 'STR (at GB 'k)) (as 'STR (at GF 'k)))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the by-dict key answers the same groups row-wise");
+    ray_release(r);
+    /* Under a memory budget the row-wise STR key column (16 bytes a row:
+     * 3.84 MB here) would take more than an eighth of, the by-dict key is
+     * evaluated per symbol — a byte a row — whatever the first rows read
+     * as; the groups are the same. */
+    ray_derived_key_mem_budget_set_for_test(16 * 1024 * 1024);
+    agg_route_reset();
+    r = ray_eval_str("(set GBm (select {from: TF by: {k: (if (like u \"*.html\") \"html\" \"php\")} c: (count v) d: (count (distinct v)) asc: k}))");
+    ray_derived_key_mem_budget_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    r = ray_eval_str("(and (all (== (at GBm 'c) (at GF 'c))) (all (== (at GBm 'd) (at GF 'd))) (all (== (as 'STR (at GBm 'k)) (as 'STR (at GF 'k)))) (== (type (at GBm 'k)) 'STR))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "under a small budget the by-dict key is per symbol with the same groups");
+    ray_release(r);
+    /* a budget the column fits in an eighth of: the probe decides, row-wise */
+    ray_derived_key_mem_budget_set_for_test((int64_t)64 * 1024 * 1024);
+    agg_route_reset();
+    r = ray_eval_str("(select {from: TF by: {k: (if (like u \"*.html\") \"html\" \"php\")} c: (count v) asc: k})");
+    ray_derived_key_mem_budget_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 0);
+    /* The groups of an unsorted outer select come out in the first-seen
+     * order of the texts, as the materialized inner select's do: a kind
+     * the second half of the rows alone shows comes last, whatever task
+     * coded its rows. */
+    r = ray_eval_str("(do (set u3 (as 'SYMBOL (map (fn [k] (format (if (== 0 (% k 2)) \"http://a/%.html\" (< k 120000) \"https://b/%.php\" \"https://c/%.jpg\") (% k 25000))) j))) "
+                     "(.db.splayed.set \"/tmp/rf_agg_contract_dkgate/t3\" (table [w u v] (list ww u3 (% j 7)))) "
+                     "(set TF3 (.db.splayed.get \"/tmp/rf_agg_contract_dkgate/t3\")) 0)");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    ray_derived_key_mem_budget_set_for_test(16 * 1024 * 1024);
+    agg_route_reset();
+    r = ray_eval_str("(set G3 (select {from: (select {from: TF3 k: (if (like u \"*.html\") \"html\" (like u \"*.php\") \"php\" \"jpg\") v: v}) by: [k] c: (count v) d: (count (distinct v))}))");
+    ray_derived_key_mem_budget_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    r = ray_eval_str("(set M3 (select {from: TF3 k: (if (like u \"*.html\") \"html\" (like u \"*.php\") \"php\" \"jpg\") v: v}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    r = ray_eval_str("(and (== (count G3) 3) (all (== (as 'STR (at G3 'k)) [\"html\" \"php\" \"jpg\"])) (all (== (at G3 'c) [120000 60000 60000])) (all (== (at G3 'd) [7 7 7])) (all (== (ser (map (fn [c] (as 'STR (at G3 c))) (cols G3))) (ser (map (fn [c] (as 'STR (at (select {from: M3 by: [k] c: (count v) d: (count (distinct v))}) c))) (cols G3))))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the groups come out html, php, jpg — first-seen over the rows — with the materialized select's counts");
+    ray_release(r);
+    /* The bitmaps of the slot coding's tasks fit their budget together:
+     * under a budget of one byte the pass runs as one task, under one of
+     * two bitmaps as at most two, with the same groups in the same order. */
+    uint32_t slot_tasks = agg_route_stats().key_slot_tasks;
+    TEST_ASSERT(slot_tasks >= 1, "the slot coding ran");
+    static const uint64_t budgets[] = { 1, 2 * ((37501 + 7) / 8) };
+    for (size_t b = 0; b < 2; b++) {
+        ray_derived_key_slot_budget_set_for_test(budgets[b]);
+        ray_derived_key_mem_budget_set_for_test(16 * 1024 * 1024);
+        agg_route_reset();
+        r = ray_eval_str("(set G3b (select {from: (select {from: TF3 k: (if (like u \"*.html\") \"html\" (like u \"*.php\") \"php\" \"jpg\") v: v}) by: [k] c: (count v) d: (count (distinct v))}))");
+        ray_derived_key_mem_budget_set_for_test(0);
+        ray_derived_key_slot_budget_set_for_test(0);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+        TEST_ASSERT_FMT(agg_route_stats().key_slot_tasks <= (b == 0 ? 1u : 2u), "budget %llu: %u slot-coding tasks",
+                        (unsigned long long)budgets[b], agg_route_stats().key_slot_tasks);
+        r = ray_eval_str("(all (== (ser (map (fn [c] (as 'STR (at G3b c))) (cols G3b))) (ser (map (fn [c] (as 'STR (at G3 c))) (cols G3)))))");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the capped pass answers the same groups in the same order");
+        ray_release(r);
+    }
+    r = ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_agg_contract_dkgate\")");
+    if (r) ray_release(r);
+#endif
     /* A user lambda shadowing `substr` is what the compiled key would call. */
     r = ray_eval_str("(set substr (fn [x a b] x))");
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
@@ -524,6 +780,500 @@ static test_result_t test_derived_key_per_symbol_route(void) {
     PASS();
 }
 
+/* Run `q` under a memory budget of 512 KB — the row-wise STR column of
+ * 6000 rows (96 KB) takes more than an eighth of it — and return how many
+ * keys were evaluated per symbol; -1 when the query fails. */
+static int64_t text_proj_evals_budgeted(const char* q) {
+    ray_derived_key_mem_budget_set_for_test(512 * 1024);
+    agg_route_reset();
+    ray_t* r = ray_eval_str(q);
+    ray_derived_key_mem_budget_set_for_test(0);
+    if (!r || RAY_IS_ERR(r)) { if (r) ray_error_free(r); return -1; }
+    ray_release(r);
+    return (int64_t)agg_route_stats().key_domain_evals;
+}
+
+/* An inner select's text projection read by the select above under a
+ * memory budget its row-wise STR column takes more than an eighth of, and
+ * with none (test/rfl/query/inner_select_pushdown.rfl holds the same
+ * queries with no budget): 6000 rows are below the parallel threshold, so
+ * one worker's share of them is every row, and the column uses 776
+ * symbols — the route is the same both ways.  Per symbol: a bare group
+ * key, a key over several arms of one alias, a comparison with a literal,
+ * a splayed FILE-domain column.
+ * Row-wise all the same: a comparison with a genuine STR column or with
+ * another output, an output named as an input column or twice, an alias
+ * whose helper has an effect, and a parted table.  Each answer exactly, by
+ * hand and against the materialized inner select.  Past the parallel
+ * threshold with no budget, the workers decide: 72000 rows using 12000
+ * symbols. */
+static test_result_t test_text_projection_budget_routes(void) {
+    ray_select_if_coded_off_for_test(true);   /* the per-symbol route: test_if_coded_route has the coded if */
+    static const char* const setup =
+        "(set N 6000) (set i (til N)) "
+        "(set hosts [\"Example.COM\" \"news.Site.org\" \"Shop.Market.NET\" \"Blog.Daily.com\"]) "
+        "(set U (as 'SYM (map (fn [k] (format (if (== 0 (% k 3)) \"http://www.%/p/%.html\" \"https://www.%/p/%.php\") (at hosts (% k 4)) (% k 97))) i))) "
+        "(set T (table [URL v w] (list U (% (* 7919 i) 2003) (% i 2)))) "
+        "(set MI (select {from: T lu: (lower URL) kind: (if (like lu \"*.html\") \"html\" \"php\") w: w v: v})) "
+        "(set s (at [\"html\" \"php\" \"x\"] (% i 3))) "
+        "(set Ts (table [URL s v] (list U s (% (* 7919 i) 2003)))) "
+        "(set Us (as 'SYM (map (fn [k] (format \"Http://X/%.Html\" (% k 50))) i))) "
+        "(set TSh (table [URL v] (list Us (% i 7)))) 0";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    const struct { const char* q; int64_t evals; const char* check; } cases[] = {
+        /* per symbol: the groups and exact distinct counts of the
+         * materialized select (html rows k = 0 mod 3, v = 7919 k mod 2003:
+         * 1000 distinct per w over the 1000 rows of each html group) */
+        { "(set R (select {from: (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu \"*.html\") \"html\" \"php\") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))", 1,
+          "(and (== (type (at R 'kind)) 'STR) (all (== (as 'STR (at R 'kind)) [\"html\" \"html\" \"php\" \"php\"])) (all (== (at R 'c) [1000 1000 2000 2000])) "
+          "(all (== (at R 'd) (at (select {from: (select {from: MI by: [kind w v]}) by: [kind w] d: (count v) asc: [kind w]}) 'd))) (all (== (take (at R 'd) 2) [1000 1000])))" },
+        { "(set R (select {from: (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu \"*.html\") \"html\" \"php\") w: w v: v}) by: kind c: (count v) asc: kind}))", 1,
+          "(and (== (type (at R 'kind)) 'STR) (all (== (as 'STR (at R 'kind)) [\"html\" \"php\"])) (all (== (at R 'c) [2000 4000])))" },
+        { "(set R (select {from: (select {from: Ts lu: (lower URL) kind: (if (like lu \"*.html\") \"html\" \"php\") s: s v: v}) where: (== kind \"html\") c: (count v)}))", 1,
+          "(all (== (at R 'c) [2000]))" },
+        { "(set R (select {from: (select {from: T lu: (lower URL) kind: (if (like lu \"*.html\") \"html\" (like lu \"*.php\") \"php\" (like lu \"*.jpg\") \"jpg\" \"other\") v: v}) by: [kind] c: (count v) d: (count (distinct v)) asc: kind}))", 1,
+          "(and (all (== (as 'STR (at R 'kind)) [\"html\" \"php\"])) (all (== (at R 'c) [2000 4000])) "
+          "(all (== (at R 'd) (at (select {from: (select {from: MI by: [kind v]}) by: [kind] d: (count v) asc: kind}) 'd))))" },
+        /* row-wise: compared with a STR column (k = 0, 1 mod 3 match: 4000
+         * rows), with another output (every row), shadowed, named twice */
+        { "(set R (select {from: (select {from: Ts lu: (lower URL) kind: (if (like lu \"*.html\") \"html\" \"php\") s: s v: v}) where: (== kind s) c: (count v)}))", 0,
+          "(all (== (at R 'c) [4000]))" },
+        { "(set R (select {from: (select {from: Ts lu: (lower URL) kind: (if (like lu \"*.html\") \"html\" \"php\") k2: (if (like lu \"*.php\") \"php\" \"html\") v: v}) where: (== kind k2) c: (count v)}))", 0,
+          "(all (== (at R 'c) [6000]))" },
+        { "(set R (select {from: (select {from: TSh URL: (lower URL) kind: (if (like URL \"*7.html\") \"a\" \"b\") v: v}) by: kind c: (count v) asc: kind}))", 0,
+          "(and (all (== (as 'STR (at R 'kind)) [\"a\" \"b\"])) (all (== (at R 'c) [600 5400])))" },
+        { "(set R (select {from: (select {from: TSh lu: (lower URL) lu: (upper URL) kind: (if (like lu \"*7.HTML\") \"a\" \"b\") v: v}) by: kind c: (count v) asc: kind}))", 0,
+          "(and (all (== (as 'STR (at R 'kind)) [\"a\" \"b\"])) (all (== (at R 'c) [600 5400])))" },
+        /* an effect under the alias: once per row */
+        { "(do (set h3 0) (set tick (fn [x] (do (set h3 (+ h3 1)) (lower x)))) (set R (select {from: (select {from: T lu: (tick URL) kind: (if (like lu \"*.html\") \"html\" \"php\") v: v}) by: kind c: (count v) asc: kind})))", 0,
+          "(and (== h3 6000) (all (== (at R 'c) [2000 4000])))" },
+    };
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        int64_t ev = text_proj_evals_budgeted(cases[c].q);
+        TEST_ASSERT_FMT(ev == cases[c].evals, "%s: %lld per-symbol evaluations", cases[c].q, (long long)ev);
+        r = ray_eval_str(cases[c].check);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "%s: %s", cases[c].q, cases[c].check);
+        ray_release(r);
+        /* with no budget set, the same route and the same answer */
+        r = ray_eval_str("(set RB R)");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        agg_route_reset();
+        r = ray_eval_str(cases[c].q);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        TEST_ASSERT_FMT((int64_t)agg_route_stats().key_domain_evals == cases[c].evals, "%s: %llu per-symbol evaluations with no budget",
+                        cases[c].q, (unsigned long long)agg_route_stats().key_domain_evals);
+        r = ray_eval_str("(all (== (ser (map (fn [c] (as 'STR (at R c))) (cols R))) (ser (map (fn [c] (as 'STR (at RB c))) (cols RB)))))");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "%s: the answers with and without a budget differ", cases[c].q);
+        ray_release(r);
+    }
+    /* Past the parallel threshold with no budget, per symbol while the
+     * column uses no more symbols than one worker's share of the rows:
+     * 72000 rows using 12000 symbols (k mod 12000 fixes the scheme and the
+     * host) — per symbol at 4 workers (18000 rows each), row-wise at 8
+     * (9000), per symbol at 8 under a budget the row-wise STR column
+     * (1.15 MB) takes more than an eighth of (a quarter of the rows).  The
+     * same answer each time, by hand: html rows k = 0 mod 3, 12000 per w;
+     * v = k mod 6000 holds the multiples of 6 (w 0) or 3 mod 6 (w 1) for
+     * html, 1000 values each, and the 2000 values 2 and 4 (w 0) or 1 and 5
+     * (w 1) mod 6 for php; and against the materialized inner select. */
+    r = ray_eval_str("(do (set iw (til 72000)) "
+                     "(set Uw (as 'SYM (map (fn [k] (format (if (== 0 (% k 3)) \"http://www.%/p/%.html\" \"https://www.%/p/%.php\") (at hosts (% k 4)) (% k 12000))) iw))) "
+                     "(set Tw (table [URL v w] (list Uw (% iw 6000) (% iw 2)))) "
+                     "(set MW (select {from: Tw kind: (if (like (lower URL) \"*.html\") \"html\" \"php\") w: w v: v})) "
+                     "(set OW (select {from: MW by: [kind w] c: (count v) asc: [kind w]})) "
+                     "(count (distinct Uw)))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 12000);
+    ray_release(r);
+    static const struct { uint32_t workers; int64_t budget; uint64_t evals; } wruns[] = {
+        { 4, 0, 1 }, { 8, 0, 0 }, { 8, 512 * 1024, 1 },
+    };
+    for (size_t k = 0; k < sizeof(wruns)/sizeof(wruns[0]); k++) {
+        ray_pool_destroy();
+        TEST_ASSERT_EQ_I(ray_pool_init_total(wruns[k].workers), RAY_OK);
+        if (wruns[k].budget) ray_derived_key_mem_budget_set_for_test(wruns[k].budget);
+        agg_route_reset();
+        r = ray_eval_str("(set RW (select {from: (select {from: Tw lu: (lower URL) x: (upper URL) kind: (if (like lu \"*.html\") \"html\" \"php\") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))");
+        ray_derived_key_mem_budget_set_for_test(0);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        TEST_ASSERT_FMT(agg_route_stats().key_domain_evals == wruns[k].evals && agg_route_stats().key_text_syms == wruns[k].evals,
+                        "%u workers, budget %lld: %llu per-symbol evaluations", wruns[k].workers, (long long)wruns[k].budget,
+                        (unsigned long long)agg_route_stats().key_domain_evals);
+        r = ray_eval_str("(and (== (type (at RW 'kind)) 'STR) (all (== (as 'STR (at RW 'kind)) [\"html\" \"html\" \"php\" \"php\"])) "
+                         "(all (== (at RW 'w) [0 1 0 1])) (all (== (at RW 'c) [12000 12000 24000 24000])) (all (== (at RW 'd) [1000 1000 2000 2000])) "
+                         "(all (== (at RW 'c) (at OW 'c))) "
+                         "(all (== (at RW 'd) (at (select {from: (select {from: MW by: [kind w v]}) by: [kind w] d: (count v) asc: [kind w]}) 'd))))");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "%u workers, budget %lld: groups, counts and exact distinct counts",
+                        wruns[k].workers, (long long)wruns[k].budget);
+        ray_release(r);
+    }
+#ifndef RAY_OS_WINDOWS
+    /* A splayed table over its FILE domain, per symbol, and a parted table
+     * of two partitions, whose column is no one vector: row-wise.  Both
+     * the materialized select's groups (html rows 1000 per w, php 2000)
+     * and distinct counts. */
+    r = ray_eval_str("(do (.sys.exec \"rm -rf /tmp/rf_agg_contract_tpb\") "
+                     "(.db.splayed.set \"/tmp/rf_agg_contract_tpb/s/t/\" T \"/tmp/rf_agg_contract_tpb/s/.sym\") "
+                     "(set TS (.db.splayed.get \"/tmp/rf_agg_contract_tpb/s/t/\" \"/tmp/rf_agg_contract_tpb/s/.sym\")) "
+                     "(.db.splayed.set \"/tmp/rf_agg_contract_tpb/p/2024.01.01/t/\" (take T 3000) \"/tmp/rf_agg_contract_tpb/p/.sym\") "
+                     "(.db.splayed.set \"/tmp/rf_agg_contract_tpb/p/2024.01.02/t/\" (take T -3000) \"/tmp/rf_agg_contract_tpb/p/.sym\") "
+                     "(set TP (.db.parted.get \"/tmp/rf_agg_contract_tpb/p/\" 't)) "
+                     "(set OS (select {from: MI by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]})) 0)");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    static const char* const stored[] = {
+        "(set R (select {from: (select {from: TS lu: (lower URL) kind: (if (like lu \"*.html\") \"html\" \"php\") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))",
+        "(set R (select {from: (select {from: TP lu: (lower URL) kind: (if (like lu \"*.html\") \"html\" \"php\") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))",
+    };
+    for (size_t c = 0; c < 2; c++) {
+        int64_t ev = text_proj_evals_budgeted(stored[c]);
+        TEST_ASSERT_FMT(ev == (c == 0 ? 1 : 0), "%s: %lld per-symbol evaluations", stored[c], (long long)ev);
+        r = ray_eval_str("(and (== (type (at R 'kind)) 'STR) (all (== (at R 'c) [1000 1000 2000 2000])) "
+                         "(all (== (ser (map (fn [c] (as 'STR (at R c))) (cols R))) (ser (map (fn [c] (as 'STR (at OS c))) (cols OS))))))");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "%s: the materialized select's groups", stored[c]);
+        ray_release(r);
+    }
+    r = ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_agg_contract_tpb\")");
+    if (r) ray_release(r);
+#endif
+    PASS();
+}
+
+
+/* An inner select's projection the DAG types other than STR is no text key:
+ * it stays row-wise before the per-symbol route does any work — no
+ * slot coding (key_slot_tasks), no evaluation per symbol — under a memory
+ * budget its row-wise column takes more than an eighth of (6000 rows using
+ * 776 symbols).
+ * A SYM one (substr over SYM keeps the column's symbols), a BOOL one and a
+ * numeric one; each answer by hand and against the same query with no
+ * budget.  The same substr over the column as STR types STR: per value. */
+static test_result_t test_text_projection_typed_rowwise(void) {
+    static const char* const setup =
+        "(set N 6000) (set i (til N)) "
+        "(set hosts [\"Example.COM\" \"news.Site.org\" \"Shop.Market.NET\" \"Blog.Daily.com\"]) "
+        "(set U (as 'SYM (map (fn [k] (format (if (== 0 (% k 3)) \"http://www.%/p/%.html\" \"https://www.%/p/%.php\") (at hosts (% k 4)) (% k 97))) i))) "
+        "(set T (table [URL v w] (list U (% (* 7919 i) 2003) (% i 2)))) 0";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    const struct { const char* q; const char* m; const char* check; } cases[] = {
+        /* html rows k = 0 mod 3: "http://www.exa" and the like, 500 rows
+         * a host; php "https://www.ex", 1000 a host: 8 prefixes */
+        { "(set R (select {from: (select {from: T kind: (substr (lower URL) 0 14) v: v}) by: kind c: (count v) asc: kind}))",
+          "(set M (select {from: (select {from: T kind: (substr (lower URL) 0 14) v: v}) by: kind c: (count v) asc: kind}))",
+          "(and (== (count R) 8) (all (== (at R 'c) [500 500 500 500 1000 1000 1000 1000])) (== (type (at R 'kind)) 'SYM) (all (== (at R 'kind) (at M 'kind))))" },
+        { "(set R (select {from: (select {from: T h: (like (lower URL) \"*.html\") v: v}) by: h c: (count v) asc: h}))",
+          "(set M (select {from: (select {from: T h: (like (lower URL) \"*.html\") v: v}) by: h c: (count v) asc: h}))",
+          "(and (all (== (at R 'h) [false true])) (all (== (at R 'c) [4000 2000])) (all (== (at R 'c) (at M 'c))))" },
+        { "(set R (select {from: (select {from: T n: (strlen (lower URL)) v: v}) by: n c: (count v) asc: n}))",
+          "(set M (select {from: (select {from: T n: (strlen (lower URL)) v: v}) by: n c: (count v) asc: n}))",
+          "(and (== (sum (at R 'c)) 6000) (all (== (at R 'n) (at M 'n))) (all (== (at R 'c) (at M 'c))))" },
+    };
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        r = ray_eval_str(cases[c].m);   /* the oracle, no budget */
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        ray_derived_key_mem_budget_set_for_test(512 * 1024);
+        agg_route_reset();
+        r = ray_eval_str(cases[c].q);
+        ray_derived_key_mem_budget_set_for_test(0);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        TEST_ASSERT_FMT(agg_route_stats().key_slot_tasks == 0 && agg_route_stats().key_domain_evals == 0,
+                        "%s: %u slot-coding tasks, %llu per-symbol evaluations", cases[c].q,
+                        agg_route_stats().key_slot_tasks, (unsigned long long)agg_route_stats().key_domain_evals);
+        r = ray_eval_str(cases[c].check);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "%s: %s", cases[c].q, cases[c].check);
+        ray_release(r);
+    }
+    /* the same substr over the column as STR types STR: per value */
+    ray_derived_key_mem_budget_set_for_test(512 * 1024);
+    agg_route_reset();
+    r = ray_eval_str("(do (set TS (table [URL v] (list (as 'STR U) (at T 'v)))) "
+                     "(set R (select {from: (select {from: TS kind: (substr (lower URL) 0 14) v: v}) by: kind c: (count v) asc: kind})))");
+    ray_derived_key_mem_budget_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+    r = ray_eval_str("(and (== (type (at R 'kind)) 'STR) (all (== (at R 'c) [500 500 500 500 1000 1000 1000 1000])) "
+                     "(all (== (as 'STR (at R 'kind)) (as 'STR (at (select {from: (select {from: T kind: (substr (lower URL) 0 14) v: v}) by: kind c: (count v) asc: kind}) 'kind)))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the STR column's 8 prefixes, as the SYM column's");
+    ray_release(r);
+    PASS();
+}
+
+/* An unsorted select grouping by an inner select's text projection held as
+ * text positions answers its groups in the order the materialized inner
+ * select's STR column gives them: the order the rows first show them, the
+ * composite keys interleaved and a where: deciding the first row (k = 27
+ * is the first zeta row, odd; k = 114 the first even one; past where:
+ * (> v 1000) the first row is k = 1, a mid one), not the order of the
+ * positions — past the parallel threshold, 72000 rows.  Coded a byte a
+ * row (select_if_coded), and per symbol under a memory budget and with
+ * none; the oracle is the materialized inner select grouped as STR. */
+static test_result_t test_text_projection_group_order(void) {
+    static const char* const setup =
+        "(set N 72000) (set i (til N)) "
+        "(set hosts [\"Example.COM\" \"news.Site.org\" \"Shop.Market.NET\" \"Blog.Daily.com\"]) "
+        "(set U (as 'SYM (map (fn [k] (format (if (== 0 (% k 3)) \"http://www.%/p/%.html\" \"https://www.%/p/%.php\") (at hosts (% k 4)) (% k 97))) i))) "
+        "(set T (table [URL v w] (list U (% (* 7919 i) 2003) (% i 2)))) "
+        "(set MI (select {from: T kind: (if (like (lower URL) \"*7.html\") \"zeta\" (like (lower URL) \"*.html\") \"alpha\" \"mid\") w: w v: v})) 0";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    const struct { const char* q; const char* o; const char* hand; } cases[] = {
+        { "(set R (select {from: (select {from: T lu: (lower URL) kind: (if (like lu \"*7.html\") \"zeta\" (like lu \"*.html\") \"alpha\" \"mid\") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v))}))",
+          "(set O (select {from: MI by: [kind w] c: (count v) d: (count (distinct v))}))",
+          "(and (all (== (as 'STR (at R 'kind)) [\"alpha\" \"mid\" \"mid\" \"alpha\" \"zeta\" \"zeta\"])) (all (== (at R 'w) [0 1 0 1 1 0])) (== (sum (at R 'c)) 72000))" },
+        { "(set R (select {from: (select {from: T lu: (lower URL) kind: (if (like lu \"*7.html\") \"zeta\" (like lu \"*.html\") \"alpha\" \"mid\") v: v where: (> v 1000)}) by: kind c: (count v)}))",
+          "(set O (select {from: (select {from: MI where: (> v 1000)}) by: kind c: (count v)}))",
+          "(and (== (count R) 3) (== (as 'STR (at (at R 'kind) 0)) \"mid\"))" },
+    };
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        r = ray_eval_str(cases[c].o);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        for (int budgeted = 2; budgeted >= 0; budgeted--) {
+            /* 2: the coded if; 1 and 0: per symbol, under a budget and not */
+            ray_select_if_coded_off_for_test(budgeted < 2);
+            if (budgeted == 1) ray_derived_key_mem_budget_set_for_test(512 * 1024);
+            agg_route_reset();
+            r = ray_eval_str(cases[c].q);
+            ray_derived_key_mem_budget_set_for_test(0);
+            ray_select_if_coded_off_for_test(false);
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+            TEST_ASSERT_FMT(agg_route_stats().key_text_syms == 1, "%s, budgeted %d: the key held as text positions", cases[c].q, budgeted);
+            TEST_ASSERT_FMT(agg_route_stats().key_if_coded == (budgeted == 2) && agg_route_stats().key_domain_evals == (budgeted < 2),
+                            "%s, budgeted %d: %llu coded, %llu per symbol", cases[c].q, budgeted,
+                            (unsigned long long)agg_route_stats().key_if_coded, (unsigned long long)agg_route_stats().key_domain_evals);
+            r = ray_eval_str("(and (== (type (at R 'kind)) 'STR) (== (count R) (count O)) "
+                             "(all (== (ser (map (fn [c] (as 'STR (at R c))) (cols R))) (ser (map (fn [c] (as 'STR (at O c))) (cols O))))))");
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "%s, budgeted %d: the materialized select's groups in its order", cases[c].q, budgeted);
+            ray_release(r);
+            r = ray_eval_str(cases[c].hand);
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "%s, budgeted %d: %s", cases[c].q, budgeted, cases[c].hand);
+            ray_release(r);
+        }
+    }
+    PASS();
+}
+
+/* A column the text projection adds to the inner select's table failing
+ * as an allocation would (ray_table_add_col consumes the table, also then):
+ * each add_col of the query fails in turn, through the coded if, the
+ * per-symbol projection over a SYM column, and over a STR column, whose
+ * aliases are bound to the table of its values (dk_bind_aliases), and a
+ * by-dict key added to the query's table.  The query answers as the
+ * materialized inner select does, or raises oom; it never reads the
+ * released table (ASan). */
+static test_result_t test_text_projection_add_col_fails(void) {
+    static const char* const setup =
+        "(set N 72000) (set i (til N)) "
+        "(set hosts [\"Example.COM\" \"news.Site.org\" \"Shop.Market.NET\" \"Blog.Daily.com\"]) "
+        "(set U (as 'SYM (map (fn [k] (format (if (== 0 (% k 3)) \"http://www.%/p/%.html\" \"https://www.%/p/%.php\") (at hosts (% k 4)) (% k 97))) i))) "
+        "(set T (table [URL v w] (list U (% (* 7919 i) 2003) (% i 2)))) "
+        "(set T2 (table [URL v w] (list (as 'STR U) (% (* 7919 i) 2003) (% i 2)))) "
+        "(set MI (select {from: T lu: (lower URL) kind: (if (like lu \"*7.html\") \"zeta\" (like lu \"*.html\") \"alpha\" \"mid\") w: w v: v})) "
+        "(set O (select {from: MI by: [kind w] c: (count v) d: (count (distinct v))})) 0";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    static const char* const qf = "(set R (select {from: (select {from: %s lu: (lower URL) kind: (if (like lu \"*7.html\") \"zeta\" (like lu \"*.html\") \"alpha\" \"mid\") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v))}))";
+    char q[512];
+    for (int route = 0; route < 3; route++) {
+        /* 0: the coded if; 1: per symbol over the SYM column; 2: over the
+         * STR column, lu bound to the table of its values */
+        snprintf(q, sizeof q, qf, route == 2 ? "T2" : "T");
+        int failed = 0, oom = 0;
+        for (int nth = 1; nth <= 64; nth++) {
+            ray_select_if_coded_off_for_test(route > 0);
+            if (route > 0) ray_derived_key_mem_budget_set_for_test(512 * 1024);
+            agg_route_reset();
+            ray_table_add_col_fail_for_test(nth);
+            r = ray_eval_str(q);
+            int left = ray_table_add_col_fail_left_for_test();
+            ray_table_add_col_fail_for_test(0);
+            ray_derived_key_mem_budget_set_for_test(0);
+            ray_select_if_coded_off_for_test(false);
+            TEST_ASSERT_NOT_NULL(r);
+            if (RAY_IS_ERR(r)) {
+                TEST_ASSERT_FMT(left == 0, "route %d, add_col %d: an error with no add_col failed", route, nth);
+                ray_error_free(r); oom++; failed++;
+                continue;
+            }
+            ray_release(r);
+            if (left > 0) {   /* past the query's add_cols: it ran whole, on its route */
+                TEST_ASSERT_FMT(route == 0 ? agg_route_stats().key_if_coded == 1 : agg_route_stats().key_domain_evals == 1,
+                                "route %d: %llu coded, %llu per symbol", route,
+                                (unsigned long long)agg_route_stats().key_if_coded, (unsigned long long)agg_route_stats().key_domain_evals);
+                break;
+            }
+            failed++;
+            r = ray_eval_str("(and (== (type (at R 'kind)) 'STR) (== (count R) (count O)) "
+                             "(all (== (ser (map (fn [c] (as 'STR (at R c))) (cols R))) (ser (map (fn [c] (as 'STR (at O c))) (cols O))))))");
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "route %d, add_col %d failing: the materialized select's groups", route, nth);
+            ray_release(r);
+        }
+        TEST_ASSERT_FMT(failed > 0 && failed < 64, "route %d: %d add_cols failed in turn", route, failed);
+        (void)oom;
+    }
+    /* a by-dict key added to the table: a failed add leaves the query's
+     * table released once, the global T intact */
+    r = ray_eval_str("(set OB (select {from: T by: {k: (lower URL)} c: (count v)})) 0");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    int bd_failed = 0;
+    for (int nth = 1; nth <= 64; nth++) {
+        ray_table_add_col_fail_for_test(nth);
+        r = ray_eval_str("(set R (select {from: T by: {k: (lower URL)} c: (count v)}))");
+        int left = ray_table_add_col_fail_left_for_test();
+        ray_table_add_col_fail_for_test(0);
+        TEST_ASSERT_NOT_NULL(r);
+        if (RAY_IS_ERR(r)) {
+            TEST_ASSERT_FMT(left == 0, "by-dict, add_col %d: an error with no add_col failed", nth);
+            ray_error_free(r); bd_failed++;
+            continue;
+        }
+        ray_release(r);
+        if (left > 0) break;
+        bd_failed++;
+        r = ray_eval_str("(all (== (ser R) (ser OB)))");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "by-dict, add_col %d failing: the groups of the query", nth);
+        ray_release(r);
+    }
+    TEST_ASSERT_FMT(bd_failed > 0 && bd_failed < 64, "by-dict: %d add_cols failed in turn", bd_failed);
+    r = ray_eval_str("(and (== (count T) 72000) (all (== (ser (select {from: T by: {k: (lower URL)} c: (count v)})) (ser OB))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "by-dict: T intact after the failed adds");
+    ray_release(r);
+    PASS();
+}
+
+/* An inner select's if over text literals, read by the select above as a
+ * key, and a by-dict key of one in a select with outputs, are coded a byte
+ * a row (key_if_coded) — not evaluated per symbol
+ * (key_domain_evals), whatever the budget — over a SYM column through an
+ * alias, a STR column, an else arm that is an if, conditions over several
+ * columns, and a table below the parallel threshold.  Row-wise: an empty
+ * text arm, a numeric condition, a condition reading a global, a then arm
+ * that is an if, a parted table.  Each answer against the materialized
+ * inner select, exactly. */
+static test_result_t test_if_coded_route(void) {
+    static const char* const setup =
+        "(set N 72000) (set i (til N)) "
+        "(set s (at (as 'SYM [\"a.html\" \"b.php\" \"c.jpg\" \"D.HTML\" \"e.txt\"]) (% i 5))) "
+        "(set T (table [s v w x] (list s (% i 7) (% i 2) (% i 20)))) "
+        "(set TS (table [s v w x] (list (as 'STR s) (% i 7) (% i 2) (% i 20)))) "
+        "(set lim 3) 0";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    /* {from, the projection}: the outer select groups by [kind w] with a
+     * count and a count distinct; the oracle runs it over the
+     * materialized inner select */
+    const struct { const char* from; const char* proj; uint64_t coded; } cases[] = {
+        { "T", "lu: (lower s) kind: (if (like lu \"*.html\") \"html\" (like lu \"*.php\") \"php\" \"other\")", 1 },
+        { "TS", "lu: (lower s) kind: (if (like lu \"*.html\") \"html\" (like lu \"*.php\") \"php\" \"other\")", 1 },
+        { "T", "kind: (if (like s \"*.html\") \"html\" (if (> v 3) \"hi\" \"lo\"))", 1 },
+        { "T", "kind: (if (and (like s \"*.html\") (== w 0)) \"h0\" (> x 15) \"big\" \"rest\")", 1 },
+        { "(take T 100)", "kind: (if (> v 4) \"a\" (< v 1) \"a\" (== w 1) \"b\" \"a\")", 1 },
+        { "T", "kind: (if (like s \"*.php\") \"\" \"p\")", 0 },
+        { "T", "kind: (if v \"nz\" \"z\")", 0 },
+        { "T", "kind: (if (> v lim) \"a\" \"b\")", 0 },
+        { "T", "kind: (if (> v 3) (if (> v 5) \"a\" \"b\") \"c\")", 0 },
+    };
+    char q[1024], o[1024];
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        snprintf(q, sizeof q, "(set R (select {from: (select {from: %s %s w: w x: x}) by: [kind w] c: (count x) d: (count (distinct x))}))",
+                 cases[c].from, cases[c].proj);
+        snprintf(o, sizeof o, "(do (set M (select {from: %s %s w: w x: x})) "
+                 "(set O (select {from: M by: [kind w] c: (count x) d: (count (distinct x))})) "
+                 "(set OD (select {from: (select {from: M by: [kind w x]}) by: [kind w] d: (count x)})) 0)",
+                 cases[c].from, cases[c].proj);
+        r = ray_eval_str(o);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        for (int budgeted = 1; budgeted >= 0; budgeted--) {
+            if (budgeted) ray_derived_key_mem_budget_set_for_test(512 * 1024);
+            agg_route_reset();
+            r = ray_eval_str(q);
+            ray_derived_key_mem_budget_set_for_test(0);
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+            TEST_ASSERT_FMT(agg_route_stats().key_if_coded == cases[c].coded, "%s, budgeted %d: %llu coded",
+                            q, budgeted, (unsigned long long)agg_route_stats().key_if_coded);
+            if (cases[c].coded)
+                TEST_ASSERT_FMT(agg_route_stats().key_domain_evals == 0 && agg_route_stats().key_text_syms == 1,
+                                "%s, budgeted %d: coded, not per symbol", q, budgeted);
+            r = ray_eval_str("(and (== (type (at R 'kind)) (type (at M 'kind))) "
+                             "(all (== (ser (map (fn [c] (as 'STR (at R c))) (cols R))) (ser (map (fn [c] (as 'STR (at O c))) (cols O))))) "
+                             "(all (== (at R 'd) (at OD 'd))) (== (sum (at R 'c)) (count M)))");
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "%s, budgeted %d: the materialized select's groups, in its order", q, budgeted);
+            ray_release(r);
+        }
+    }
+    /* The same ifs as by-dict keys of a select with outputs: coded, the
+     * groups of the materialized select's [kind w] in its order; a by-dict
+     * of keys alone (the distinct) keeps the STR key, row-wise. */
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        const char* pj = strstr(cases[c].proj, "kind: ");
+        if (!pj || strncmp(cases[c].proj, "lu:", 3) == 0) continue;   /* no aliases in a by-dict */
+        snprintf(q, sizeof q, "(set R (select {from: %s by: {%s w: w} c: (count x) d: (count (distinct x))}))", cases[c].from, pj);
+        snprintf(o, sizeof o, "(do (set M (select {from: %s %s w: w x: x})) "
+                 "(set O (select {from: M by: [kind w] c: (count x) d: (count (distinct x))})) "
+                 "(set OD (select {from: (select {from: M by: [kind w x]}) by: [kind w] d: (count x)})) 0)",
+                 cases[c].from, pj);
+        r = ray_eval_str(o);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        agg_route_reset();
+        r = ray_eval_str(q);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        TEST_ASSERT_FMT(agg_route_stats().key_if_coded == cases[c].coded, "%s: %llu coded",
+                        q, (unsigned long long)agg_route_stats().key_if_coded);
+        r = ray_eval_str("(and (== (type (at R 'kind)) (type (at M 'kind))) "
+                         "(all (== (ser (map (fn [c] (as 'STR (at R c))) (cols R))) (ser (map (fn [c] (as 'STR (at O c))) (cols O))))) "
+                         "(all (== (at R 'd) (at OD 'd))) (== (sum (at R 'c)) (count M)))");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_FMT(r->type == -RAY_BOOL && r->b8, "%s: the materialized select's groups, in its order", q);
+        ray_release(r);
+    }
+    agg_route_reset();
+    r = ray_eval_str("(set R (select {from: T by: {kind: (if (like s \"*.html\") \"html\" \"rest\")}}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_if_coded, 0);
+    r = ray_eval_str("(and (== (type (at R 'kind)) 'STR) (all (== (as 'STR (at R 'kind)) [\"html\" \"rest\"])))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the distinct keys, STR");
+    ray_release(r);
+    /* by hand, the first: html i = 0, 3 mod 5, php 1 mod 5, the rest
+     * other; two values of x per residue of i mod 10 */
+    r = ray_eval_str("(do (set R (select {from: (select {from: T lu: (lower s) kind: (if (like lu \"*.html\") \"html\" (like lu \"*.php\") \"php\" \"other\") w: w x: x}) by: [kind w] c: (count x) d: (count (distinct x))})) "
+                     "(and (all (== (as 'STR (at R 'kind)) [\"html\" \"php\" \"other\" \"html\" \"php\" \"other\"])) (all (== (at R 'w) [0 1 0 1 0 1])) "
+                     "(all (== (at R 'c) [14400 7200 14400 14400 7200 14400])) (all (== (at R 'd) [4 2 4 4 2 4]))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "six groups in first-seen order, 14400/7200 rows, 4/2 distinct x");
+    ray_release(r);
+#ifndef RAY_OS_WINDOWS
+    /* a parted table: row-wise, the same groups */
+    r = ray_eval_str("(do (.sys.exec \"rm -rf /tmp/rf_agg_contract_ifc\") "
+                     "(.db.splayed.set \"/tmp/rf_agg_contract_ifc/p/2024.01.01/t/\" (take T 36000) \"/tmp/rf_agg_contract_ifc/p/.sym\") "
+                     "(.db.splayed.set \"/tmp/rf_agg_contract_ifc/p/2024.01.02/t/\" (take T -36000) \"/tmp/rf_agg_contract_ifc/p/.sym\") "
+                     "(set TP (.db.parted.get \"/tmp/rf_agg_contract_ifc/p/\" 't)) 0)");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    agg_route_reset();
+    r = ray_eval_str("(set RP (select {from: (select {from: TP lu: (lower s) kind: (if (like lu \"*.html\") \"html\" (like lu \"*.php\") \"php\" \"other\") w: w x: x}) by: [kind w] c: (count x) asc: [kind w]}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_if_coded, 0);
+    r = ray_eval_str("(and (all (== (as 'STR (at RP 'kind)) [\"html\" \"html\" \"other\" \"other\" \"php\" \"php\"])) (all (== (at RP 'c) [14400 14400 14400 14400 7200 7200])))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the parted table's groups row-wise");
+    ray_release(r);
+    r = ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_agg_contract_ifc\")");
+    if (r) ray_release(r);
+#endif
+    PASS();
+}
 
 /* The legacy dense-array grouping seeds the workers' sets lazily and its
  * parallel merge skips the chunks a worker never seeded.  agg_route_stats()
@@ -815,20 +1565,25 @@ static test_result_t test_derived_key_per_str_value_route(void) {
         "(set TU2 (table [s v] (list (concat \"u\" (as 'STR j)) (% j 5))))";
     ray_t* r = ray_eval_str(setup);
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
-    const struct { const char* q; uint64_t evals; uint64_t indexed; } cases[] = {
-        { "(select {from: T by: (upper (trim s)) c: (count v)})", 1, 1 },
-        { "(select {from: T by: {k: (upper (trim s))} c: (count v) where: (!= s \"\")})", 1, 1 },
-        { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v)})", 1, 1 },
-        { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v) u: (count (distinct v)) where: (!= s \"\")})", 1, 1 },
+    /* `text`: a by-dict's STR key over the distinct values is kept as
+     * positions of a text domain while the query groups (key_text_syms) and
+     * takes the dense route; a lone by: expression, a key with "" among its
+     * values (T's where: drops those rows) and a row-wise key stay STR on
+     * the indexed route. */
+    const struct { const char* q; uint64_t evals; uint64_t indexed; uint64_t text; } cases[] = {
+        { "(select {from: T by: (upper (trim s)) c: (count v)})", 1, 1, 0 },
+        { "(select {from: T by: {k: (upper (trim s))} c: (count v) where: (!= s \"\")})", 1, 0, 1 },
+        { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v)})", 1, 1, 0 },
+        { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v) u: (count (distinct v)) where: (!= s \"\")})", 1, 0, 1 },
         /* a selection within the probe's 65536 rows: per value whatever the
          * distinct share (TU: ~4000 unique values); a sparse but large
          * near-unique selection (TU2: 80000 unique values) keeps the row key */
-        { "(select {from: T by: (upper (trim s)) c: (count v) where: (< v 40)})", 1, 1 },
-        { "(select {from: TU by: (upper (trim s)) c: (count v) where: (< v 40)})", 1, 1 },
-        { "(select {from: TU2 by: (upper (trim s)) c: (count v) where: (== v 0)})", 0, 1 },
-        { "(select {from: T by: (if (> v 3) (upper s) s) c: (count v)})", 0, 1 },
-        { "(select {from: T3 by: (upper (trim s)) c: (count v)})", 0, 1 },
-        { "(select {from: TU by: (upper (trim s)) c: (count v)})", 0, 1 },
+        { "(select {from: T by: (upper (trim s)) c: (count v) where: (< v 40)})", 1, 1, 0 },
+        { "(select {from: TU by: (upper (trim s)) c: (count v) where: (< v 40)})", 1, 1, 0 },
+        { "(select {from: TU2 by: (upper (trim s)) c: (count v) where: (== v 0)})", 0, 1, 0 },
+        { "(select {from: T by: (if (> v 3) (upper s) s) c: (count v)})", 0, 1, 0 },
+        { "(select {from: T3 by: (upper (trim s)) c: (count v)})", 0, 1, 0 },
+        { "(select {from: TU by: (upper (trim s)) c: (count v)})", 0, 1, 0 },
     };
     for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
         agg_route_reset();
@@ -840,6 +1595,10 @@ static test_result_t test_derived_key_per_str_value_route(void) {
                         cases[c].q, (unsigned long long)st.key_domain_evals);
         TEST_ASSERT_FMT(st.routes[AGG_ROUTE_V2_INDEXED] == cases[c].indexed, "%s: indexed route %llu",
                         cases[c].q, (unsigned long long)st.routes[AGG_ROUTE_V2_INDEXED]);
+        TEST_ASSERT_FMT(st.key_text_syms == cases[c].text, "%s: %llu text keys",
+                        cases[c].q, (unsigned long long)st.key_text_syms);
+        TEST_ASSERT_FMT(st.routes[AGG_ROUTE_V2_DENSE] == cases[c].text, "%s: dense route %llu",
+                        cases[c].q, (unsigned long long)st.routes[AGG_ROUTE_V2_DENSE]);
     }
     /* A user lambda shadowing `trim` is what the compiled key would call. */
     r = ray_eval_str("(set trim (fn [x] x))");
@@ -6760,6 +7519,11 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/registry_admission", test_registry_admission_contracts, contract_setup, contract_teardown },
     { "agg_contract/routes_bool_outputs", test_group_routes_and_bool_outputs, contract_setup, contract_teardown },
     { "agg_contract/derived_key_per_symbol_route", test_derived_key_per_symbol_route, contract_setup, contract_teardown },
+    { "agg_contract/text_projection_budget_routes", test_text_projection_budget_routes, contract_setup, contract_teardown },
+    { "agg_contract/text_projection_typed_rowwise", test_text_projection_typed_rowwise, contract_setup, contract_teardown },
+    { "agg_contract/text_projection_group_order", test_text_projection_group_order, contract_setup, contract_teardown },
+    { "agg_contract/if_coded_route", test_if_coded_route, contract_setup, contract_teardown },
+    { "agg_contract/text_projection_add_col_fails", test_text_projection_add_col_fails, contract_setup, contract_teardown },
     { "agg_contract/derived_key_per_str_value_route", test_derived_key_per_str_value_route, contract_setup, contract_teardown },
     { "agg_contract/derived_key_cancel_at_dispatch", test_derived_key_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/dense_array_lazy_merge_route", test_dense_array_lazy_merge_route, contract_setup, contract_teardown },

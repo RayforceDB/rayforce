@@ -135,8 +135,23 @@ ray_t* ray_table_new(int64_t ncols) {
  * keeps its own ref.
  * -------------------------------------------------------------------------- */
 
+#ifdef DEBUG
+static int g_add_col_fail_test;   /* the nth next call fails; 0: none */
+/* Test seam: the nth next ray_table_add_col fails as an allocation in it
+ * would — the table released, "oom" returned.  0 disarms; the count left
+ * reads back (0 once the failing call ran). */
+void ray_table_add_col_fail_for_test(int nth) { g_add_col_fail_test = nth; }
+int  ray_table_add_col_fail_left_for_test(void) { return g_add_col_fail_test; }
+#endif
+
 ray_t* ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+#ifdef DEBUG
+    if (g_add_col_fail_test > 0 && --g_add_col_fail_test == 0) {
+        ray_release(tbl);
+        return ray_error("oom", NULL);
+    }
+#endif
     /* Unlike the accessors, this consumes `tbl` and owns its result, so the
      * wrong-tag answer has to be a typed error rather than an empty one —
      * same consume-and-error contract as the bad-column path below.  Without
@@ -154,8 +169,11 @@ ray_t* ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec) {
                          col_vec ? ray_type_name(col_vec->type) : "null");
     }
 
-    tbl = ray_cow(tbl);
-    if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    /* ray_cow keeps its input when the copy fails: release it, as every
+     * other failure here does */
+    ray_t* cw = ray_cow(tbl);
+    if (!cw || RAY_IS_ERR(cw)) { ray_release(tbl); return cw ? cw : ray_error("oom", NULL); }
+    tbl = cw;
     /* a column added under a name a note gives is not the column the note
      * was made for; the builders that know it is mark the table afterwards */
     tbl->attrs &= (uint8_t)~RAY_ATTR_ORDER_NOTES;
