@@ -1,0 +1,34 @@
+;; #1832: under an unaggregated by:, an output whose whole-table value had
+;; as many elements as the table has rows was split by row across the
+;; groups, whatever the call did: (map f [1 2 3 4]) over four rows gave
+;; each group the whole table's (f 1) and (f 3).  A value as long as the
+;; table is a column of the rows only when every column it reads is read
+;; row by row; one read through map's collection, list's elements, a helper
+;; or lambda given as a value, or the body of a helper called there, is
+;; evaluated per group, as with any other length (#1772).
+(.sys.exec "rm -rf /tmp/rf_issue_1832 && mkdir -p /tmp/rf_issue_1832") -- 0
+(set t (table [a c s] (list [1 2 3 4] [100 200 300 400] ['x 'y 'x 'y])))
+(set f (fn [v] (+ v c)))
+(set f2 (fn [x y] (+ x (+ y c))))
+(.db.splayed.set "/tmp/rf_issue_1832/spl/t/" t "/tmp/rf_issue_1832/spl/.sym")
+(set S (.db.splayed.get "/tmp/rf_issue_1832/spl/t/" "/tmp/rf_issue_1832/spl/.sym"))
+(map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1832/par/%/t" (+ 2024.01.01 p)) t "/tmp/rf_issue_1832/par/.sym")) (til 2))
+(set P (.db.parted.get "/tmp/rf_issue_1832/par/" 't))
+;; as on dev: three values, an aggregate around the call, row-wise outputs
+(at (select {from: t by: s r: (map f [1 2 3])}) 'r) -- (list (list [101 301] [102 302] [103 303]) (list [201 401] [202 402] [203 403]))
+(at (select {from: t by: s r: (first (list (map f [1 2 3 4])))}) 'r) -- (list (list [101 301] [102 302] [103 303] [104 304]) (list [201 401] [202 402] [203 403] [204 404]))
+(at (select {from: t by: s r: (+ a c)}) 'r) -- (list [101 303] [202 404])
+(at (select {from: t by: s r: (f a)}) 'r) -- (list [101 303] [202 404])
+(at (select {from: t by: s r: (do (let y c) (+ y 1))}) 'r) -- (list [101 301] [201 401])
+(at (select {from: t by: s r: (if (> a 2) c a)}) 'r) -- (list [1 300] [2 400])
+(at (select {from: t by: s r: (map neg c)}) 'r) -- (list [-100 -300] [-200 -400])
+;; four values over four rows: each group's rows, in every form
+(at (select {from: t by: s r: (map f [1 2 3 4])}) 'r) -- (list (list [101 301] [102 302] [103 303] [104 304]) (list [201 401] [202 402] [203 403] [204 404]))
+(at (select {from: t by: s r: (map (fn [v] (+ v c)) [1 2 3 4])}) 'r) -- (list (list [101 301] [102 302] [103 303] [104 304]) (list [201 401] [202 402] [203 403] [204 404]))
+(at (select {from: t by: s r: (list (f 1) (f 2) (f 3) (f 4))}) 'r) -- (list (list [101 301] [102 302] [103 303] [104 304]) (list [201 401] [202 402] [203 403] [204 404]))
+(at (select {from: t by: s r: (list ((fn [v] (+ v c)) 1) ((fn [v] (+ v c)) 2) ((fn [v] (+ v c)) 3) ((fn [v] (+ v c)) 4))}) 'r) -- (list (list [101 301] [102 302] [103 303] [104 304]) (list [201 401] [202 402] [203 403] [204 404]))
+(at (select {from: t by: s r: (apply f2 [1 2 3 4] [5 6 7 8])}) 'r) -- (list (list [106 306] [108 308] [110 310] [112 312]) (list [206 406] [208 408] [210 410] [212 412]))
+(at (select {from: t by: s where: (> a 0) r: (pmap f [1 2 3 4])}) 'r) -- (list (list [101 301] [102 302] [103 303] [104 304]) (list [201 401] [202 402] [203 403] [204 404]))
+(at (select {from: S by: s r: (map f [1 2 3 4])}) 'r) -- (list (list [101 301] [102 302] [103 303] [104 304]) (list [201 401] [202 402] [203 403] [204 404]))
+(at (select {from: P by: s r: (map f [1 2 3 4 5 6 7 8])}) 'r) -- (list (list [101 301 101 301] [102 302 102 302] [103 303 103 303] [104 304 104 304] [105 305 105 305] [106 306 106 306] [107 307 107 307] [108 308 108 308]) (list [201 401 201 401] [202 402 202 402] [203 403 203 403] [204 404 204 404] [205 405 205 405] [206 406 206 406] [207 407 207 407] [208 408 208 408]))
+(.sys.exec "rm -rf /tmp/rf_issue_1832") -- 0
