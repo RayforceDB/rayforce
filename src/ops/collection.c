@@ -3933,6 +3933,7 @@ static ray_t* in_fn_c(ray_t* val, ray_t* vec) {
                 if (ray_vec_is_null(vec, i) != val_null) continue;
                 int alloc = 0;
                 ray_t* elem = collection_elem(vec, i, &alloc);
+                if (alloc && (!elem || RAY_IS_ERR(elem))) { ray_error_free(elem); return ray_error("oom", NULL); }   /* boxed here, owned here: never compared (#1854) */
                 int eq = atom_eq(val, elem);
                 if (alloc) ray_release(elem);
                 if (eq) return make_bool(1);
@@ -3942,6 +3943,7 @@ static ray_t* in_fn_c(ray_t* val, ray_t* vec) {
             for (int64_t i = 0; i < len; i++) {
                 int alloc = 0;
                 ray_t* elem = collection_elem(vec, i, &alloc);
+                if (alloc && (!elem || RAY_IS_ERR(elem))) { ray_error_free(elem); return ray_error("oom", NULL); }   /* boxed here, owned here: never compared (#1854) */
                 int eq = atom_eq(val, elem);
                 if (alloc) ray_release(elem);
                 if (eq) return make_bool(1);
@@ -4115,6 +4117,11 @@ ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2) {
             for (int64_t i = 0; i < len1; i++) {
                 int alloc = 0;
                 ray_t* elem = collection_elem(vec1, i, &alloc);
+                if (alloc && (!elem || RAY_IS_ERR(elem))) {   /* never compared (#1854) */
+                    ray_error_free(elem);                     /* boxed here, owned here */
+                    if (idx != idx_stack) ray_free_raw(idx);
+                    return ray_error("oom", NULL);
+                }
                 int eq = atom_eq(elem, vec2);
                 if (alloc) ray_release(elem);
                 if (!eq) idx[count++] = i;
@@ -6157,6 +6164,7 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                 if (ray_vec_is_null(vec, i) != val_null) continue;
                 int alloc = 0;
                 ray_t* elem = collection_elem(vec, i, &alloc);
+                if (alloc && (!elem || RAY_IS_ERR(elem))) { ray_error_free(elem); return ray_error("oom", NULL); }   /* boxed here, owned here: never compared (#1854) */
                 int eq = atom_eq(elem, val);
                 if (alloc) ray_release(elem);
                 if (eq) return make_i64(i);
@@ -6166,6 +6174,7 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                 for (int64_t i = 0; i < len; i++) {
                     int alloc = 0;
                     ray_t* elem = collection_elem(vec, i, &alloc);
+                    if (alloc && (!elem || RAY_IS_ERR(elem))) { ray_error_free(elem); return ray_error("oom", NULL); }   /* boxed here, owned here: never compared (#1854) */
                     int eq = atom_eq(elem, val);
                     if (alloc) ray_release(elem);
                     if (eq) return make_i64(i);
@@ -8515,11 +8524,15 @@ static ray_t* map_iterate(ray_t* fn, ray_t* fixed, ray_t* vec, int fixed_is_left
         } else {
             int alloc = 0;
             ray_t* elem = collection_elem(vec, i, &alloc);
-            if (fixed_is_left)
-                results[i] = call_fn2(fn, fixed, elem);
-            else
-                results[i] = call_fn2(fn, elem, fixed);
-            if (alloc) ray_release(elem);
+            if (alloc && (!elem || RAY_IS_ERR(elem))) {   /* never an argument (#1854) */
+                results[i] = elem ? elem : ray_error("oom", NULL);   /* boxed here: owned, answered below */
+            } else {
+                if (fixed_is_left)
+                    results[i] = call_fn2(fn, fixed, elem);
+                else
+                    results[i] = call_fn2(fn, elem, fixed);
+                if (alloc) ray_release(elem);
+            }
         }
         if (RAY_IS_ERR(results[i])) {
             ray_t* err = results[i];
@@ -8606,6 +8619,10 @@ ray_t* ray_fold_while_fn(ray_t** args, int64_t n) {
 
         int alloc = 0;
         ray_t* elem = collection_elem(coll, i, &alloc);
+        if (alloc && (!elem || RAY_IS_ERR(elem))) {   /* never an argument (#1854) */
+            ray_release(acc);                         /* owned here */
+            return elem ? elem : ray_error("oom", NULL);   /* boxed here: owned, the answer */
+        }
         ray_t* next = call_fn2(fn, acc, elem);
         if (alloc) ray_release(elem);
         ray_release(acc);

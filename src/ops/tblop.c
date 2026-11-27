@@ -259,6 +259,7 @@ ray_t* pivot_col_names(ray_t* pcol, int64_t* rows, int64_t n, ray_t* tbl) {
     for (int64_t j = 0; j < n && !err; j++) {
         int al = 0;
         ray_t* a = collection_elem(vals, j, &al);
+        if (al && (!a || RAY_IS_ERR(a))) { err = a ? a : ray_error("oom", NULL); break; }   /* boxed here: owned, the answer (#1854) */
         char buf[64];
         const char* t; size_t tl = 0;
         ray_t* own = ray_fmt_pct(a, buf, sizeof buf, &t, &tl);
@@ -282,13 +283,16 @@ ray_t* pivot_col_names(ray_t* pcol, int64_t* rows, int64_t n, ray_t* tbl) {
             if (!(*pcn_slot(keys, fl, mask, ids[j]) & PCN_TWICE) || ray_vec_is_null(vals, j)) continue;
             int al = 0;
             ray_t* a = collection_elem(vals, j, &al);
+            if (al && (!a || RAY_IS_ERR(a))) { err = a ? a : ray_error("oom", NULL); break; }   /* boxed here: owned, the answer (#1854) */
             ray_t* s = ray_fmt(a, RAY_FMT_ROUNDTRIP);
             if (al) ray_release(a);
             if (s && !RAY_IS_ERR(s)) {
                 int64_t id = ray_sym_intern(ray_str_ptr(s), ray_str_len(s));
                 if (id >= 0) ids[j] = id; else err = ray_error("oom", NULL);
             }
-            if (s) ray_release(s);              /* non-finite: keep its text */
+            /* non-finite: keep its text.  s is owned here; an error is freed
+             * (ray_release leaves it) */
+            if (s && RAY_IS_ERR(s)) ray_error_free(s); else if (s) ray_release(s);
         }
     }
 
@@ -327,6 +331,21 @@ ray_t* pivot_col_names(ray_t* pcol, int64_t* rows, int64_t n, ray_t* tbl) {
     return out;
 }
 
+/* atom_eq of cell ia of a and cell ib of b, boxing each as collection_elem
+ * does.  A cell that fails to box sets *fail and compares unequal; its
+ * error, and each box, is owned and freed here (#1854). */
+static bool pivot_cells_eq(ray_t* a, int64_t ia, ray_t* b, int64_t ib, bool* fail) {
+    int a1 = 0, a2 = 0;
+    ray_t* v1 = a ? collection_elem(a, ia, &a1) : NULL;
+    ray_t* v2 = collection_elem(b, ib, &a2);
+    bool bad = (a1 && (!v1 || RAY_IS_ERR(v1))) || (a2 && (!v2 || RAY_IS_ERR(v2)));
+    bool eq = !bad && atom_eq(v1, v2);
+    if (a1) { if (!v1 || RAY_IS_ERR(v1)) ray_error_free(v1); else ray_release(v1); }
+    if (a2) { if (!v2 || RAY_IS_ERR(v2)) ray_error_free(v2); else ray_release(v2); }
+    if (bad) *fail = true;
+    return eq;
+}
+
 /* The generic route's pivot value number per group of `g_pcol` (the
  * grouped table's pivot column), in group order: an I64 vector of n_grps,
  * *n_pv the count.  Equal cells share a number as atom_eq compares them,
@@ -359,10 +378,21 @@ static __attribute__((noinline)) ray_t* pivot_fb_number_values(ray_t* g_pcol, in
         uint64_t slot = h & mask;
         int a1 = 0;
         ray_t* v = collection_elem(g_pcol, gi, &a1);
+        if (a1 && (!v || RAY_IS_ERR(v))) {   /* never compared (#1854): NULL is this function's oom */
+            ray_error_free(v);               /* boxed here, owned here */
+            scratch_free(ht_hdr); ray_release(out);
+            return NULL;
+        }
         num[gi] = -1;
         while (ht[slot] >= 0) {
             int a2 = 0;
             ray_t* w = collection_elem(g_pcol, ht[slot], &a2);
+            if (a2 && (!w || RAY_IS_ERR(w))) {   /* never compared (#1854) */
+                ray_error_free(w);
+                if (a1) ray_release(v);          /* both boxed here, owned here */
+                scratch_free(ht_hdr); ray_release(out);
+                return NULL;
+            }
             bool eq = atom_eq(v, w);
             if (a2) ray_release(w);
             if (eq) { num[gi] = num[ht[slot]]; break; }
@@ -495,10 +525,19 @@ static ray_t* pivot_edge_by_row(ray_t* tbl, ray_t* index_arg, int64_t n_idx, ray
         ray_t* col = ray_table_col_idx(piv, c);
         if (c < n_idx) { out = ray_table_add_col(out, ray_table_col_name(piv, c), col); continue; }
         const int64_t* ix = (const int64_t*)ray_data(col);
+        bool cell_fail = false;
         for (int64_t r = 0; r < np; r++) {
             int alloc = 0;
             cells[r] = ray_vec_is_null(col, r) ? NULL : collection_elem(vcol, ix[r], &alloc);
+            if (alloc && (!cells[r] || RAY_IS_ERR(cells[r]))) {   /* never a null cell (#1854) */
+                ray_error_free(cells[r]);                         /* boxed here, owned here */
+                cells[r] = NULL; cell_fail = true; break;
+            }
             if (cells[r] && !alloc) ray_retain(cells[r]);
+        }
+        if (cell_fail) {
+            for (int64_t r = 0; r < np; r++) if (cells[r]) { ray_release(cells[r]); cells[r] = NULL; }   /* the cells made */
+            ray_release(out); out = ray_error("oom", NULL); break;
         }
         ray_t* vc = pivot_cells_col(cells, np);
         for (int64_t r = 0; r < np; r++) if (cells[r]) { ray_release(cells[r]); cells[r] = NULL; }
@@ -844,35 +883,29 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     int64_t* gids = (int64_t*)ray_data(gid_vec);
 
     /* Probe HT for each input row; on collision fall through to atom_eq. */
-    for (int64_t r = 0; r < nrows; r++) {
+    bool box_fail = false;
+    for (int64_t r = 0; r < nrows && !box_fail; r++) {
         uint64_t h = FB_ROW_HASH(icols, n_idx, pcol, r);
         uint32_t slot = (uint32_t)(h & gid_mask);
         int64_t found = -1;
         while (gid_ht[slot] != UINT32_MAX) {
             int64_t gi = gid_ht[slot];
             bool match = true;
-            for (int64_t ci = 0; ci < n_idx && match; ci++) {
-                int a1 = 0, a2 = 0;
-                ray_t* v1 = collection_elem(icols[ci], r, &a1);
-                ray_t* v2 = collection_elem(g_icols[ci], gi, &a2);
-                if (!atom_eq(v1, v2)) match = false;
-                if (a1) ray_release(v1);
-                if (a2) ray_release(v2);
-            }
-            if (match) {
-                int a1 = 0, a2 = 0;
-                ray_t* v1 = collection_elem(pcol, r, &a1);
-                ray_t* v2 = collection_elem(g_pcol, gi, &a2);
-                if (!atom_eq(v1, v2)) match = false;
-                if (a1) ray_release(v1);
-                if (a2) ray_release(v2);
-            }
+            for (int64_t ci = 0; ci < n_idx && match; ci++)
+                if (!pivot_cells_eq(icols[ci], r, g_icols[ci], gi, &box_fail)) match = false;
+            if (match && !pivot_cells_eq(pcol, r, g_pcol, gi, &box_fail)) match = false;
+            if (box_fail) break;
             if (match) { found = gi; break; }
             slot = (slot + 1) & gid_mask;
         }
         gids[r] = found;
     }
     ray_free(gid_ht_hdr);
+    if (box_fail) {   /* a cell failed to box: never a row in the wrong group (#1854) */
+        scratch_free(g_icols_hdr); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
+        scratch_free(ic_hdr);
+        return ray_error("oom", NULL);
+    }
 
     /* For each group, gather the value column subset and apply agg_fn.
      * agg_results owns the per-group results as a RAY_LIST, so ray_free
@@ -979,7 +1012,8 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
      * Map each group to (ix_idx, pv_idx). */
     ray_t* ix_list = ray_list_new(16);
 
-    for (int64_t gi = 0; gi < n_grps; gi++) {
+    bool ix_fail = false;
+    for (int64_t gi = 0; gi < n_grps && !ix_fail; gi++) {
         gm_pv[gi] = ((const int64_t*)ray_data(dvals))[gi];
 
         /* Find or insert index key */
@@ -992,11 +1026,16 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
             for (int64_t ci = 0; ci < n_idx && match; ci++) {
                 int a2 = 0;
                 ray_t* v = collection_elem(g_icols[ci], gi, &a2);
+                if (a2 && (!v || RAY_IS_ERR(v))) {   /* never compared (#1854) */
+                    ray_error_free(v); ix_fail = true; match = false; break;   /* boxed here, owned here */
+                }
                 if (!atom_eq(ex[ci], v)) match = false;
                 if (a2) ray_release(v);
             }
+            if (ix_fail) break;
             if (match) { gm_ix[gi] = j; break; }
         }
+        if (ix_fail) break;
         if (gm_ix[gi] < 0) {
             gm_ix[gi] = ray_len(ix_list);
             ix_row[gm_ix[gi]] = gm_row[gi];
@@ -1004,10 +1043,14 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
             for (int64_t ci = 0; ci < n_idx; ci++) {
                 int a2 = 0;
                 ray_t* v = collection_elem(g_icols[ci], gi, &a2);
+                if (a2 && (!v || RAY_IS_ERR(v))) {   /* never a NULL key part (#1854) */
+                    ray_error_free(v); ix_fail = true; break;   /* boxed here, owned here */
+                }
                 if (!a2) ray_retain(v);
                 tup = ray_list_append(tup, v);
                 ray_release(v);
             }
+            if (ix_fail) { ray_release(tup); break; }   /* owned here, with the parts made */
             ix_list = ray_list_append(ix_list, tup);
             ray_release(tup);
         }
@@ -1017,7 +1060,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     int64_t n_ix = ray_len(ix_list);
 
     /* Build result table */
-    ray_t* result = ray_table_new(n_idx + n_pv);
+    ray_t* result = ix_fail ? ray_error("oom", NULL) : ray_table_new(n_idx + n_pv);
     if (RAY_IS_ERR(result)) goto fb_cleanup;
 
     /* Index columns: each index row's first source row, gathered from the
@@ -1994,10 +2037,9 @@ static ray_t* alter_target(ray_t** args, int64_t n,
             } else if (ray_is_vec(idx)) {
                 int64_t nidx = idx->len;
                 for (int64_t k = 0; k < nidx; k++) {
-                    int alloc = 0;
-                    ray_t* ie = collection_elem(idx, k, &alloc);
-                    int64_t i = as_i64(ie);
-                    if (alloc) ray_release(ie);
+                    /* an integer index vector (checked above), read in
+                     * place: no box that could fail (#1854) */
+                    int64_t i = read_col_i64(ray_data(idx), k, idx->type, idx->attrs);
                     if (i >= 0 && i < vlen) { ray_release(out[i]); ray_retain(val); out[i] = val; }
                 }
             }
@@ -2095,15 +2137,20 @@ static ray_t* alter_target(ray_t** args, int64_t n,
             int64_t nidx = idx->len;
             int val_is_vec = ray_is_vec(val) && val->len == nidx;
             for (int64_t k = 0; k < nidx; k++) {
-                int alloc = 0;
-                ray_t* ie = collection_elem(idx, k, &alloc);
-                int64_t i = as_i64(ie);
-                if (alloc) ray_release(ie);
+                /* an integer index vector (idx_is_vec), read in place: no
+                 * box that could fail (#1854) */
+                int64_t i = read_col_i64(ray_data(idx), k, idx->type, idx->attrs);
                 if (i < 0 || i >= var->len) continue;
                 ray_t* nv;
                 if (val_is_vec) {
                     int va = 0;
                     ray_t* ve = collection_elem(val, k, &va);
+                    if (va && (!ve || RAY_IS_ERR(ve))) {   /* never a cell stored from an error (#1854) */
+                        ray_error_free(ve);                /* boxed here, owned here */
+                        ray_release(var);                  /* owned here; alter_store_cell would consume it */
+                        ray_release(idx); ray_release(val); ray_release(name_sym);
+                        return ray_error("oom", NULL);
+                    }
                     nv = alter_store_cell(var, i, ve);
                     if (va) ray_release(ve);
                 } else {
@@ -2173,12 +2220,8 @@ static ray_t* alter_target(ray_t** args, int64_t n,
         } else if (ray_is_vec(idx) && ray_int_key_type(idx->type)) {
             nremove = idx->len;
             if (nremove > 256) { ray_release(idx); ray_release(name_sym); return ray_error("limit", NULL); }
-            for (int64_t i = 0; i < nremove; i++) {
-                int alloc = 0;
-                ray_t* e = collection_elem(idx, i, &alloc);
-                remove_idx[i] = as_i64(e);
-                if (alloc) ray_release(e);
-            }
+            for (int64_t i = 0; i < nremove; i++)   /* an integer index vector, read in place (#1854) */
+                remove_idx[i] = read_col_i64(ray_data(idx), i, idx->type, idx->attrs);
         } else {
             int8_t it = idx->type;
             ray_release(idx); ray_release(name_sym);

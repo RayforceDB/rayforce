@@ -5318,9 +5318,21 @@ static ray_t* rowwise_apply(int8_t fn_type, void* fnp, ray_t** args, const uint8
     for (int64_t i = 0; i < nrows; i++) {
         ray_t* cargs[ROWWISE_MAX_ARGS] = { NULL };
         int alloc[ROWWISE_MAX_ARGS] = { 0 };
+        bool boxed_ok = true;
         for (int64_t j = 0; j < argc; j++) {
             alloc[j] = 0;
             cargs[j] = map[j] ? collection_elem(args[j], i, &alloc[j]) : args[j];
+            if (RAY_UNLIKELY(alloc[j] && (!cargs[j] || RAY_IS_ERR(cargs[j])))) {   /* never an argument (#1854) */
+                ray_error_free(cargs[j]);   /* boxed here, owned here */
+                alloc[j] = 0; cargs[j] = NULL;
+                boxed_ok = false;
+                break;
+            }
+        }
+        if (RAY_UNLIKELY(!boxed_ok)) {
+            for (int64_t j = 0; j < argc; j++) if (alloc[j]) ray_release(cargs[j]);   /* the cells boxed so far */
+            ray_release(out);   /* owned here, with the rows made */
+            return ray_error("oom", NULL);
         }
         ray_t* r = fn_type == RAY_UNARY ? ((ray_unary_fn)fnp)(cargs[0])
                  : fn_type == RAY_BINARY ? ((ray_binary_fn)fnp)(cargs[0], cargs[1])
