@@ -2646,7 +2646,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     /* Index columns */
     for (uint32_t k = 0; k < n_idx; k++) {
         ray_t* new_col = col_vec_new(idx_vecs[k], (int64_t)ix_count);
-        if (!new_col || RAY_IS_ERR(new_col)) { ray_release(result); result = ray_error("oom", NULL); goto pivot_cleanup; }
+        if (!new_col || RAY_IS_ERR(new_col)) { ray_error_free(new_col); ray_release(result); result = ray_error("oom", NULL); goto pivot_cleanup; }   /* its error, owned here (#1854) */
         new_col->len = (int64_t)ix_count;
         uint8_t esz = col_esz(idx_vecs[k]);
         int8_t kt = idx_vecs[k]->type;
@@ -2717,7 +2717,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         ray_t* new_col = (out_agg_type == vcol->type)
                         ? col_vec_new(vcol, (int64_t)ix_count)
                         : ray_vec_new(out_agg_type, (int64_t)ix_count);
-        if (!new_col || RAY_IS_ERR(new_col)) { ray_release(result); result = ray_error("oom", NULL); goto pivot_cleanup; }
+        if (!new_col || RAY_IS_ERR(new_col)) { ray_error_free(new_col); ray_release(result); result = ray_error("oom", NULL); goto pivot_cleanup; }   /* its error, owned here (#1854) */
         new_col->len = (int64_t)ix_count;
 
         /* Initialize missing cells with the type-correct NULL sentinel —

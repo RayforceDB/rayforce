@@ -923,6 +923,12 @@ static inline ray_t* identical_c(ray_t* a, ray_t* b) {
             int oa = 0, ob = 0;
             ray_t* x = collection_elem(a, i, &oa);
             ray_t* y = collection_elem(b, i, &ob);
+            if ((oa && (!x || RAY_IS_ERR(x))) || (ob && (!y || RAY_IS_ERR(y)))) {   /* never compared (#1854) */
+                /* each boxed one is owned here: a failed one's error freed */
+                if (oa) { if (!x || RAY_IS_ERR(x)) ray_error_free(x); else ray_release(x); }
+                if (ob) { if (!y || RAY_IS_ERR(y)) ray_error_free(y); else ray_release(y); }
+                return ray_error("oom", NULL);
+            }
             ray_t* equal = ray_identical_fn(x, y);
             if (oa) ray_release(x);
             if (ob) ray_release(y);

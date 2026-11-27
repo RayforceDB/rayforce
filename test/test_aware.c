@@ -7405,6 +7405,34 @@ static test_result_t test_filter_alloc_fail(void) {
     PASS();
 }
 
+/* A cell that fails to box (collection_elem) in the builtins outside the
+ * query engine: a row-wise call, `identical`, `in`, `except`, `find`,
+ * `map-left`, `fold-while`, the generic pivot and `alter`.  Each run answers
+ * the unfailed answer or `oom`, keeping nothing (aw_sweep_eval); a failed
+ * box was compared, passed or stored as a value (#1854). */
+static test_result_t test_cell_box_alloc_fail(void) {
+    aw_eval_ok("(set TB (table [k s v f] (list (% (til 40) 4) (at ['a 'b 'c] (% (til 40) 3)) (til 40) (as 'F64 (% (til 40) 5)))))");
+    aw_eval_ok("(set X9 [1 2 3 4])");
+    static const char* const qs[] = {
+        "(identical (list 1 2) [1 2])",
+        "(in \"b\" [\"a\" \"b\"])",
+        "(in 1.5 (as 'F32 [1.0 1.5]))",
+        "(except (as 'F32 [1.0 2.0 3.0]) (as 'F32 2.0))",
+        "(find [\"a\" \"b\"] \"b\")",
+        "(find (as 'F32 [1.0 2.0]) (as 'F32 2.0))",
+        "(map-left + 1 [1 2 3])",
+        "(fold-while not + 0 [0 0 1 2])",
+        "(pivot TB 'k 'f 'v sum)",
+        "(pivot TB 'k 's 'v sum)",
+        "(do (set X9 [1 2 3 4]) (alter 'X9 set [0 2] [9 8]) X9)",
+    };
+    int failed = aw_sweep_eval(qs, NULL, sizeof qs / sizeof *qs);
+    TEST_ASSERT_FMT(failed >= 0, "a failed allocation answered other than oom keeping nothing");
+    TEST_ASSERT_FMT(failed > 0, "no allocation failure answered oom");
+    aw_eval_ok("(set TB 0)"); aw_eval_ok("(set X9 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set Q 0)");
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -7523,5 +7551,6 @@ const test_entry_t aware_entries[] = {
     { "aware/grouped_grade_routes", test_grouped_grade_routes, aw_setup, aw_teardown },
     { "aware/plan_alloc_fail", test_plan_alloc_fail, aw_setup, aw_teardown },
     { "aware/filter_alloc_fail", test_filter_alloc_fail, aw_setup, aw_teardown },
+    { "aware/cell_box_alloc_fail", test_cell_box_alloc_fail, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };
