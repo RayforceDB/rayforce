@@ -160,7 +160,13 @@ static inline void pool_exec(ray_pool_t* pool, uint32_t worker_id, uint32_t tick
     }
     ray_pool_task_t* t = &pool->tasks[ticket & (pool->task_cap - 1)];
     int64_t _qs_t0; uint32_t _qs_m = ray_qstats_task_begin(&_qs_t0);
+#ifdef DEBUG
+    ray_test_in_pool_task++;
+#endif
     t->fn(t->ctx, worker_id, t->start, t->end);
+#ifdef DEBUG
+    ray_test_in_pool_task--;
+#endif
     ray_qstats_task_end(_qs_m, worker_id, t->end - t->start, _qs_t0);
     atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
 }

@@ -3683,6 +3683,107 @@ static test_result_t test_radix_cancel_keeps_nothing(void) {
     PASS();
 }
 
+/* An allocation that fails while a group on the radix route runs (an F64
+ * key, alone or beside another) answers `oom` and keeps nothing, or the
+ * answer the group gives without the failure; never a crash or another
+ * answer.  The radix emit skipped a key column it could not allocate
+ * (phase 3 then wrote through its NULL data: SIGSEGV) and an aggregate
+ * column (the answer lost that column), leaking the allocation's error;
+ * the classic route's phase 2 skipped a partition whose table it could not
+ * allocate (the answer lost its groups).  The seam fails the nth
+ * allocation of the calling thread's own code while the outermost group
+ * runs (not of the pool tasks it steals, whose share varies from run to
+ * run), every n the group makes; a second seam fails the nth partition
+ * table init inside phase 2's tasks, on any thread.  "Keeps nothing" is
+ * the process's allocation trace (every heap) over the run, the error's
+ * release and a GC. */
+static test_result_t test_group_alloc_fail(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    aw_eval_ok("(set F (table [k j v] (list (as 'F64 (% (* (til 262144) 7919) 3001)) (% (til 262144) 7) (til 262144))))");
+    static const char* const qs[] = {
+        "(select {from: F by: k})",                      /* v2 radix */
+        "(select {c: (count v) s: (sum v) from: F by: [k j]})",
+        "(select {m: (max v) from: F by: k})",           /* classic radix */
+    };
+    int part_failed = 0;
+    for (size_t q = 0; q < sizeof qs / sizeof *qs; q++) {
+        char setq[200];
+        snprintf(setq, sizeof setq, "(set R0 %s)", qs[q]);
+        aw_eval_ok(setq);
+        /* the route's allocations on this thread, armed past them */
+        ray_group_alloc_fail_for_test((int64_t)1 << 40);
+        ray_t* r0 = aw_eval(qs[q]);
+        int64_t total = ray_group_alloc_count_for_test();
+        ray_group_alloc_fail_for_test(0);
+        if (r0 && RAY_IS_ERR(r0)) ray_error_free(r0); else if (r0) ray_release(r0);
+        TEST_ASSERT_FMT(total > 0, "%s: the group made no allocation", qs[q]);
+        int failed = 0;
+        for (int64_t n = 1; n <= total; n++) {
+            ray_heap_gc();
+            bool traced = ray_mem_trace_begin();
+            ray_group_alloc_fail_for_test(n);
+            ray_t* got = aw_eval(qs[q]);
+            ray_group_alloc_fail_for_test(0);
+            if (got && RAY_IS_ERR(got)) {
+                char code[32];
+                snprintf(code, sizeof code, "%s", ray_err_code(got));
+                ray_error_free(got);
+                ray_heap_gc();
+                ray_mem_trace_t tr = {0};
+                if (traced) ray_mem_trace_end(&tr);
+                TEST_ASSERT_FMT(traced, "no allocation trace");
+                TEST_ASSERT_FMT(strcmp(code, "oom") == 0, "%s, allocation %lld of %lld fails: %s, not oom", qs[q], (long long)n, (long long)total, code);
+                TEST_ASSERT_FMT(tr.net_bytes <= 0, "%s, allocation %lld of %lld fails: %lld bytes kept", qs[q], (long long)n, (long long)total, (long long)tr.net_bytes);
+                failed++;
+                continue;
+            }
+            if (traced) { ray_mem_trace_t t0; ray_mem_trace_end(&t0); }
+            TEST_ASSERT_NOT_NULL(got);
+            ray_env_set(ray_sym_intern("Q", 1), got);
+            ray_release(got);
+            ray_t* v = ray_eval_str("(and (== (count (ser Q)) (count (ser R0))) (all (== (ser Q) (ser R0))))");
+            bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+            if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+            TEST_ASSERT_FMT(ok, "%s, allocation %lld of %lld fails: an answer, not the reference", qs[q], (long long)n, (long long)total);
+        }
+        TEST_ASSERT_FMT(failed > 0, "%s: no allocation failure answered oom", qs[q]);
+        /* inside phase 2's tasks: the nth partition-table init fails (its
+         * slots allocated, rows NULL), on whichever thread runs it */
+        for (int64_t n = 1; n <= 32; n++) {
+            ray_heap_gc();
+            bool traced = ray_mem_trace_begin();
+            ray_group_test_ht_rows_fail(n, false);
+            ray_t* got = aw_eval(qs[q]);
+            ray_group_test_ht_rows_fail(0, false);
+            bool err = got && RAY_IS_ERR(got);
+            char code[32] = "";
+            if (err) { snprintf(code, sizeof code, "%s", ray_err_code(got)); ray_error_free(got); }
+            ray_heap_gc();
+            ray_mem_trace_t tr = {0};
+            if (traced) ray_mem_trace_end(&tr);
+            if (!err) {
+                TEST_ASSERT_NOT_NULL(got);
+                ray_env_set(ray_sym_intern("Q", 1), got);
+                ray_release(got);
+                ray_t* v = ray_eval_str("(and (== (count (ser Q)) (count (ser R0))) (all (== (ser Q) (ser R0))))");
+                bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+                if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+                TEST_ASSERT_FMT(ok, "%s, partition init %lld fails: an answer, not the reference", qs[q], (long long)n);
+                continue;
+            }
+            TEST_ASSERT_FMT(strcmp(code, "oom") == 0, "%s, partition init %lld fails: %s, not oom", qs[q], (long long)n, code);
+            TEST_ASSERT_FMT(tr.net_bytes <= 0, "%s, partition init %lld fails: %lld bytes kept", qs[q], (long long)n, (long long)tr.net_bytes);
+            part_failed++;
+        }
+    }
+    /* the v2 route falls back to the classic one on a failed init and
+     * answers; the classic route's failed init answers `oom` */
+    TEST_ASSERT_FMT(part_failed > 0, "no partition init failure answered oom");
+    aw_eval_ok("(set F 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set Q 0)");
+    PASS();
+}
+
 /* #1780: a cancel that lands while a group runs answers `cancel`, never
  * `oom` and never an answer it did not finish.  For each query, the nth
  * pool dispatch finds the query cancelled (mode 0: a cancel request; mode
@@ -6801,6 +6902,7 @@ const test_entry_t aware_entries[] = {
     { "aware/sort_head_late_chunked", test_sort_head_late_chunked, aw_setup, aw_teardown },
     { "aware/topk_cancel_at_dispatch", test_topk_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/group_cancel_status", test_group_cancel_status, aw_setup, aw_teardown },
+    { "aware/group_alloc_fail", test_group_alloc_fail, aw_setup, aw_teardown },
     { "aware/holistic_oom", test_holistic_oom, aw_setup, aw_teardown },
     { "aware/radix_cancel_keeps_nothing", test_radix_cancel_keeps_nothing, aw_setup, aw_teardown },
     { "aware/sel_compact_cancel_at_dispatch", test_sel_compact_cancel_at_dispatch, aw_setup, aw_teardown },

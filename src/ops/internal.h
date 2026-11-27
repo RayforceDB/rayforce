@@ -61,6 +61,16 @@
  * than ray_interrupted() does. */
 #define RAY_CANCEL_ROWS ((int64_t)65536)
 
+#ifdef DEBUG
+/* Test seam (group.c): the nth allocation of the calling thread's own code
+ * (not the pool tasks it runs) while the outermost group (exec_group) runs
+ * fails; fired says whether it was reached, count how many the last
+ * unfired run made.  nth 0 disarms. */
+void ray_group_alloc_fail_for_test(int64_t nth);
+bool ray_group_alloc_fail_fired_for_test(void);
+int64_t ray_group_alloc_count_for_test(void);
+#endif
+
 /* Test seam (DEBUG): a holistic aggregate's per-group buffers fail their
  * nth allocation on the calling thread.  HOLISTIC_FAIL_ARM/_DISARM bound
  * the code that computes a median, quantile or mode column from its
@@ -79,8 +89,8 @@ int64_t ray_holistic_fail_regions_for_test(void);
 #define HOLISTIC_FAIL_DISARM() do { } while (0)
 #endif
 #ifdef DEBUG
-/* Test seam (group.c): the nth partition-table init of the v2 radix
- * route's phase 2 from now, on any thread, fails as a failed rows
+/* Test seam (group.c): the nth partition-table init of a radix route's
+ * phase 2 (v2 or classic) from now, on any thread, fails as a failed rows
  * allocation does (its slots allocated); with cancel it also raises the
  * cancel.  nth 0 disarms. */
 void ray_group_test_ht_rows_fail(int64_t nth, bool cancel);
