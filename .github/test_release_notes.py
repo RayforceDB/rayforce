@@ -153,6 +153,19 @@ class GraphTests(unittest.TestCase):
         self.assertIn('- listed beside closing lines (#14)', body)
         self.assertNotIn('Fixes #1', body[body.index('Breaking changes'):body.index('Bug fixes')])
 
+    def test_breaking_three_trailers_in_a_row(self):
+        self.git('tag', 'v2.9.0')
+        target = self.add_body('fix(query): three in a row (#15)',
+                               'Text.\n\nFixes #1814\n'
+                               'BREAKING CHANGE: the first change\n'
+                               'BREAKING CHANGE: the second change\n'
+                               'BREAKING CHANGE: the third change')
+        body = self.generate('2.10.0', target)
+        breaking = body[body.index('Breaking changes'):body.index('Bug fixes')]
+        for n in ('first', 'second', 'third'):
+            self.assertIn(f'- the {n} change (#15)\n', breaking)
+        self.assertEqual(breaking.count('\n- '), 3)
+
     def test_no_breaking_section_without_markers(self):
         self.git('tag', 'v2.9.0')
         self.add('feat: plain feature')
