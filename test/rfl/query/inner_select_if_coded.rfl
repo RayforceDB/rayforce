@@ -1,0 +1,131 @@
+;; An inner select's projection that is an if over text literals — an else
+;; arm that is itself such an if continues the chain — read by the outer
+;; select as a key, a predicate operand or a count's argument, is coded a
+;; byte a row: the conditions over every row, the first that holds picks
+;; the arm.  The answers are the row-wise if's: by hand, against the
+;; materialized inner select (STR), and the groups of an unsorted outer
+;; select in that select's first-seen order.
+(set N 12000)
+(set i (til N))
+(set s (at (as 'SYM ["a.html" "b.php" "c.jpg" "D.HTML" "e.txt"]) (% i 5)))
+(set vn (map (fn [k] (if (== 0 (% k 11)) 0N (% k 7))) i))
+(set T (table [s v vn w x] (list s (% i 7) vn (% i 2) (% i 20))))
+(set FP (fn [t] (ser (map (fn [c] (as 'STR (at t c))) (cols t)))))
+;; three arms through an alias: html rows i = 0, 3 mod 5, php 1 mod 5, the
+;; rest other; w = i mod 2; x = i mod 20 holds two values per residue mod 10
+(set G1 (select {from: (select {from: T lu: (lower s) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" "other") w: w x: x}) by: [kind w] c: (count x) d: (count (distinct x))}))
+(type (at G1 'kind)) -- 'STR
+(as 'STR (at G1 'kind)) -- ["html" "php" "other" "html" "php" "other"]
+(at G1 'w) -- [0 1 0 1 0 1]
+(at G1 'c) -- [2400 1200 2400 2400 1200 2400]
+(at G1 'd) -- [4 2 4 4 2 4]
+(set M1 (select {from: T kind: (if (like (lower s) "*.html") "html" (like (lower s) "*.php") "php" "other") w: w x: x}))
+(type (at M1 'kind)) -- 'STR
+(FP G1) -- (FP (select {from: M1 by: [kind w] c: (count x) d: (count (distinct x))}))
+;; the distinct counts against the distinct (kind, w, x) tuples
+(at G1 'd) -- (at (select {from: (select {from: M1 by: [kind w x]}) by: [kind w] d: (count x)}) 'd)
+;; sorted, the same groups
+(FP (select {from: (select {from: T lu: (lower s) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" "other") w: w x: x}) by: [kind w] c: (count x) asc: [kind w]})) -- (FP (select {from: M1 by: [kind w] c: (count x) asc: [kind w]}))
+;; a null condition cell is false: vn is null at i = 0 mod 11 (1091 rows);
+;; hi where vn > 3: 5142 rows of i mod 7 in 4..6, less the 468 of them at
+;; 0 mod 11; the groups in first-seen order (i = 0 none, 1 lo, 4 hi)
+(set G2 (select {from: (select {from: T kind: (if (> vn 3) "hi" (nil? vn) "none" "lo") x: x}) by: kind c: (count x)}))
+(as 'STR (at G2 'kind)) -- ["none" "lo" "hi"]
+(at G2 'c) -- [1091 6235 4674]
+(FP G2) -- (FP (select {from: (set M2 (select {from: T kind: (if (> vn 3) "hi" (nil? vn) "none" "lo") x: x})) by: kind c: (count x)}))
+(type (at M2 'kind)) -- 'STR
+;; a numeric condition: a null cell is false, as zero is (vn is 0 at i = 0
+;; mod 7 outside 0 mod 11: 1715 - 156 rows; null at 0 mod 11: 1091 rows)
+(set G2n (select {from: (select {from: T kind: (if vn "t" "f") x: x}) by: kind c: (count x)}))
+(as 'STR (at G2n 'kind)) -- ["f" "t"]
+(at G2n 'c) -- [2650 9350]
+;; duplicate arms, the else arm equal to the first: a where v is 5, 6 or 0
+;; or w is 0; b the odd rows with v in 1..4 (i mod 14 in 1 3 9 11)
+(set G3 (select {from: (select {from: T kind: (if (> v 4) "a" (< v 1) "a" (== w 1) "b" "a") w: w x: x}) by: [kind w] c: (count x)}))
+(as 'STR (at G3 'kind)) -- ["a" "b" "a"]
+(at G3 'w) -- [0 1 1]
+(at G3 'c) -- [6000 3429 2571]
+(FP G3) -- (FP (select {from: (set M3 (select {from: T kind: (if (> v 4) "a" (< v 1) "a" (== w 1) "b" "a") w: w x: x})) by: [kind w] c: (count x)}))
+(type (at M3 'kind)) -- 'STR
+;; no condition holds: every row takes the else arm
+(set G4 (select {from: (select {from: T kind: (if (> v 100) "x" (< v 0) "y" "z") x: x}) by: kind c: (count x)}))
+(as 'STR (at G4 'kind)) -- ["z"]
+(at G4 'c) -- [12000]
+;; conditions over several columns: h0 the even html rows (x in 0 8 10 18),
+;; big the other rows with x past 15 (16 17 19), the rest 13 values of x
+(set G5 (select {from: (select {from: T lu: (lower s) kind: (if (and (like lu "*.html") (== w 0)) "h0" (> x 15) "big" "rest") x: x}) by: kind c: (count x) d: (count (distinct x))}))
+(as 'STR (at G5 'kind)) -- ["h0" "rest" "big"]
+(at G5 'c) -- [2400 7800 1800]
+(at G5 'd) -- [4 13 3]
+(set M5 (select {from: T kind: (if (and (like (lower s) "*.html") (== w 0)) "h0" (> x 15) "big" "rest") x: x}))
+(at G5 'd) -- (at (select {from: (select {from: M5 by: [kind x]}) by: kind d: (count x)}) 'd)
+;; an else arm that is an if continues the chain
+(set G6 (select {from: (select {from: T lu: (lower s) kind: (if (like lu "*.html") "html" (if (like lu "*.php") "php" "other")) w: w x: x}) by: [kind w] c: (count x) d: (count (distinct x))}))
+(FP G6) -- (FP G1)
+;; over a STR column, the same groups
+(set TS (table [s w x] (list (as 'STR s) (% i 2) (% i 20))))
+(type (at TS 's)) -- 'STR
+(set G7 (select {from: (select {from: TS lu: (lower s) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" "other") w: w x: x}) by: [kind w] c: (count x) d: (count (distinct x))}))
+(FP G7) -- (FP G1)
+;; a predicate on the output, its count, and a where: of the inner select
+;; (odd rows: html 2400, php 1200, other 2400)
+(at (select {from: (select {from: T lu: (lower s) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" "other") x: x}) where: (== kind "php") c: (count x)}) 'c) -- [2400]
+(at (select {from: (select {from: T lu: (lower s) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" "other") x: x}) where: (!= kind "php") c: (count kind)}) 'c) -- [9600]
+(set G8 (select {from: (select {from: T lu: (lower s) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" "other") x: x where: (== w 1)}) by: kind c: (count x)}))
+(as 'STR (at G8 'kind)) -- ["php" "html" "other"]
+(at G8 'c) -- [1200 2400 2400]
+;; a where: deciding the first row: past v > 5 the first rows are i = 6
+;; (php) and 13 (html)
+(as 'STR (at (select {from: (select {from: T lu: (lower s) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" "other") x: x where: (> v 5)}) by: kind c: (count x)}) 'kind)) -- ["php" "html" "other"]
+;; an empty text arm stays row-wise ("" heads no group): the same groups
+(set G9 (select {from: (select {from: T kind: (if (like s "*.php") "" "p") x: x}) by: kind c: (count x)}))
+(as 'STR (at G9 'kind)) -- ["p" ""]
+(at G9 'c) -- [9600 2400]
+;; a small table: the first 7 rows
+(set G10 (select {from: (select {from: (take T 7) lu: (lower s) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" "other") w: w x: x}) by: [kind w] c: (count x)}))
+(as 'STR (at G10 'kind)) -- ["html" "php" "other" "html" "php"]
+(at G10 'c) -- [1 1 2 2 1]
+;; a condition that raises raises as row-wise
+(at (try (select {from: (select {from: T kind: (if (like v "*1") "a" "b") x: x}) by: kind c: (count x)}) (fn [e] e)) 'msg) -- "like: expects string or symbol"
+;; the same ifs as by-dict keys of a select with outputs: the groups of
+;; the materialized select's
+(FP (select {from: T by: {kind: (if (like (lower s) "*.html") "html" (like (lower s) "*.php") "php" "other") w: w} c: (count x) d: (count (distinct x))})) -- (FP G1)
+(set G11 (select {from: T by: {kind: (if (> vn 3) "hi" (nil? vn) "none" "lo")} c: (count x)}))
+(as 'STR (at G11 'kind)) -- ["none" "lo" "hi"]
+(at G11 'c) -- [1091 6235 4674]
+(type (at G11 'kind)) -- 'STR
+;; a vector literal in a condition lines up with the rows, not with the
+;; used symbols of the SYM column (Z interns them in another order than
+;; the rows show them): the row-wise answer, and its length error
+(set Z ['vqa 'vqb 'vqc])
+(set TV (table [s x] (list ['vqc 'vqb 'vqa] [1 2 3])))
+(set GV (select {from: (select {from: TV k: (if (== s ['vqc 'vqb 'vqa]) "y" "n") x: x}) by: k c: (count x)}))
+(as 'STR (at GV 'k)) -- ["y"]
+(at GV 'c) -- [3]
+(set GD (select {from: TV by: {k: (if (== s ['vqc 'vqb 'vqa]) "y" "n")} c: (count x)}))
+(as 'STR (at GD 'k)) -- ["y"]
+(at GD 'c) -- [3]
+(set T6 (table [s x] (list ['vqc 'vqb 'vqa 'vqa 'vqb 'vqc] [1 2 3 4 5 6])))
+(at (try (select {from: (select {from: T6 k: (if (== s ['vqc 'vqb 'vqa]) "y" "n") x: x}) by: k c: (count x)}) (fn [e] e)) 'msg) -- "expr eval: binary op operand lengths must match, got 6 and 3"
+(at (try (select {from: T6 by: {k: (if (== s ['vqc 'vqb 'vqa]) "y" "n")} c: (count x)}) (fn [e] e)) 'msg) -- "expr eval: binary op operand lengths must match, got 6 and 3"
+;; a head is the builtin it holds, not its spelling: with within
+;; rebound to ==, the coded if does not take the bounds for a range, and
+;; the select answers as over the materialized inner select
+(set W0 within)
+(set within ==)
+(set TW (table [s x] (list (take ['wqa 'wqb] 6) (til 6))))
+(set MWW (select {from: TW k: (if (within s ['wqa 'wqb]) "y" "n") x: x}))
+(at (select {from: (select {from: TW k: (if (within s ['wqa 'wqb]) "y" "n") x: x}) by: k c: (count x) asc: k}) 'c) -- (at (select {from: MWW by: k c: (count x) asc: k}) 'c)
+(set within W0)
+(at (select {from: (select {from: TW k: (if (within x [1 3]) "y" "n") x: x}) by: k c: (count x) asc: k}) 'c) -- [3 3]
+;; parameters spelled like the builtins the checks know answer as the
+;; select over the materialized inner select
+(set MW (select {from: TW k: (if (like s "wqa") "y" "n") x: x}))
+(at ((fn [like] (select {from: (select {from: TW k: (if (like s "wqa") "y" "n") x: x}) by: k c: (count x) asc: k})) (fn [a b] (== a 'wqb))) 'c) -- (at ((fn [like] (select {from: (let q (select {from: TW k: (if (like s "wqa") "y" "n") x: x})) by: k c: (count x) asc: k})) (fn [a b] (== a 'wqb))) 'c)
+(at ((fn [count] (select {from: (select {from: TW k: (if (like s "wqa") "y" "n") x: x}) where: (== k "y") c: (sum x)})) 0) 'c) -- (at (select {from: MW where: (== k "y") c: (sum x)}) 'c)
+;; a chain of outputs each reading the one before twice: each is checked
+;; once, so the coded if's analysis stays linear: about a millisecond,
+;; where walking each read anew takes minutes
+(set TC (table [x] (list (% (til 1000) 7))))
+(at (select {from: (select {from: TC a0: (> x 3) a1: (and a0 a0) a2: (and a1 a1) a3: (and a2 a2) a4: (and a3 a3) a5: (and a4 a4) a6: (and a5 a5) a7: (and a6 a6) a8: (and a7 a7) a9: (and a8 a8) a10: (and a9 a9) a11: (and a10 a10) a12: (and a11 a11) a13: (and a12 a12) a14: (and a13 a13) a15: (and a14 a14) a16: (and a15 a15) a17: (and a16 a16) a18: (and a17 a17) a19: (and a18 a18) a20: (and a19 a19) a21: (and a20 a20) a22: (and a21 a21) a23: (and a22 a22) a24: (and a23 a23) a25: (and a24 a24) a26: (and a25 a25) a27: (and a26 a26) a28: (and a27 a27) a29: (and a28 a28) kind: (if a29 "y" "n") x: x}) by: kind c: (count x) asc: kind}) 'c) -- [572 428]
+(< (timeit (select {from: (select {from: TC a0: (> x 3) a1: (and a0 a0) a2: (and a1 a1) a3: (and a2 a2) a4: (and a3 a3) a5: (and a4 a4) a6: (and a5 a5) a7: (and a6 a6) a8: (and a7 a7) a9: (and a8 a8) a10: (and a9 a9) a11: (and a10 a10) a12: (and a11 a11) a13: (and a12 a12) a14: (and a13 a13) a15: (and a14 a14) a16: (and a15 a15) a17: (and a16 a16) a18: (and a17 a17) a19: (and a18 a18) a20: (and a19 a19) a21: (and a20 a20) a22: (and a21 a21) a23: (and a22 a22) a24: (and a23 a23) a25: (and a24 a24) a26: (and a25 a25) a27: (and a26 a26) a28: (and a27 a27) a29: (and a28 a28) kind: (if a29 "y" "n") x: x}) by: kind c: (count x) asc: kind})) 10000) -- true

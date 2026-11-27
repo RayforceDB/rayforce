@@ -1,0 +1,258 @@
+;; Projection pushdown into an inner select: as the immediate from: of a
+;; select whose clauses read columns only by name, the inner select builds
+;; only the outputs the outer one names.  An output nobody reads is still
+;; compiled — a later output may read it by its alias — but no column of
+;; it is built.  Observed through (.sys.mem)'s sym-map-runs: `(lower URL)`
+;; over a SYM column of 4096 rows or more runs the per-code path once per
+;; evaluation that builds its rows.  Values against the same query without
+;; the unread output, and the inner select alone.
+(set N 6000)
+(set i (til N))
+(set hosts ["Example.COM" "news.Site.org" "Shop.Market.NET" "Blog.Daily.com"])
+(set U (as 'SYM (map (fn [k] (format (if (== 0 (% k 3)) "http://www.%/p/%.html" "https://www.%/p/%.php") (at hosts (% k 4)) (% k 97))) i)))
+(set T (table [URL v w] (list U (% (* 7919 i) 2003) (% i 2))))
+(set runs (fn [] (at (.sys.mem) 'sym-map-runs)))
+(>= (runs) 0) -- true
+(set FP (fn [t] (ser (map (fn [c] (as 'STR (at t c))) (cols t)))))
+;; the inner select alone builds both lower-cased columns: two runs
+(set m0 (runs))
+(set I (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}))
+(- (runs) m0) -- 2
+(cols I) -- ['lu 'x 'kind 'w 'v]
+;; under an outer grouping that names kind, w and v: x is not built at all,
+;; and kind — an if over text literals of one column through lu — is coded
+;; a byte a row, its condition evaluated once per symbol the column uses
+;; (no row-wise lower: no run); the result is the same
+(set m0 (runs))
+(set G (select {from: (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))
+(- (runs) m0) -- 0
+(type (at G 'kind)) -- 'STR
+(count G) -- 4
+(set G2 (select {from: (select {from: T kind: (if (like (lower URL) "*.html") "html" "php") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))
+(all (== (FP G) (FP G2))) -- true
+;; the distinct counts, exactly: the distinct (kind, w, v) tuples per (kind, w)
+(set O (select {from: (select {from: I by: [kind w v]}) by: [kind w] d: (count v) asc: [kind w]}))
+(all (== (at G 'd) (at O 'd))) -- true
+(sum (at G 'c)) -- 6000
+;; by hand: the html rows are k = 0 mod 3, w = k mod 2: v = 7919 k mod 2003 over k = 0 mod 6
+(count (distinct (at (select {from: T where: (and (== 0 (% i 3)) (== w 0))}) 'v))) -- 1000
+(at (at (select {from: G where: (and (== kind "html") (== w 0))}) 'd) 0) -- 1000
+;; an outer clause that names x keeps it: the aggregate over x answers
+(set Gx (select {from: (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) by: [kind w] c: (count v) mx: (max x) asc: [kind w]}))
+(all (== (at Gx 'c) (at G 'c))) -- true
+(== (as 'STR (at (at Gx 'mx) 0)) (max (upper (as 'STR (at (select {from: T where: (and (like (lower URL) "*.html") (== w 0))}) 'URL))))) -- true
+;; an inner select that sorts keeps every output (a sort key may name one)
+(set Gs (select {from: (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu "*.html") "html" "php") w: w v: v asc: x}) by: [kind w] c: (count v) asc: [kind w]}))
+(all (== (at Gs 'c) (at G 'c))) -- true
+(cols (select {from: T lu: (lower URL) x: (upper URL) w: w asc: x})) -- ['lu 'x 'w]
+;; an outer select with no outputs of its own reads every column: all are built
+(set m0 (runs))
+(set Ga (select {from: (select {from: T lu: (lower URL) x: (upper URL) w: w})}))
+(- (runs) m0) -- 2
+(cols Ga) -- ['lu 'x 'w]
+;; an outer select that names one output gets that one
+(set m0 (runs))
+(set Gb (select {from: (select {from: T lu: (lower URL) x: (upper URL) w: w}) n: (count w)}))
+(- (runs) m0) -- 0
+(at (at Gb 'n) 0) -- 6000
+;; the bare name as the one group or sort key is a key use too
+(set m0 (runs))
+(set Gk (select {from: (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) by: kind c: (count v) asc: kind}))
+(- (runs) m0) -- 0
+(type (at Gk 'kind)) -- 'STR
+(all (== (at Gk 'c) (at (select {from: G by: kind c: (sum c) asc: kind}) 'c))) -- true
+(sum (at Gk 'c)) -- 6000
+;; an alias the kept output reads through several arms is evaluated once,
+;; not once per arm: 20000 distinct URLs, five rows each, three arms
+;; reading lu — one run of (lower URL) (each arm sees 4096 symbols or
+;; more, so a run per arm would count), per symbol or row-wise (over 100000
+;; rows the projection is per symbol up to 5 workers, row-wise past them)
+(set N2 100000)
+(set i2 (til N2))
+(set U2 (as 'SYM (map (fn [j] (format (if (== 0 (% j 3)) "http://www.%/p/%.html" (== 1 (% j 3)) "https://www.%/p/%.php" "https://img.%/p/%.jpg") (at hosts (% j 4)) j)) (% i2 20000))))
+(count (distinct U2)) -- 20000
+(set T2 (table [URL v] (list U2 (% i2 7))))
+(set m0 (runs))
+(set G3 (select {from: (select {from: T2 lu: (lower URL) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" (like lu "*.jpg") "jpg" "other") v: v}) by: [kind] c: (count v) d: (count (distinct v)) asc: kind}))
+(- (runs) m0) -- 1
+(type (at G3 'kind)) -- 'STR
+(as 'STR (at G3 'kind)) -- ["html" "jpg" "php"]
+;; by hand: of j = 0..19999, 6667 are 0 mod 3, 6667 are 1 mod 3, 6666 are 2
+;; mod 3, five rows each; v = k mod 7 takes all seven values in each class
+(at G3 'c) -- [33335 33330 33335]
+(at G3 'd) -- [7 7 7]
+;; and against the row-wise evaluation and the tuple-distinct oracle
+(set G3R (select {from: (select {from: T2 kind: (if (like (lower URL) "*.html") "html" (like (lower URL) "*.php") "php" (like (lower URL) "*.jpg") "jpg" "other") v: v}) by: [kind] c: (count v) d: (count (distinct v)) asc: kind}))
+(all (== (FP G3) (FP G3R))) -- true
+(set O3 (select {from: (select {from: (select {from: T2 lu: (lower URL) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" (like lu "*.jpg") "jpg" "other") v: v}) by: [kind v]}) by: [kind] d: (count v) asc: kind}))
+(all (== (at G3 'd) (at O3 'd))) -- true
+;; an output the outer select compares with a genuine STR column, or with
+;; another output, is built row-wise (STR): the per-symbol positions have
+;; a domain of their own and compare with literals only
+(set s (at ["html" "php" "x"] (% i 3)))
+(set Ts (table [URL s v] (list U s (% (* 7919 i) 2003))))
+(set Ms (select {from: Ts lu: (lower URL) kind: (if (like lu "*.html") "html" "php") k2: (if (like lu "*.php") "php" "html") s: s v: v}))
+(set m0 (runs))
+(set Cs (select {from: (select {from: Ts lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}) where: (== kind s) c: (count v)}))
+(- (runs) m0) -- 1
+(at (at Cs 'c) 0) -- (at (at (select {from: Ms where: (== kind s) c: (count v)}) 'c) 0)
+(at (at Cs 'c) 0) -- (sum (== (at Ms 'kind) (at Ms 's)))
+(set m0 (runs))
+(set Ck (select {from: (select {from: Ts lu: (lower URL) kind: (if (like lu "*.html") "html" "php") k2: (if (like lu "*.php") "php" "html") v: v}) where: (== kind k2) c: (count v) m: (max k2)}))
+(- (runs) m0) -- 1
+(at (at Ck 'c) 0) -- (at (at (select {from: Ms where: (== kind k2) c: (count v) m: (max k2)}) 'c) 0)
+(as 'STR (at (at Ck 'm) 0)) -- (max (at Ms 'k2))
+(at (at Ck 'c) 0) -- 6000
+;; compared with a literal, the output stays coded and answers the same
+(set m0 (runs))
+(set Cl (select {from: (select {from: Ts lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}) where: (== kind "html") c: (count v)}))
+(- (runs) m0) -- 0
+(at (at Cl 'c) 0) -- (sum (== (at Ms 'kind) "html"))
+(at (at Cl 'c) 0) -- 2000
+;; an inner output named as an input column, or named twice, is read by the
+;; later outputs as the row-wise select binds it: every projection stays
+;; row-wise, and the groups are the materialized inner select's
+(set Ns 30000)
+(set is (til Ns))
+(set Us (as 'SYM (map (fn [k] (format "Http://X/%.Html" (% k 50))) is)))
+(set TSh (table [URL v] (list Us (% is 7))))
+(set FG (fn [r] (ser (xasc (table [k c] (list (as 'STR (at r 'kind)) (at r 'c))) 'k))))
+(set MSh (select {from: TSh URL: (lower URL) kind: (if (like URL "*7.html") "a" "b") v: v}))
+(set m0 (runs))
+(set GSh (select {from: (select {from: TSh URL: (lower URL) kind: (if (like URL "*7.html") "a" "b") v: v}) by: kind c: (count v)}))
+(- (runs) m0) -- 1
+(count GSh) -- 2
+(all (== (FG GSh) (FG (select {from: MSh by: kind c: (count v)})))) -- true
+(at (select {from: GSh where: (== kind "a")}) 'c) -- [3000]
+(set MDu (select {from: TSh lu: (lower URL) lu: (upper URL) kind: (if (like lu "*7.HTML") "a" "b") v: v}))
+(set GDu (select {from: (select {from: TSh lu: (lower URL) lu: (upper URL) kind: (if (like lu "*7.HTML") "a" "b") v: v}) by: kind c: (count v)}))
+(all (== (FG GDu) (FG (select {from: MDu by: kind c: (count v)})))) -- true
+(count GDu) -- (count (distinct (at MDu 'kind)))
+;; under a where, with count distinct and a sort key
+(set GW2 (select {from: (select {from: TSh URL: (lower URL) kind: (if (like URL "*7.html") "a" "b") v: v where: (> v 2)}) by: kind c: (count v) d: (count (distinct v)) asc: kind}))
+(set OW2 (select {from: (select {from: MSh where: (> v 2)}) by: kind c: (count v) d: (count (distinct v)) asc: kind}))
+(all (== (ser (map (fn [c] (as 'STR (at GW2 c))) (cols GW2))) (ser (map (fn [c] (as 'STR (at OW2 c))) (cols OW2))))) -- true
+(at (at GW2 'c) 0) -- (count (where (and (> (at TSh 'v) 2) (like (lower (at TSh 'URL)) "*7.html"))))
+(at (at GW2 'c) 1) -- (count (where (and (> (at TSh 'v) 2) (not (like (lower (at TSh 'URL)) "*7.html")))))
+(at GW2 'd) -- [4 4]
+(at (select {from: (select {from: TSh URL: (lower URL) kind: (if (like URL "*7.html") "a" "b") v: v}) dk: (count (distinct kind))}) 'dk) -- [2]
+;; An output the select above does not read is left unbuilt only when
+;; building it could change nothing the program sees: no effect and no
+;; error.  An output with an effect — a set, a helper that sets a global —
+;; runs as it does in the select alone: once per row, the global set as
+;; there; the values of the select above are unchanged.
+(set GE (select {from: T by: w c: (count v) d: (sum v) asc: w}))
+(set g 0)
+(set GE1 (select {from: (select {from: T a: (set g (+ g 1)) w: w v: v}) by: w c: (count v) d: (sum v) asc: w}))
+g -- 6000
+(all (== (FP GE1) (FP GE))) -- true
+(set h 0)
+(set bump (fn [x] (do (set h (+ h 1)) x)))
+(set GE2 (select {from: (select {from: T a: (bump v) w: w v: v}) by: w c: (count v) d: (sum v) asc: w}))
+h -- 6000
+(all (== (FP GE2) (FP GE))) -- true
+(set h2 0)
+(set note (fn [x] (set h2 (+ h2 (count x)))))
+(set GE3 (select {from: (select {from: T a: (note v) w: w v: v}) by: w c: (count v) d: (sum v) asc: w}))
+h2 -- 6000
+(all (== (FP GE3) (FP GE))) -- true
+;; a helper with an effect under an alias the kept output reads: run per
+;; row, not once per symbol
+(set h3 0)
+(set tick (fn [x] (do (set h3 (+ h3 1)) (lower x))))
+(set GE4 (select {from: (select {from: T lu: (tick URL) kind: (if (like lu "*.html") "html" "php") v: v}) by: kind c: (count v) asc: kind}))
+h3 -- 6000
+(at GE4 'c) -- [2000 4000]
+;; an unread output whose kernel raises: the error is the query's
+(at (try (select {from: (select {from: T a: (xbar v w) w: w v: v}) by: w c: (count v)}) (fn [e] e)) 'msg) -- "xbar: bucket size must be non-zero and non-null"
+(at (try (select {from: (select {from: T a: (like v "1*") w: w v: v}) by: w c: (count v)}) (fn [e] e)) 'msg) -- "like: expects string or symbol"
+(at (try (select {from: (select {from: T a: (if URL 1 2) w: w v: v}) by: w c: (count v)}) (fn [e] e)) 'msg) -- "if: condition must be boolean, numeric or temporal, got SYM"
+(at (try (select {from: (select {from: T a: (not (lower URL)) w: w v: v}) by: w c: (count v)}) (fn [e] e)) 'msg) -- "not: expects a numeric argument, got SYM"
+(at (try (select {from: (select {from: T a: (lower 1) w: w v: v}) by: w c: (count v)}) (fn [e] e)) 'msg) -- "string transform: expected string or symbol, got i64"
+(try (select {from: (select {from: T a: (try (xbar v w) (fn [e] (raise "handler"))) w: w v: v}) by: w c: (count v)}) (fn [e] e)) -- "handler"
+;; a local of the enclosing helper named like the column is its value
+(at (try ((fn [URL] (select {from: (select {from: T lu: (lower URL) w: w v: v}) by: w c: (count v)})) 5) (fn [e] e)) 'msg) -- "string transform: expected string or symbol, got i64"
+;; text that cannot raise is left unbuilt beside an output that is built:
+;; lu, its upper case and its length are not (no run), (+ v 1) is
+(set m0 (runs))
+(set GE5 (select {from: (select {from: T lu: (lower URL) x: (upper lu) n: (strlen lu) b: (+ v 1) w: w v: v}) by: w c: (count v) d: (sum v) asc: w}))
+(- (runs) m0) -- 0
+(all (== (FP GE5) (FP GE))) -- true
+;; Nested (#1567, #1568's shapes): the inner select inside another query's
+;; output, reading a name only that query has (a correlated name), and under
+;; a from: that is an expression, a parameter or a let.  The answers are the
+;; row-wise ones: the inner select sorted (every output built, none per
+;; symbol), or the materialized inner select bound first.
+(set t2 (table [g mm] (list ['a 'a 'b] [1 2 3])))
+(set MI (select {from: T lu: (lower URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}))
+(set HM (fn [] (let q MI) q))
+;; a correlated name in the inner where:, by g: pushed down (no run), the
+;; answer the row-wise inner select gives in the same place
+(set m0 (runs))
+(set B1 (at (select {from: t2 by: g r: (count (at (select {from: (select {from: T lu: (lower URL) kind: (if (like lu "*.html") "html" "php") v: v where: (> v (* 100 (first mm)))}) by: kind c: (count v)}) 'c))}) 'r))
+(- (runs) m0) -- 0
+B1 -- (at (select {from: t2 by: g r: (count (at (select {from: (select {from: T lu: (lower URL) kind: (if (like lu "*.html") "html" "php") v: v where: (> v (* 100 (first mm))) asc: v}) by: kind c: (count v)}) 'c))}) 'r)
+;; combined with a correlated column, keyless; summed by g
+(at (select {from: t2 r: (+ mm (first (at (select {from: (select {from: T lu: (lower URL) kind: (if (like lu "*.html") "html" "php") v: v}) by: kind c: (count v) asc: kind}) 'c)))}) 'r) -- (+ (at t2 'mm) (first (at (select {from: (HM) by: kind c: (count v) asc: kind}) 'c)))
+(at (select {from: t2 r: (+ mm (first (at (select {from: (select {from: T lu: (lower URL) kind: (if (like lu "*.html") "html" "php") v: v}) by: kind c: (count v) asc: kind}) 'c)))}) 'r) -- [2001 2002 2003]
+(at (select {from: t2 by: g r: (sum (at (select {from: (select {from: T lu: (lower URL) kind: (if (like lu "*.html") "html" "php") v: v}) by: kind c: (count v)}) 'c))}) 'r) -- [6000 6000]
+;; a parameter of the enclosing helper in the inner where:
+(set B4 ((fn [z] (select {from: (select {from: T lu: (lower URL) kind: (if (like lu "*.html") "html" "php") v: v where: (> v z)}) by: kind c: (count v) asc: kind})) 1000))
+(at B4 'c) -- (at (select {from: (select {from: (HM) where: (> v 1000)}) by: kind c: (count v) asc: kind}) 'c)
+(at B4 'c) -- [1002 2004]
+(type (at B4 'kind)) -- 'STR
+;; from: an expression over the inner select: take, and a sort by an output
+;; the select above does not name
+(set B5 (select {from: (take (select {from: T lu: (lower URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) 3000) by: kind c: (count v) asc: kind}))
+(at B5 'c) -- (at (select {from: (take (HM) 3000) by: kind c: (count v) asc: kind}) 'c)
+(type (at B5 'kind)) -- 'STR
+(set B6 (select {from: (xasc (select {from: T lu: (lower URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) 'lu) by: kind c: (count v) f: (first v) asc: kind}))
+(all (== (FP B6) (FP (select {from: (xasc (HM) 'lu) by: kind c: (count v) f: (first v) asc: kind})))) -- true
+(at B6 'f) -- [979 949]
+;; the inner select's table a parameter, a let, an expression
+(at ((fn [q] (select {from: (select {from: q lu: (lower URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) by: kind c: (count v) asc: kind})) T) 'c) -- [2000 4000]
+(at ((fn [] (let q T) (select {from: (select {from: q lu: (lower URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) by: kind c: (count v) asc: kind}))) 'c) -- [2000 4000]
+(at (select {from: (select {from: (take T 3000) lu: (lower URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) by: kind c: (count v) asc: kind}) 'c) -- (at (select {from: (take (HM) 3000) by: kind c: (count v) asc: kind}) 'c)
+;; a by-dict text key read through an expression comes back as STR
+(type (at (select {from: (take (select {from: T by: {kind: (if (like URL "*.html") "html" "php")} c: (count v)}) 2) k: kind c: c}) 'k)) -- 'STR
+;; a select inside an inner output; two levels of from:
+(at (select {from: (select {from: T lu: (lower URL) kind: (if (like lu "*.html") "html" "php") r: (first (at (select {from: (select {from: T lu: (upper URL) v: v}) n: (count v)}) 'n)) v: v}) by: kind s: (sum r) asc: kind}) 's) -- [12000000 24000000]
+(set B12 (select {from: (select {from: (select {from: T lu: (lower URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) k2: kind v: v lu2: lu}) by: k2 c: (count v) asc: k2}))
+(at B12 'c) -- [2000 4000]
+(type (at B12 'k2)) -- 'STR
+;; three levels: the middle select only groups on the coded kind, the top
+;; one compares it with a STR column, copies or transforms it.  Each select
+;; keeps the positions only for a reader that uses them as a key or against
+;; literals, so the top select sees STR, as over the materialized inner one
+(set TS (table [URL s v] (list U (take ["html" "php" "x" "html" "php"] N) i)))
+(set MS (select {from: TS lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}))
+(set B13 (select {from: (select {from: (select {from: TS lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}) by: [kind s] c: (count v)}) where: (== kind s) c: (sum c)}))
+(at B13 'c) -- (at (select {from: (select {from: MS by: [kind s] c: (count v)}) where: (== kind s) c: (sum c)}) 'c)
+(at B13 'c) -- [2400]
+(set B14 (select {from: (select {from: (select {from: TS lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}) by: [kind s] c: (count v)}) k2: (concat kind "!") u: (upper kind) f: (first kind) a: (if (== s "x") kind s) c: c}))
+(all (== (FP B14) (FP (select {from: (select {from: MS by: [kind s] c: (count v)}) k2: (concat kind "!") u: (upper kind) f: (first kind) a: (if (== s "x") kind s) c: c})))) -- true
+(map (fn [c] (type (at B14 c))) ['k2 'u 'f 'a]) -- ['STR 'STR 'STR 'STR]
+;; a top select grouping on the column the middle one grouped on: STR
+(set B15 (select {from: (select {from: (select {from: TS lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}) by: [kind s] c: (count v)}) by: kind c: (sum c) asc: kind}))
+(at B15 'c) -- [2000 4000]
+(at B15 'c) -- (at (select {from: (select {from: MS by: [kind s] c: (count v)}) by: kind c: (sum c) asc: kind}) 'c)
+;; a symbol or a number against the coded column compares as against the
+;; STR column it stands for: no match, or the STR column's error
+(at (select {from: (select {from: (select {from: TS lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}) by: [kind s] c: (count v)}) where: (in kind ['php 'zz]) c: (sum c)}) 'c) -- (at (select {from: (select {from: MS by: [kind s] c: (count v)}) where: (in kind ['php 'zz]) c: (sum c)}) 'c)
+(at (select {from: (select {from: TS lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}) where: (in kind ['php]) c: (count v)}) 'c) -- (at (select {from: MS where: (in kind ['php]) c: (count v)}) 'c)
+(select {from: (select {from: TS lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}) where: (== kind 'php) c: (count v)}) !- type
+(select {from: (select {from: TS lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}) where: (== kind 0) c: (count v)}) !- type
+;; a coded by-dict key read by a select: STR where the select copies it or
+;; compares it with a STR column
+(set BD (select {from: TS by: {kind: (if (like (lower URL) "*.html") "html" "php") s: s} c: (count v)}))
+(set B16 (select {from: (select {from: TS by: {kind: (if (like (lower URL) "*.html") "html" "php") s: s} c: (count v)}) k: (concat kind "!") c: c}))
+(all (== (FP B16) (FP (select {from: BD k: (concat kind "!") c: c})))) -- true
+(type (at B16 'k)) -- 'STR
+(at (select {from: (select {from: TS by: {kind: (if (like (lower URL) "*.html") "html" "php") s: s} c: (count v)}) where: (== kind s) c: (sum c)}) 'c) -- (at (select {from: BD where: (== kind s) c: (sum c)}) 'c)
+(at (select {from: (select {from: TS by: {kind: (if (like (lower URL) "*.html") "html" "php") s: s} c: (count v)}) where: (in kind ['php]) c: (sum c)}) 'c) -- (at (select {from: BD where: (in kind ['php]) c: (sum c)}) 'c)
+;; a distinct of the coded column is counted only: under any other
+;; function its values come out, STR as over the materialized inner select
+(set B17 (select {from: (select {from: TS lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}) by: s d: (enlist (distinct kind)) n: (count (distinct kind))}))
+(type (first (first (at B17 'd)))) -- 'STR
+(all (== (ser B17) (ser (select {from: MS by: s d: (enlist (distinct kind)) n: (count (distinct kind))})))) -- true
+(type (at B15 'kind)) -- 'STR

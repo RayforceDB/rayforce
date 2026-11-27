@@ -65,3 +65,28 @@
 (at ((fn [q] (select {from: t by: g r: (count (at (select {from: q by: k x: (sum v)}) 'x))})) u) 'r) -- [3 3]
 (at ((fn [] (let q u) (select {from: t by: g r: (count (at (select {from: q by: k x: (sum v)}) 'x))}))) 'r) -- [3 3]
 (at ((fn [q] (select {from: t r: (sum (at (select {from: q by: k x: (sum v)}) 'x))})) u) 'r) -- (at (select {from: t r: (sum (H1))}) 'r)
+;; A name bound to a function is the function inside a query, as the
+;; evaluator reads it: an operand of + or > raises the type error, never
+;; reads the function's own pointer as a number.  A nested select's output
+;; does not see the outer table's columns (qq: not found), so `mm` there is
+;; the builtin even where the outer table has an mm column.
+(set t2 (table [g mm] (list ['a 'a 'b] [1 2 3])))
+(set t3 (table [g qq] (list ['a 'a 'b] [1 2 3])))
+(set T2 (table [v w] (list (% (* 7919 (til 6000)) 2003) (% (til 6000) 2))))
+(at (try (select {from: t2 by: g r: (first (at (select {from: T2 v: (+ v (first mm))}) 'v))}) (fn [e] e)) 'msg) -- "cannot add i64 and UNARY"
+(at (try (select {from: t2 r: (first (at (select {from: T2 v: (+ v (first mm))}) 'v))}) (fn [e] e)) 'msg) -- "cannot add i64 and UNARY"
+(at (try (select {from: t3 by: g r: (first (at (select {from: T2 v: (+ v (first qq))}) 'v))}) (fn [e] e)) 'msg) -- "column 'qq' not found"
+(set R (at (select {from: t2 by: g r: (first (at (select {from: T2 v: (first mm)}) 'v))}) 'r))
+(map type R) -- ['UNARY 'UNARY]
+(all (== (ser R) (ser (list mm mm)))) -- true
+(at (try (select {from: T2 v: (+ v mm)}) (fn [e] e)) 'msg) -- "cannot add i64 and UNARY"
+(at (try (select {from: T2 where: (> v (first mm))}) (fn [e] e)) 'msg) -- "cannot compare i64 and UNARY"
+(at (try (select {from: T2 by: w s: (sum (+ v mm))}) (fn [e] e)) 'msg) -- "cannot add i64 and UNARY"
+;; a parameter or a global bound to a function, as an operand and as a head
+(at (try ((fn [f] (select {from: T2 v: (+ v f)})) neg) (fn [e] e)) 'msg) -- "cannot add i64 and UNARY"
+(set inc1 (fn [x] (+ x 1)))
+(at (try (select {from: T2 v: (+ v inc1)}) (fn [e] e)) 'msg) -- "cannot add i64 and LAMBDA"
+(at (select {from: (take T2 3) v: (inc1 v)}) 'v) -- [1 1911 1818]
+(at ((fn [f] (select {from: (take T2 3) v: (f v)})) neg) 'v) -- [0 -1910 -1817]
+(at (try ((fn [f] (select {from: T2 by: f})) neg) (fn [e] e)) 'msg) -- "by: the key is a function, not a value"
+(at (try ((fn [f] (select {from: T2 by: f c: (count v)})) neg) (fn [e] e)) 'msg) -- "by: the key is a function, not a value"

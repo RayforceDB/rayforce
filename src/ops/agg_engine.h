@@ -130,6 +130,9 @@ typedef struct {
     uint64_t dense_local_slots;     /* allocated group-state slots, including partials */
     uint32_t dense_tasks;           /* local/partition tasks; worker count for shared updates */
     uint64_t key_domain_evals;      /* computed keys evaluated once per distinct symbol */
+    uint64_t key_text_syms;         /* STR keys of those kept as positions of a text domain */
+    uint64_t key_if_coded;          /* constant-arm if projections coded a byte a row (select_if_coded) */
+    uint32_t key_slot_tasks;        /* tasks of the last slot coding over a bounded vocabulary */
     uint64_t key_vocab_order;       /* ...of which put back into vocabulary order on the pool */
     uint64_t da_lazy_merges;        /* legacy dense-array groupings merged over lazily seeded sets */
     uint64_t da_lazy_skipped;       /* ...(worker, 64-slot chunk) pairs those merges skipped as never seeded */
@@ -156,6 +159,9 @@ typedef struct {
 enum { AGG_RADIX_P1_TWO_PASS = 1, AGG_RADIX_P1_FUSED_RECORDS, AGG_RADIX_P1_FUSED_COMPACT };
 void agg_route_reset(void);
 void agg_route_note_key_domain(void);
+void agg_route_note_key_text(void);
+void agg_route_note_key_if_coded(void);
+void agg_route_note_key_slot_tasks(uint32_t tasks);
 void agg_route_note_key_where_deferred(void);
 void agg_route_note_vocab_order(void);
 void agg_route_note_da_lazy(uint64_t skipped_chunks);
