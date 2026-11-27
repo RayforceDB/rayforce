@@ -399,6 +399,8 @@ stands, each time that code runs (see
 (let y (+ x 1))   ; local binding
 ```
 
+Both return the value they bind: `(set x 42)` is `42`. Over IPC that value is the reply to `.ipc.send`, so a remote assignment of a large value sends it back whole; `(do (set x expr) null)` replies `null` instead (see [Remote assignments](../namespaces/ipc.md#remote-assignments)).
+
 ### Dotted Namespaces
 
 A symbol whose name contains one or more `.` is a *dotted* symbol — it names a path through nested dictionaries rather than a single global binding. `set` auto-creates the intermediate dicts on write, and read/delete traverse them with copy-on-write semantics so other references to the enclosing dict see their old value.

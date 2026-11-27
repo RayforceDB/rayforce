@@ -645,8 +645,10 @@ static const ray_sig_entry_t own_sigs[] = {
      "Deliver a Parquet file to a callback in chunks; returns the number of rows delivered"},
     {"let", "(let <name: sym> <value: any>)",
      "Bind value to local variable (lexical scope); at the top level it binds a global, refused for a restricted caller"},
+    /* docs: . Returns the value it binds, as `set` does: sent through `.ipc.send`, that value is the reply (see [Remote assignments](../namespaces/ipc.md#remote-assignments)) */
     {"set", "(set <name: sym> <value: any>)",
      "Bind value to global variable"},
+    /* docs: . Returns the value it binds, so a large value assigned through `.ipc.send` comes back whole as the reply: `(.ipc.send h "(do (set x expr) null)")` assigns it and replies `null` (see [Remote assignments](../namespaces/ipc.md#remote-assignments)) */
     {"try", "(try <expr> <handler: fn of the error, or a fallback value>)",
      "Error handling: (try expr handler-fn-or-fallback-value); the handler gets the raised value, or `{code msg}` for an engine error (`{code msg usage}` when it is about a builtin's call)"},
     {"eval", "(eval <expr: a parsed expression>)",
