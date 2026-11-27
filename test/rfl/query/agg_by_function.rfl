@@ -55,3 +55,49 @@
 (at ((fn [f] (window {from: W part: [k] order: [t] funcs: {x: (f v)}})) first) 'x) -- (at (window {from: W part: [k] order: [t] funcs: {x: (first v)}}) 'x)
 ((fn [sum] (window {from: W part: [k] funcs: {x: (sum v)}})) til) !- domain
 (.sys.exec "rm -rf /tmp/rfl_agg_fn") -- 0
+
+;; ── (count|first|last (asc ...)): the shortcut judges both heads by function (#1826) ──
+;; (count (asc v)) is (count v) and (first (asc v)) is (min v) over a vector
+;; column, under any name for count, first, last and asc
+(set TA (table [k v l] (list [0 0 1 1 1] [3 1 2 5 4] (list [1 2] "a" 'x [3] 4))))
+(set cnt1826 count) (set fst1826 first) (set lst1826 last) (set up1826 asc)
+(at (select {n: (count (asc v)) from: TA by: k}) 'n) -- [2 3]
+(at (select {n: (cnt1826 (up1826 v)) from: TA by: k}) 'n) -- [2 3]
+(at (select {n: (count (desc v)) from: TA}) 'n) -- [5]
+(at (select {n: (first (asc v)) from: TA by: k}) 'n) -- [1 2]
+(at (select {n: (fst1826 (asc v)) from: TA by: k}) 'n) -- [1 2]
+(at (select {n: (last (up1826 v)) from: TA by: k}) 'n) -- [3 5]
+(at (select {n: (lst1826 (asc v)) from: TA}) 'n) -- [5]
+;; asc and the other sort verbs raise on a LIST column, and the shortcut no
+;; longer hides it: every form raises as eval does
+(asc (at TA 'l)) !- type
+(select {n: (count (asc l)) from: TA}) !- type
+(select {n: (count (asc l)) from: TA by: k}) !- type
+(select {n: (cnt1826 (asc l)) from: TA by: k}) !- type
+(select {n: (count (desc l)) from: TA by: k}) !- type
+(select {n: (count (iasc l)) from: TA by: k}) !- type
+(select {n: (count (rank l)) from: TA by: k}) !- type
+(select {n: (count (xrank 2 l)) from: TA by: k}) !- type
+(select {n: (first (asc l)) from: TA by: k}) !- type
+;; reverse and rotate take a list: their count is the list's
+(at (select {n: (count (reverse l)) from: TA by: k}) 'n) -- [2 3]
+(at (select {n: (count (rotate l 1)) from: TA by: k}) 'n) -- [2 3]
+;; arithmetic over vector columns is a vector: its sort still takes the shortcut
+(at (select {n: (count (asc (+ v 1))) from: TA by: k}) 'n) -- [2 3]
+(at (select {n: (count (desc (* v 2.0))) from: TA by: k}) 'n) -- [2 3]
+;; a column named like the verb is the column, as evaluation reads it in the
+;; select: no verb, so no shortcut, and the call raises as it does keyless
+(set up1846 asc)
+(set TC (table [k v up1846] (list [0 0 1 1] [3 1 2 4] [10 20 30 40])))
+(set TC2 (table [k v asc] (list [0 0 1 1] [3 1 2 4] [10 20 30 40])))
+(select {from: TC r: (up1846 v)}) !- type
+(select {from: TC by: k r: (first (up1846 v))}) !- type
+(select {from: TC by: k r: (count (up1846 v))}) !- type
+(select {from: TC by: k r: (last (up1846 v))}) !- type
+(select {from: TC2 r: (count (asc v))}) !- type
+(select {from: TC2 by: k r: (first (asc v))}) !- type
+(select {from: TC2 by: k r: (count (asc v))}) !- type
+;; a column named like the aggregate does not hide it (#1814): the shortcut stands
+(set TC3 (table [k v count] (list [0 0 1 1] [3 1 2 4] [10 20 30 40])))
+(at (select {from: TC3 by: k r: (count (asc v))}) 'r) -- [2 2]
+(at (select {from: TC3 r: (count (asc v))}) 'r) -- [4]

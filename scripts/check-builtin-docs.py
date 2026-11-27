@@ -134,6 +134,70 @@ def spelling_problems(names):
     return problems
 
 
+# An aggregate is the function a call's head holds, never its spelling
+# (#1814): no head is compared with an aggregate's name.  The comparisons
+# read: memcmp/strcmp/strncmp of anything with a literal, a *_is / *_named /
+# *_IS helper given a literal, and an interned literal compared with ==.
+# Each listed (file, function) is allowed with a reason; one that no longer
+# compares fails the check too, so converting a site is deleting its line.
+AGG_REGISTER = re.compile(r'register_\w+\(\s*"([^"]+)"\s*,([^;]*?)\)\s*;', re.S)
+AGG_LIT = r'"([^"\\]+)"'
+AGG_COMPARE = (
+    re.compile(r'\b(?:memcmp|strcmp|strncmp)\(\s*(?:[^,()]|\([^()]*\))+,\s*' + AGG_LIT),
+    re.compile(r'\b(?:\w+_is|\w+_named|[A-Z]+_IS)\(\s*(?:(?:[^,()"]|\([^()]*\))+,\s*)?' + AGG_LIT),
+    re.compile(r'==\s*ray_sym_intern\(\s*' + AGG_LIT),
+    re.compile(r'ray_sym_intern\(\s*' + AGG_LIT + r'\s*,\s*\d+\s*\)\s*=='),
+)
+AGG_FUNCTION = re.compile(r'^(?:static\s+)?(?:inline\s+)?[\w\s*]+?\b(\w+)\s*\([^;]*$')
+ALLOWED_AGG_SPELLINGS = {
+    ("src/ops/datalog.c", "dl_is_aggregate"): "Datalog's find-clause aggregates: syntax, not heads",
+    ("src/ops/datalog.c", "dl_agg_op_from_name"): "Datalog's find-clause aggregates: syntax, not heads",
+    ("src/ops/query.c", "select_fallback_bulk_minmax"): "pending, #1844",
+    ("src/ops/query.c", "match_count_distinct"): "pending, #1844",
+    ("src/ops/query.c", "dkv_agg_kind"): "pending, #1844",
+    ("src/ops/query.c", "is_med_call"): "pending, #1844",
+    ("src/ops/query.c", "src_rank"): "pending, #1844",
+}
+
+
+def aggregate_names():
+    """The names registered with RAY_FN_AGGR in src/lang/eval.c."""
+    text = (ROOT / "src" / "lang" / "eval.c").read_text(errors="ignore")
+    return {n for n, flags in AGG_REGISTER.findall(text) if "RAY_FN_AGGR" in flags}
+
+
+def agg_spellings_in(rel, text, aggs):
+    """{(rel, function): {aggregate names}} compared by spelling in `text`."""
+    found, fn = {}, "?"
+    for line in text.split("\n"):
+        m = AGG_FUNCTION.match(line)
+        if m and line[:1] not in " \t#/*}":
+            fn = m.group(1)
+        for pat in AGG_COMPARE:
+            for name in pat.findall(line):
+                if name in aggs:
+                    found.setdefault((rel, fn), set()).add(name)
+    return found
+
+
+def agg_spelling_problems():
+    aggs, found = aggregate_names(), {}
+    for rel in SPELLING_FILES:
+        found.update(agg_spellings_in(rel, (ROOT / rel).read_text(errors="ignore"), aggs))
+    problems = [f"{rel}: {fn} compares a head with {', '.join(sorted(names))} by spelling; "
+                "judge it by the function the name holds (resolve_agg_opcode)"
+                for (rel, fn), names in sorted(found.items()) if (rel, fn) not in ALLOWED_AGG_SPELLINGS]
+    problems += [f"{rel}: {fn} is listed in ALLOWED_AGG_SPELLINGS but compares no aggregate "
+                 "name: delete its line"
+                 for rel, fn in sorted(ALLOWED_AGG_SPELLINGS) if (rel, fn) not in found]
+    # the rule itself: the spelling #1826 converted would be caught
+    probe = ('static bool simplify_agg_idiom(ray_t* e) {\n'
+             '    if (op_n == 5 && memcmp(op_s, "count", 5) == 0) return true;\n}\n')
+    if ("src/ops/query.c", "simplify_agg_idiom") not in agg_spellings_in("src/ops/query.c", probe, aggs):
+        problems.append("self-test: a memcmp of a head with count is not caught")
+    return problems
+
+
 def registered():
     """The set of (name, arity) pairs registered in src/."""
     pairs = set()
@@ -325,6 +389,12 @@ def main():
     if spelled:
         print("names the planner recognises by spelling (scripts/check-builtin-docs.py):")
         for p in spelled:
+            print("  " + p)
+        bad = 1
+    agg_spelled = agg_spelling_problems()
+    if agg_spelled:
+        print("aggregate names compared by spelling (scripts/check-builtin-docs.py):")
+        for p in agg_spelled:
             print("  " + p)
         bad = 1
     problems = self_test(reg, summ)

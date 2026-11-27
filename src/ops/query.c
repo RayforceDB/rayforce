@@ -6936,49 +6936,82 @@ static bool idiom_int_literal(ray_t* a, bool positive) {
     return !positive || v > 0;
 }
 
+/* An argument the sort verbs (asc, desc, iasc, idesc, rank, xrank) take,
+ * known from the text: a column of `tbl` no lexical local hides, of a
+ * vector type, or a builtin's arithmetic over such columns and literals
+ * (one the planner lowers, resolve_unary_dag / resolve_binary_dag, its
+ * name holding a builtin), which gives a vector too.  The verbs raise on
+ * anything else (a LIST column, an atom), so the rewrite below fires only
+ * for such an argument and every other one keeps the verb's own answer, an
+ * error included, as eval gives it (#1826). */
+static bool idiom_sort_arg_ok(ray_t* a, ray_t* tbl, int depth) {
+    if (!a || depth > 16 || (a->attrs & ATTR_QUOTED)) return false;
+    if (a->type == -RAY_SYM) {
+        if (ray_env_has_lexical_local(a->i64)) return false;
+        int8_t t = tbl_col_base_type(tbl, a->i64);
+        return t > RAY_LIST && t < RAY_PARTED_BASE && t != RAY_ENCCOL;
+    }
+    if (a->type != RAY_LIST || a->len < 2 || a->len > 3) return false;
+    ray_t** el = (ray_t**)ray_data(a);
+    ray_t* h = el[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
+        ray_env_has_lexical_local(h->i64) || tbl_has_col(tbl, h->i64)) return false;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return false;
+    if (a->len == 2 ? !resolve_unary_dag(h->i64) : !resolve_binary_dag(h->i64)) return false;
+    bool vec = false;   /* at least one operand a vector: atoms alone give an atom */
+    for (int64_t i = 1; i < a->len; i++) {
+        if (ray_is_atom(el[i]) && el[i]->type != -RAY_SYM) continue;
+        if (!idiom_sort_arg_ok(el[i], tbl, depth + 1)) return false;
+        vec = true;
+    }
+    return vec;
+}
+
 static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
                                 uint16_t* op_out, ray_t** arg_out) {
     if (!val_expr || val_expr->type != RAY_LIST || ray_len(val_expr) < 2) return false;
     ray_t** outer = (ray_t**)ray_data(val_expr);
-    if (!outer[0] || outer[0]->type != -RAY_SYM) return false;
-    ray_t* outer_nm = ray_sym_str(outer[0]->i64);
-    if (!outer_nm) return false;
-    const char* op_s = ray_str_ptr(outer_nm);
-    size_t op_n = ray_str_len(outer_nm);
+    if (!outer[0] || outer[0]->type != -RAY_SYM || (outer[0]->attrs & ATTR_QUOTED)) return false;
+    /* The outer aggregate is the function its head holds, as the planner
+     * reads every aggregate (#1814): an alias of count is count, and a
+     * count rebound to another function is that function, not rewritten. */
+    uint16_t outer_op = resolve_agg_opcode(outer[0]->i64);
 
     ray_t* inner = outer[1];
     if (!inner || inner->type != RAY_LIST || ray_len(inner) < 2) return false;
     ray_t** inner_e = (ray_t**)ray_data(inner);
-    if (!inner_e[0] || inner_e[0]->type != -RAY_SYM) return false;
-    ray_t* inner_nm = ray_sym_str(inner_e[0]->i64);
-    if (!inner_nm) return false;
-    const char* wrap_s = ray_str_ptr(inner_nm);
-    size_t wrap_n = ray_str_len(inner_nm);
+    if (!inner_e[0] || inner_e[0]->type != -RAY_SYM || (inner_e[0]->attrs & ATTR_QUOTED)) return false;
     ray_t* col_expr = inner_e[1];
 
-    /* the verb, only while its name is the builtin: a rebound `reverse` is
-     * the user's function, whose count is its own */
+    /* the verb, by the function its name holds, as evaluation resolves it
+     * inside the select: a column of the name is the column (the select
+     * binds its columns over the globals), so no verb at all; a rebound
+     * `reverse` is the user's function, whose count is its own; another
+     * name for asc is asc.  The outer head is not so shadowed: it is an
+     * aggregate, which the planner reads past a column of its name (#1814). */
+    if (tbl_has_col(tbl, inner_e[0]->i64)) return false;
     ray_t* fn = ray_env_get(inner_e[0]->i64);
-    bool wrap_is_asc     = (wrap_n == 3 && memcmp(wrap_s, "asc", 3) == 0) &&
-                           fn && head_is_builtin_unary(fn, ray_asc_fn);
-    bool wrap_is_desc    = (wrap_n == 4 && memcmp(wrap_s, "desc", 4) == 0) &&
-                           fn && head_is_builtin_unary(fn, ray_desc_fn);
-    bool wrap_is_reverse = (wrap_n == 7 && memcmp(wrap_s, "reverse", 7) == 0) &&
-                           fn && head_is_builtin_unary(fn, ray_reverse_fn);
+    bool wrap_is_asc     = fn && head_is_builtin_unary(fn, ray_asc_fn);
+    bool wrap_is_desc    = fn && head_is_builtin_unary(fn, ray_desc_fn);
+    bool wrap_is_reverse = fn && head_is_builtin_unary(fn, ray_reverse_fn);
 
     /* (count (asc|desc|reverse|iasc|idesc|rank col)), (count (rotate col n))
      * and (count (xrank n col)) -> (count col): each gives one cell per cell
-     * of col, and count counts nulls.  The other argument must be a literal
-     * the verb takes and for which that holds (rotate: an integer; xrank: a
-     * positive integer, as (xrank 0 x) is empty); anything else keeps the
-     * ordinary route and raises what the verb raises. */
-    if (op_n == 5 && memcmp(op_s, "count", 5) == 0) {
+     * of col, and count counts nulls.  The sort verbs' col must be one they
+     * take (idiom_sort_arg_ok); reverse and rotate take any list.  The other
+     * argument must be a literal the verb takes and for which that holds
+     * (rotate: an integer; xrank: a positive integer, as (xrank 0 x) is
+     * empty); anything else keeps the ordinary route and raises what the
+     * verb raises. */
+    if (outer_op == OP_COUNT) {
         int64_t il = ray_len(inner);
         ray_t* arg = NULL;
-        if (il == 2 && (wrap_is_asc || wrap_is_desc || wrap_is_reverse ||
-                        (fn && (head_is_builtin_unary(fn, ray_iasc_fn) ||
-                                head_is_builtin_unary(fn, ray_idesc_fn) ||
-                                head_is_builtin_unary(fn, ray_rank_fn)))))
+        bool sorts = wrap_is_asc || wrap_is_desc ||
+                     (fn && (head_is_builtin_unary(fn, ray_iasc_fn) ||
+                             head_is_builtin_unary(fn, ray_idesc_fn) ||
+                             head_is_builtin_unary(fn, ray_rank_fn)));
+        if (il == 2 && (wrap_is_reverse || (sorts && idiom_sort_arg_ok(col_expr, tbl, 0))))
             arg = col_expr;
         else if (il == 3 && fn && fn->type == RAY_BINARY &&
                  (ray_binary_fn)(uintptr_t)fn->i64 == ray_rotate_fn &&
@@ -6986,7 +7019,7 @@ static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
             arg = inner_e[1];
         else if (il == 3 && fn && fn->type == RAY_BINARY &&
                  (ray_binary_fn)(uintptr_t)fn->i64 == ray_xrank_fn &&
-                 idiom_int_literal(inner_e[1], true))
+                 idiom_int_literal(inner_e[1], true) && idiom_sort_arg_ok(inner_e[2], tbl, 0))
             arg = inner_e[2];
         if (!arg) return false;
         *op_out = OP_COUNT;
@@ -6997,15 +7030,15 @@ static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
 
     /* (first|last (asc col)) -> (min|max col) — only when col is null-free */
     if (!wrap_is_asc) return false;
-    bool is_first = (op_n == 5 && memcmp(op_s, "first", 5) == 0);
-    bool is_last  = (op_n == 4 && memcmp(op_s, "last",  4) == 0);
+    bool is_first = outer_op == OP_FIRST;
+    bool is_last  = outer_op == OP_LAST;
     if (!is_first && !is_last) return false;
 
     /* Null-free precondition: col_expr must be a column ref naming a
      * null-free col of tbl.  Mirrors idiom.c:pre_no_nulls_on_asc_input. */
     if (!col_expr || col_expr->type != -RAY_SYM || (col_expr->attrs & ATTR_QUOTED))
         return false;
-    if (!tbl_has_col(tbl, col_expr->i64) ||
+    if (!idiom_sort_arg_ok(col_expr, tbl, 0) ||
         ray_table_col_has_nulls(tbl, col_expr->i64)) return false;
 
     *op_out = is_first ? OP_MIN : OP_MAX;
