@@ -65,6 +65,29 @@
 #include <assert.h>
 #include "ops/walkmemo.h"
 
+#ifdef DEBUG
+/* Test seam (ray_select_keys_alloc_fail_for_test): the nth allocation of
+ * the calling thread's own code while a keys-only `select by:` builds its
+ * result (first rows, table, gathered columns) fails; the region ends at
+ * its answer.  fired: whether the failure was reached. */
+static _Thread_local int64_t g_keys_fail_nth;
+static _Thread_local bool    g_keys_fail_fired;
+void ray_select_keys_alloc_fail_for_test(int64_t nth) {
+    g_keys_fail_nth = nth;
+    g_keys_fail_fired = false;
+    if (!nth) { ray_alloc_fail_set_for_test(0, 0); ray_alloc_fail_skip_tasks_for_test(false); }
+}
+bool ray_select_keys_alloc_fail_fired_for_test(void) { return g_keys_fail_fired; }
+#define KEYS_FAIL_ARM() do { if (g_keys_fail_nth) { ray_alloc_fail_skip_tasks_for_test(true); \
+        ray_alloc_fail_set_for_test(g_keys_fail_nth, 1); } } while (0)
+#define KEYS_FAIL_DISARM() do { if (g_keys_fail_nth) { \
+        if (!ray_alloc_fail_armed_for_test()) g_keys_fail_fired = true; \
+        ray_alloc_fail_set_for_test(0, 0); ray_alloc_fail_skip_tasks_for_test(false); } } while (0)
+#else
+#define KEYS_FAIL_ARM() do { } while (0)
+#define KEYS_FAIL_DISARM() do { } while (0)
+#endif
+
 /* Debug builds check at every query's exit that its result holds no
  * private id (#1462; fv_holds_private, below).  DEBUG, not NDEBUG: release
  * builds keep assert() live, and the walk reads every SYM and LIST cell of
@@ -32166,6 +32189,7 @@ by_dict_done:
 
             /* Each group's first row (keys_first_rows), in the grouping's
              * order, while grouped (its key column) is alive. */
+            KEYS_FAIL_ARM();
             int64_t first_idx_stack[256];
             ray_t* fi_heap_hdr = NULL;
             int64_t* first_idx = first_idx_stack;
@@ -32208,6 +32232,7 @@ by_dict_done:
                 if (RAY_IS_ERR(result)) { if (fi_heap_hdr) ray_free(fi_heap_hdr); if (filtered_tbl != tbl) ray_release(filtered_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result; }
             }
 
+            KEYS_FAIL_DISARM();
             if (fi_heap_hdr) ray_free(fi_heap_hdr);
             if (filtered_tbl != tbl) ray_release(filtered_tbl);
             ray_release(tbl);

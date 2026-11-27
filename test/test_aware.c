@@ -65,6 +65,7 @@ static uint8_t* g_img; static size_t g_len;
 static void aw_setup(void)    { g_awrt = ray_runtime_create(0, NULL); (void)ray_test_rm_rf(aw_root()); (void)ray_test_mkdir_p(aw_root()); }
 static void aw_teardown(void) {
     ray_test_hooks_off(); ray_encw_test_force(-1);
+    ray_agg_engine_v2 = true;   /* a test that turned the v2 engine off and failed */
     free(g_img); g_img = NULL; g_len = 0;
     (void)ray_test_rm_rf(aw_root()); ray_runtime_destroy(g_awrt);
 }
@@ -3705,9 +3706,13 @@ static test_result_t test_group_alloc_fail(void) {
         "(select {from: F by: k})",                      /* v2 radix */
         "(select {c: (count v) s: (sum v) from: F by: [k j]})",
         "(select {m: (max v) from: F by: k})",           /* classic radix */
+        /* the dense array (#1811), which the v2 engine would take: run
+         * with it off */
+        "(select {s: (sum v) n: (min v) from: F by: j})",
     };
     int part_failed = 0;
     for (size_t q = 0; q < sizeof qs / sizeof *qs; q++) {
+        ray_agg_engine_v2 = q != 3;
         char setq[200];
         snprintf(setq, sizeof setq, "(set R0 %s)", qs[q]);
         aw_eval_ok(setq);
@@ -3779,8 +3784,100 @@ static test_result_t test_group_alloc_fail(void) {
     }
     /* the v2 route falls back to the classic one on a failed init and
      * answers; the classic route's failed init answers `oom` */
+    ray_agg_engine_v2 = true;
     TEST_ASSERT_FMT(part_failed > 0, "no partition init failure answered oom");
-    aw_eval_ok("(set F 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set Q 0)");
+    /* two failures: the radix route's buffer table (forced) sends the group
+     * to its sequential fallback, and then the nth allocation of the
+     * group's own code fails, every n, the fallback's emit included */
+    aw_eval_ok("(set G (table [k j v] (list (as 'F64 (% (* (til 70000) 7919) 61)) (% (til 70000) 7) (til 70000))))");
+    static const char* const fq[] = {
+        "(select {m: (max v) from: G by: k})",
+        "(select {m: (max v) s: (sum v) from: G by: [k j]})",
+    };
+    for (size_t q = 0; q < sizeof fq / sizeof *fq; q++) {
+        int64_t forced0 = ray_group_test_radix_bufs_forced();
+        char setq[200];
+        snprintf(setq, sizeof setq, "(set R0 %s)", fq[q]);
+        aw_eval_ok(setq);
+        int failed = 0;
+        for (int64_t n = 1; n <= 4000; n++) {
+            ray_heap_gc();
+            bool traced = ray_mem_trace_begin();
+            ray_group_test_radix_bufs_fail(true);
+            ray_group_alloc_fail_for_test(n);
+            ray_t* got = aw_eval(fq[q]);
+            bool fired = ray_group_alloc_fail_fired_for_test();
+            ray_group_alloc_fail_for_test(0);
+            ray_group_test_radix_bufs_fail(false);
+            if (got && RAY_IS_ERR(got)) {
+                char code[32];
+                snprintf(code, sizeof code, "%s", ray_err_code(got));
+                ray_error_free(got);
+                ray_heap_gc();
+                ray_mem_trace_t tr = {0};
+                if (traced) ray_mem_trace_end(&tr);
+                TEST_ASSERT_FMT(strcmp(code, "oom") == 0, "%s, buffers and allocation %lld fail: %s, not oom", fq[q], (long long)n, code);
+                TEST_ASSERT_FMT(tr.net_bytes <= 0, "%s, buffers and allocation %lld fail: %lld bytes kept", fq[q], (long long)n, (long long)tr.net_bytes);
+                failed++;
+                continue;
+            }
+            if (traced) { ray_mem_trace_t t0; ray_mem_trace_end(&t0); }
+            TEST_ASSERT_NOT_NULL(got);
+            ray_env_set(ray_sym_intern("Q", 1), got);
+            ray_release(got);
+            ray_t* v = ray_eval_str("(and (== (count (ser Q)) (count (ser R0))) (all (== (ser Q) (ser R0))))");
+            bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+            if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+            TEST_ASSERT_FMT(ok, "%s, buffers and allocation %lld fail: an answer, not the reference", fq[q], (long long)n);
+            if (!fired) break;
+        }
+        TEST_ASSERT_FMT(ray_group_test_radix_bufs_forced() > forced0, "%s: never reached the radix buffers", fq[q]);
+        TEST_ASSERT_FMT(failed > 0, "%s: no second failure answered oom", fq[q]);
+    }
+    /* a keys-only `select by:` builds its result after the group (first
+     * rows, the table, the gathered columns): the nth allocation of that
+     * build fails, every n it reaches (#1811) */
+    static const char* const ks[] = {
+        "(select {from: F by: k})",
+        "(select {from: F by: j})",
+    };
+    for (size_t q = 0; q < sizeof ks / sizeof *ks; q++) {
+        char setq[200];
+        snprintf(setq, sizeof setq, "(set R0 %s)", ks[q]);
+        aw_eval_ok(setq);
+        int failed = 0;
+        for (int64_t n = 1; n <= 2000; n++) {
+            ray_heap_gc();
+            bool traced = ray_mem_trace_begin();
+            ray_select_keys_alloc_fail_for_test(n);
+            ray_t* got = aw_eval(ks[q]);
+            bool fired = ray_select_keys_alloc_fail_fired_for_test();
+            ray_select_keys_alloc_fail_for_test(0);
+            if (got && RAY_IS_ERR(got)) {
+                char code[32];
+                snprintf(code, sizeof code, "%s", ray_err_code(got));
+                ray_error_free(got);
+                ray_heap_gc();
+                ray_mem_trace_t tr = {0};
+                if (traced) ray_mem_trace_end(&tr);
+                TEST_ASSERT_FMT(strcmp(code, "oom") == 0, "%s, result allocation %lld fails: %s, not oom", ks[q], (long long)n, code);
+                TEST_ASSERT_FMT(tr.net_bytes <= 0, "%s, result allocation %lld fails: %lld bytes kept", ks[q], (long long)n, (long long)tr.net_bytes);
+                failed++;
+                continue;
+            }
+            if (traced) { ray_mem_trace_t t0; ray_mem_trace_end(&t0); }
+            TEST_ASSERT_NOT_NULL(got);
+            ray_env_set(ray_sym_intern("Q", 1), got);
+            ray_release(got);
+            ray_t* v = ray_eval_str("(and (== (count (ser Q)) (count (ser R0))) (all (== (ser Q) (ser R0))))");
+            bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+            if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+            TEST_ASSERT_FMT(ok, "%s, result allocation %lld fails: an answer, not the reference", ks[q], (long long)n);
+            if (!fired) break;   /* past the build's last allocation */
+        }
+        TEST_ASSERT_FMT(failed > 0, "%s: no result allocation failure answered oom", ks[q]);
+    }
+    aw_eval_ok("(set F 0)"); aw_eval_ok("(set G 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set Q 0)");
     PASS();
 }
 

@@ -69,6 +69,15 @@
 void ray_group_alloc_fail_for_test(int64_t nth);
 bool ray_group_alloc_fail_fired_for_test(void);
 int64_t ray_group_alloc_count_for_test(void);
+/* Test seam (group.c): the radix route's buffer table fails to allocate,
+ * so the route takes its sequential fallback. */
+void ray_group_test_radix_bufs_fail(bool on);
+int64_t ray_group_test_radix_bufs_forced(void);   /* times it forced the fallback */
+/* Test seam (query.c): the nth allocation of the calling thread's own code
+ * while a keys-only `select by:` builds its result fails; fired says
+ * whether it was reached. */
+void ray_select_keys_alloc_fail_for_test(int64_t nth);
+bool ray_select_keys_alloc_fail_fired_for_test(void);
 #endif
 
 /* Test seam (DEBUG): a holistic aggregate's per-group buffers fail their
