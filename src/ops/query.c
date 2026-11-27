@@ -2568,6 +2568,23 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
  * even where the evaluation would skip the operand that names it.  When the
  * read fails, no node: the evaluator answers the expression, and a read
  * there raises the value's own error (RAY_LAZY_G_FAILED, #1860). */
+/* The value a name holds, as a planner classifier reads it to decide a plan
+ * (one value, a free vector, a row-local operand): ray_env_get, with a lazy
+ * value settled to its concrete value at its binding (#1868), so the
+ * classification is of the value, whichever lookup reached the name first.
+ * A handle is no atom though ray_is_atom says so, and would be misjudged.
+ * A failed settling leaves the handle, which classifies as no value.
+ * Borrowed. */
+static ray_t* query_bound_value(int64_t sym) {
+    ray_t* v = ray_env_get(sym);
+    if (!v || !ray_is_lazy(v)) return v;
+    ray_t* r = ray_env_read_bound(sym, v);        /* owned, or the error */
+    if (!r || RAY_IS_ERR(r)) { if (r) ray_error_free(r); return NULL; }
+    ray_release(r);                               /* the binding holds it now */
+    ray_t* now = ray_env_get(sym);
+    return now && !ray_is_lazy(now) ? now : NULL;
+}
+
 static ray_op_t* compile_lazy_name(ray_graph_t* g, int64_t sym, ray_t* lazy) {
     ray_t* v = ray_env_read_bound(sym, lazy);   /* the binding the lookup found */
     if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); return NULL; }
@@ -6114,7 +6131,7 @@ static bool helper_result_one_value(ray_t* e, ray_t* tbl, const wv_scope_t* sc, 
             return g && ray_is_atom(g);
         }
         if (ray_env_has_lexical_local(e->i64) || tbl_has_col(tbl, e->i64)) return false;
-        ray_t* v = ray_env_get(e->i64);
+        ray_t* v = query_bound_value(e->i64);
         return v && ray_is_atom(v);
     }
     if (e->type < 0) return true;
@@ -20439,7 +20456,7 @@ static int src_rank(ray_t* e, ray_t* tbl, int depth) {
     if (e->type == -RAY_SYM) {
         if (e->attrs & ATTR_QUOTED) return 0;
         if (!ray_env_has_lexical_local(e->i64) && tbl_has_col(tbl, e->i64)) return -1;
-        ray_t* v = ray_env_get(e->i64);
+        ray_t* v = query_bound_value(e->i64);
         return v && v->type != RAY_LAMBDA && !(v->type >= RAY_UNARY && v->type <= RAY_VARY)
             ? src_value_rank(v, 0) : -1;
     }
@@ -20455,7 +20472,7 @@ static int src_rank(ray_t* e, ray_t* tbl, int depth) {
         ray_t* a = el[1];   /* not-a-table */
         if (a && a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED) &&
             (ray_env_has_lexical_local(a->i64) || !tbl_has_col(tbl, a->i64))) {
-            ray_t* v = ray_env_get(a->i64);
+            ray_t* v = query_bound_value(a->i64);
             if (v && v->type == RAY_LIST && v->len > 0) {
                 bool first = fl == OP_FIRST;
                 return src_value_rank(((ray_t**)ray_data(v))[first ? 0 : v->len - 1], 0);
@@ -22530,11 +22547,11 @@ static bool sp_row_local(ray_t* e, ray_t* tbl, int depth) {
     if (e->type == -RAY_SYM) {
         if (e->attrs & ATTR_QUOTED) return true;
         if (ray_env_has_lexical_local(e->i64)) {
-            ray_t* v = ray_env_get(e->i64);
+            ray_t* v = query_bound_value(e->i64);
             return v && ray_is_atom(v);
         }
         if (tbl_has_col(tbl, e->i64)) return true;
-        ray_t* v = ray_env_get(e->i64);
+        ray_t* v = query_bound_value(e->i64);
         return v && ray_is_atom(v) && v->type != -RAY_SYM;
     }
     if (e->type < 0) return true;
@@ -23196,7 +23213,7 @@ static bool fv_scan_row_vector(ray_t* a, ray_t* tbl, fv_cols_t* fc) {
     if (a->type == -RAY_SYM) {
         if (a->attrs & ATTR_QUOTED) return false;
         for (int64_t c = 0; c < fc->scan_nc; c++) if (fc->scan_cols[c] == a->i64) return false;
-        ray_t* v = ray_env_get(a->i64);
+        ray_t* v = query_bound_value(a->i64);
         return v && ray_is_vec(v) && v->len == nr;
     }
     return a->type > 0 && a->type != RAY_LIST && ray_is_vec(a) && a->len == nr;
@@ -24414,7 +24431,7 @@ static bool index_reads_free_vector(ray_t* e, ray_t* tbl, int depth) {
     if (e->type == -RAY_SYM) {
         if ((e->attrs & ATTR_QUOTED) || (!ray_env_has_lexical_local(e->i64) && tbl_has_col(tbl, e->i64)))
             return false;
-        ray_t* v = ray_env_get(e->i64);
+        ray_t* v = query_bound_value(e->i64);
         /* at least as long as the rows: under a where: the rows are the
          * kept ones, and the vector is as long as the table */
         return v && ray_is_vec(v) && v->type != RAY_LIST && v->len >= nr && v->len > 1;
@@ -24482,7 +24499,7 @@ static bool expr_one_value(ray_t* e, ray_t* tbl, int depth) {
     if (e->type == -RAY_SYM) {
         if (e->attrs & ATTR_QUOTED) return true;
         if (!ray_env_has_lexical_local(e->i64) && tbl_has_col(tbl, e->i64)) return false;
-        ray_t* v = ray_env_get(e->i64);
+        ray_t* v = query_bound_value(e->i64);
         return v && ray_is_atom(v);
     }
     if (e->type < 0) return true;
