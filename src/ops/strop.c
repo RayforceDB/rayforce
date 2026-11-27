@@ -898,7 +898,7 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
         int64_t nidx = delim->len;
         if (nidx == 0) return RAY_NULL_OBJ; /* null for empty indices */
         int64_t idx_buf[256];
-        if (nidx > 256) return ray_error("limit", NULL);
+        if (nidx > 256) return ray_error("limit", "split: more than 256 cut positions, got %lld", (long long)nidx);
         split_read_cuts(delim, nidx, idx_buf);
         ray_t* bad_pos = split_positions_check(idx_buf, nidx, str->len);
         if (bad_pos) return bad_pos;
@@ -958,7 +958,7 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
         if (nidx == 0) return RAY_NULL_OBJ; /* null for empty indices */
         /* Extract indices as i64 */
         int64_t idx_buf[256];
-        if (nidx > 256) return ray_error("limit", NULL);
+        if (nidx > 256) return ray_error("limit", "split: more than 256 cut positions, got %lld", (long long)nidx);
         split_read_cuts(delim, nidx, idx_buf);
         ray_t* bad_pos = split_positions_check(idx_buf, nidx,
             ray_is_atom(str) ? (int64_t)ray_str_len(str) : str->len);

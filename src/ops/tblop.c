@@ -2092,9 +2092,10 @@ static ray_t* alter_target(ray_t** args, int64_t n,
         if (idx_is_atom_num) {
             int64_t i_check = as_i64(idx);
             if (i_check < 0 || i_check >= var->len) {
+                int64_t vlen = var->len;   /* read before the release (#1886) */
                 ray_release(var);
                 ray_release(idx); ray_release(val); ray_release(name_sym);
-                return ray_error("index", NULL);
+                return ray_error("index", "alter: index %lld is out of range for length %lld", (long long)i_check, (long long)vlen);
             }
         }
 
@@ -2220,7 +2221,7 @@ static ray_t* alter_target(ray_t** args, int64_t n,
             nremove = 1;
         } else if (ray_is_vec(idx) && ray_int_key_type(idx->type)) {
             nremove = idx->len;
-            if (nremove > 256) { ray_release(idx); ray_release(name_sym); return ray_error("limit", NULL); }
+            if (nremove > 256) { ray_release(idx); ray_release(name_sym); return ray_error("limit", "alter: more than 256 indices to remove, got %lld", (long long)nremove); }
             for (int64_t i = 0; i < nremove; i++)   /* an integer index vector, read in place (#1854) */
                 remove_idx[i] = read_col_i64(ray_data(idx), i, idx->type, idx->attrs);
         } else {

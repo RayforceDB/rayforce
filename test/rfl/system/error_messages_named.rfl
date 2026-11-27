@@ -1,0 +1,77 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; An error names the operation and the reason, for a sample of each family
+;; that raised one with an empty message (#1886).  Codes are as before.
+(set em (fn [f] (try (f) (fn [e] (list (get e 'code) (get e 'msg))))))
+;; eval: binding a reserved name, the generic null as an argument
+(em (fn [] (set .sys.gc 1))) -- (list 'reserve "set: cannot bind '.sys.gc' (reserve)")
+(em (fn [] ((fn [] (set .sys.gc 1))))) -- (list 'reserve "set: cannot bind '.sys.gc' (reserve)")
+(em (fn [] (times [.sys.gc 2] 0))) -- (list 'reserve "times: '.sys.gc' is a reserved name")
+(em (fn [] (neg null))) -- (list 'type "neg: the generic null is not an argument; only nil?, type and ser take it")
+;; query: insert and upsert payloads
+(set T (table [k v] (list [1 2] [3 4])))
+(em (fn [] (upsert T 'k (table [v] (list [5]))))) -- (list 'value "upsert: the payload has no key column 'k'")
+(em (fn [] (upsert T 'k (table [k z] (list [1] [5]))))) -- (list 'value "upsert: payload column 'z' must appear exactly once in the target and in the payload")
+(em (fn [] (insert T {k: 1 zz: 2}))) -- (list 'value "insert: the row's key 'zz' is not a column of the table")
+;; graph
+(em (fn [] (.graph.build (table [a b] (list [0 1] [1 0])) 'src 'dst))) -- (list 'name "graph.build: the table has no src column 'src'")
+;; strings and tables
+(em (fn [] (split "abcdef" (til 300)))) -- (list 'limit "split: more than 256 cut positions, got 300")
+(em (fn [] (do (set vv [1 2 3]) (alter 'vv set 9 0)))) -- (list 'index "alter: index 9 is out of range for length 3")
+;; the same on a value another name shares, read before it is released
+(em (fn [] (do (set va [1 2 3]) (set vb va) (alter 'va set 9 0)))) -- (list 'index "alter: index 9 is out of range for length 3")
+;; storage
+(em (fn [] (.db.parted.get "/tmp/x" 'a/b))) -- (list 'io "parted load: table name 'a/b' must be a plain name (no '/', '..' or leading '.')")
+(em (fn [] (.db.splayed.set "/nonexistent/x/" (table [a] (list [1]))))) -- (list 'io ".db.splayed.set \"/nonexistent/x/\": the save failed (io)")
+;; a long path is shown by its tail, so the reason fits
+(set lm (at (em (fn [] (.db.splayed.set (concat "/nonexistent/" (concat (take "d" 200) "/")) (table [a] (list [1]))))) 1))
+(like lm ".db.splayed.set \"...ddd*d/\": the save failed (io)") -- true
+(< (count lm) 256) -- true
+;; a column file a table cannot load: the table, the column and then the
+;; reader's own reason, as before plus the reason (review of #1887).  A
+;; path is matched by its tail: a long temp root shows it so.
+(.sys.exec "rm -rf /tmp/rftest_emn; mkdir -p /tmp/rftest_emn") -- 0
+(.db.splayed.set "/tmp/rftest_emn/s/" (table [a l] (list [1 2] (list [1 2] [3]))))
+(.sys.exec "truncate -s 40 /tmp/rftest_emn/s/l") -- 0
+(at (em (fn [] (.db.splayed.get "/tmp/rftest_emn/s/"))) 0) -- 'corrupt
+(like (at (em (fn [] (.db.splayed.get "/tmp/rftest_emn/s/"))) 1) "splayed *emn/s/: column 'l' failed to load: the vector header is truncated") -- true
+(.db.splayed.set "/tmp/rftest_emn/p/2024.01.01/t/" (table [a l] (list [1 2] (list [1 2] [3]))))
+(.sys.exec "truncate -s 40 /tmp/rftest_emn/p/2024.01.01/t/l") -- 0
+(at (em (fn [] (.db.parted.get "/tmp/rftest_emn/p/" 't))) 0) -- 'corrupt
+(like (at (em (fn [] (.db.parted.get "/tmp/rftest_emn/p/" 't))) 1) "splayed *2024.01.01/t: column 'l' failed to load: the vector header is truncated") -- true
+(.db.splayed.set "/tmp/rftest_emn/u/" (table [a] (list [1 2])))
+(.sys.exec "truncate -s 10 /tmp/rftest_emn/u/.d") -- 0
+(at (em (fn [] (.db.splayed.get "/tmp/rftest_emn/u/"))) 0) -- 'corrupt
+(like (at (em (fn [] (.db.splayed.get "/tmp/rftest_emn/u/"))) 1) "splayed *emn/u/: cannot read .d schema: the file is shorter*") -- true
+;; the journal builtins given a path name it
+(like (at (em (fn [] (.log.validate "/tmp/rftest_emn/nolog.log"))) 1) ".log.validate \"*/nolog.log\": the journal failed (io)") -- true
+(like (at (em (fn [] (.log.open 'async "/tmp/rftest_emn/nodir/x/y"))) 1) ".log.open \"*/nodir/x/y\": the journal failed (io)") -- true
+(.sys.exec "rm -rf /tmp/rftest_emn; true") -- 0
+;; under a long directory the loader's reason survives: the message names
+;; the directory by its tail and the column once, then the reason, never
+;; the loader's own copy of the path (second review of #1887).  A
+;; truncation's wording differs by the file's format generation.
+(set LD (concat "/tmp/rftest_eml/" (concat (take "d" 70) (concat "/" (take "e" 70)))))
+(.sys.exec (concat "rm -rf /tmp/rftest_eml; mkdir -p " LD)) -- 0
+(set mk (fn [n] (.db.splayed.set (concat (concat (concat LD "/") n) "/") (table [a l] (list [1 2 3] (list [1 2] [3] [4 5]))))))
+(set ld (fn [n] (try (.db.splayed.get (concat (concat (concat LD "/") n) "/")) (fn [e] (get e 'msg)))))
+(set cut (fn [n f size] (.sys.exec (concat (concat (concat (concat (concat "truncate -s " size) " ") LD) (concat "/" n)) (concat "/" f)))))
+(mk "t1") (cut "t1" "a" "40") -- 0
+(mk "t2") (cut "t2" "a" "10") -- 0
+(mk "t3") (.sys.exec (concat (concat "rm " LD) "/t3/a")) -- 0
+(mk "t4") (cut "t4" "l" "40") -- 0
+(mk "t5") (cut "t5" ".d" "10") -- 0
+(mk "t6") (cut "t6" "a" "0") -- 0
+(mk "t7") (.sys.exec (concat (concat "rm " LD) "/t7/.d")) -- 0
+(like (ld "t1") "splayed ...*/t1/: column 'a' failed to load: *shorter than its*") -- true
+(like (ld "t2") "splayed ...*/t2/: column 'a' failed to load: *shorter than its*") -- true
+(like (ld "t3") "splayed ...*/t3/: column 'a' failed to load: cannot map the file: No such file*") -- true
+(like (ld "t4") "splayed ...*/t4/: column 'l' failed to load: the vector header is truncated") -- true
+(like (ld "t5") "splayed ...*/t5/: cannot read .d schema: *shorter than its*") -- true
+(like (ld "t6") "splayed ...*/t6/: column 'a' failed to load: cannot map the file: the file is empty") -- true
+(like (ld "t7") "splayed ...*/t7/: cannot read .d schema: cannot map the file: No such file*") -- true
+(all (map (fn [n] (< (count (ld n)) 256)) ["t1" "t2" "t3" "t4" "t5" "t6" "t7"])) -- true
+;; a parted table's partition, the same way
+(.db.splayed.set (concat LD "/p/2024.01.01/t/") (table [a l] (list [1 2] (list [1 2] [3]))))
+(.sys.exec (concat (concat "truncate -s 40 " LD) "/p/2024.01.01/t/l")) -- 0
+(like (try (.db.parted.get (concat LD "/p/") 't) (fn [e] (get e 'msg))) "splayed ...*2024.01.01/t: column 'l' failed to load: the vector header is truncated") -- true
+(.sys.exec "rm -rf /tmp/rftest_eml; true") -- 0

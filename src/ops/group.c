@@ -5158,7 +5158,7 @@ static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
             ray_t* r = ray_f64(ray_f64_fin(val));
             return dur_dev ? ray_timespan_of_f64_atom(r) : r;
         }
-        default:       return ray_error("nyi", NULL);
+        default:       return ray_error("nyi", "group: aggregate opcode %d has no final value", (int)opcode);
     }
 }
 
@@ -14157,10 +14157,10 @@ static int group_needed_cols(ray_graph_t* g, const ray_op_ext_t* ext, int64_t nc
 static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                                int64_t group_limit) {
     int64_t ncols = ray_table_ncols(parted_tbl);
-    if (ncols <= 0) return ray_error("nyi", NULL);
+    if (ncols <= 0) return ray_error("nyi", "parted group: the table has no columns");
 
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "parted group: the plan node has no extension");
 
     uint32_t n_keys = ext->n_keys;
     uint32_t n_aggs = ext->n_aggs;
@@ -14176,7 +14176,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
             break;
         }
     }
-    if (n_parts <= 0) return ray_error("nyi", NULL);
+    if (n_parts <= 0) return ray_error("nyi", "parted group: the table has no partitions");
     /* Every partition empty: the answer of an empty plain table of the same
      * columns (#1621) -- one row of the aggregates over no values keyless,
      * no group under by:. */
@@ -17803,7 +17803,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     }
 
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "group: the plan node has no extension");
 
     /* group_limit is a HINT (HEAD(GROUP) fusion), not a semantic: v2 threads
      * it down to the radix strategy's bounded emit and the caller trims the

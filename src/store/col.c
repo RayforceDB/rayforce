@@ -44,6 +44,17 @@
 #include "vec/str.h"
 #include "lang/format.h"
 #include <string.h>
+#include <errno.h>
+#include "core/errpath.h"
+/* a path as messages show it: a long one by its tail (#1886) */
+#define EPATH(p) ray_err_path((p), (char[RAY_ERR_PATH_MAX + 1]){0})
+/* why a map failed: POSIX's map leaves the failing call's errno, or 0 for an
+ * empty file (platform.c); Windows' sets none */
+#if defined(RAY_OS_WINDOWS)
+#define COL_MAP_REASON "the file cannot be mapped"
+#else
+#define COL_MAP_REASON (errno ? strerror(errno) : "the file is empty")
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -408,24 +419,24 @@ static ray_err_t col_save_str_list(ray_t* list, FILE* f) {
  * -------------------------------------------------------------------------- */
 
 static ray_t* col_load_str_list(const uint8_t* ptr, size_t remaining) {
-    if (remaining < 8) return ray_error("corrupt", NULL);
+    if (remaining < 8) return ray_error("corrupt", "column file: the string list header is truncated");
     int64_t count;
     memcpy(&count, ptr, 8);
     ptr += 8; remaining -= 8;
 
     if (count < 0 || (uint64_t)count > remaining / 4)
-        return ray_error("corrupt", NULL);
+        return ray_error("corrupt", "column file: string list count %lld exceeds the file", (long long)count);
 
     ray_t* list = ray_list_new(count);
     if (!list || RAY_IS_ERR(list)) return list;
 
     for (int64_t i = 0; i < count; i++) {
-        if (remaining < 4) { ray_release(list); return ray_error("corrupt", NULL); }
+        if (remaining < 4) { ray_release(list); return ray_error("corrupt", "column file: the string list is truncated at entry %lld", (long long)i); }
         uint32_t slen;
         memcpy(&slen, ptr, 4);
         ptr += 4; remaining -= 4;
 
-        if (slen > remaining) { ray_release(list); return ray_error("corrupt", NULL); }
+        if (slen > remaining) { ray_release(list); return ray_error("corrupt", "column file: string %lld runs past the end of the file", (long long)i); }
         ray_t* s = ray_str((const char*)ptr, (size_t)slen);
         if (!s || RAY_IS_ERR(s)) { ray_release(list); return s; }
         ptr += slen; remaining -= slen;
@@ -606,7 +617,7 @@ static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
 }
 
 static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining) {
-    if (*remaining < 1) return ray_error("corrupt", NULL);
+    if (*remaining < 1) return ray_error("corrupt", "column file: a value is truncated before its type byte");
     int8_t type;
     memcpy(&type, *pp, 1);
     *pp += 1; *remaining -= 1;
@@ -614,11 +625,11 @@ static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining) {
     if (type < 0) {
         /* Atom */
         if (type == -RAY_STR || type == -RAY_SYM) {
-            if (*remaining < 4) return ray_error("corrupt", NULL);
+            if (*remaining < 4) return ray_error("corrupt", "column file: a string atom is truncated");
             uint32_t slen;
             memcpy(&slen, *pp, 4);
             *pp += 4; *remaining -= 4;
-            if (slen > *remaining) return ray_error("corrupt", NULL);
+            if (slen > *remaining) return ray_error("corrupt", "column file: a string atom runs past the end of the file");
             if (type == -RAY_SYM) {
                 /* Stored as a string; re-intern → runtime-domain atom. */
                 int64_t id = ray_sym_intern((const char*)*pp, (size_t)slen);
@@ -632,14 +643,14 @@ static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining) {
         } else if (type == -RAY_GUID) {
             /* GUID atom: its 16-byte value.  Files written before this
              * held a process pointer here and were never readable. */
-            if (*remaining < 16) return ray_error("corrupt", NULL);
+            if (*remaining < 16) return ray_error("corrupt", "column file: a guid atom is truncated");
             uint8_t gb[16];
             memcpy(gb, *pp, 16);
             *pp += 16; *remaining -= 16;
             return ray_guid(gb);
         } else {
             /* Fixed atom: 8 bytes */
-            if (*remaining < 8) return ray_error("corrupt", NULL);
+            if (*remaining < 8) return ray_error("corrupt", "column file: an atom is truncated");
             int64_t val;
             memcpy(&val, *pp, 8);
             *pp += 8; *remaining -= 8;
@@ -655,23 +666,23 @@ static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining) {
     if (type == RAY_SYM) {
         /* SYM vector stored as per-cell strings: intern each into the
          * global table — runtime-domain output by construction. */
-        if (*remaining < 8) return ray_error("corrupt", NULL);
+        if (*remaining < 8) return ray_error("corrupt", "column file: the SYM vector header is truncated");
         int64_t len;
         memcpy(&len, *pp, 8);
         *pp += 8; *remaining -= 8;
         if (len < 0 || (uint64_t)len > *remaining / 4)
-            return ray_error("corrupt", NULL);
+            return ray_error("corrupt", "column file: SYM vector length %lld exceeds the file", (long long)len);
 
         ray_t* vec = ray_sym_vec_new(RAY_SYM_W64, len);
         if (!vec || RAY_IS_ERR(vec)) return vec;
         vec->len = len;
         int64_t* out = (int64_t*)ray_data(vec);
         for (int64_t i = 0; i < len; i++) {
-            if (*remaining < 4) { ray_release(vec); return ray_error("corrupt", NULL); }
+            if (*remaining < 4) { ray_release(vec); return ray_error("corrupt", "column file: the SYM vector is truncated at cell %lld", (long long)i); }
             uint32_t slen;
             memcpy(&slen, *pp, 4);
             *pp += 4; *remaining -= 4;
-            if (slen > *remaining) { ray_release(vec); return ray_error("corrupt", NULL); }
+            if (slen > *remaining) { ray_release(vec); return ray_error("corrupt", "column file: SYM cell %lld runs past the end of the file", (long long)i); }
             int64_t id = ray_sym_intern((const char*)*pp, (size_t)slen);
             *pp += slen; *remaining -= slen;
             if (id < 0) { ray_release(vec); return ray_error("oom", NULL); }
@@ -682,25 +693,25 @@ static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining) {
 
     if (is_serializable_type(type)) {
         /* Fixed-size vector */
-        if (*remaining < 8) return ray_error("corrupt", NULL);
+        if (*remaining < 8) return ray_error("corrupt", "column file: the vector header is truncated");
         int64_t len;
         memcpy(&len, *pp, 8);
         *pp += 8; *remaining -= 8;
-        if (len < 0) return ray_error("corrupt", NULL);
+        if (len < 0) return ray_error("corrupt", "column file: negative vector length %lld", (long long)len);
 
         /* RAY_STR: read attrs byte for nulls/pool layout */
         uint8_t attrs = 0;
         if (type == RAY_STR) {
-            if (*remaining < 1) return ray_error("corrupt", NULL);
+            if (*remaining < 1) return ray_error("corrupt", "column file: the STR vector header is truncated");
             memcpy(&attrs, *pp, 1);
             *pp += 1; *remaining -= 1;
         }
 
         uint8_t esz = ray_sym_elem_size(type, attrs);
         if (esz > 0 && (uint64_t)len > SIZE_MAX / esz)
-            return ray_error("corrupt", NULL);
+            return ray_error("corrupt", "column file: vector length %lld overflows the address space", (long long)len);
         size_t data_size = (size_t)len * esz;
-        if (data_size > *remaining) return ray_error("corrupt", NULL);
+        if (data_size > *remaining) return ray_error("corrupt", "column file: the vector data is truncated (%zu bytes needed, %zu left)", data_size, *remaining);
 
         /* The nested format carries no attrs for fixed-width vectors, so
          * their HAS_NULLS is rebuilt from the sentinels — the source of
@@ -729,13 +740,13 @@ static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining) {
             ray_str_t* elems = (ray_str_t*)ray_data(vec);
             for (int64_t i = 0; i < len; i++)
                 if (!ray_str_is_inline(&elems[i])) elems[i].hash32 = 0;
-            if (*remaining < 8) { ray_release(vec); return ray_error("corrupt", NULL); }
+            if (*remaining < 8) { ray_release(vec); return ray_error("corrupt", "column file: the STR pool header is truncated"); }
             uint64_t pool_size;
             memcpy(&pool_size, *pp, 8);
             *pp += 8; *remaining -= 8;
             if (pool_size > *remaining || pool_size > (uint64_t)INT64_MAX) {
                 ray_release(vec);
-                return ray_error("corrupt", NULL);
+                return ray_error("corrupt", "column file: STR pool size %llu exceeds the file", (unsigned long long)pool_size);
             }
             if (pool_size > 0) {
                 vec->str_pool = ray_alloc((size_t)pool_size);
@@ -759,11 +770,11 @@ static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining) {
     }
 
     if (type == RAY_LIST) {
-        if (*remaining < 8) return ray_error("corrupt", NULL);
+        if (*remaining < 8) return ray_error("corrupt", "column file: the list header is truncated");
         int64_t count;
         memcpy(&count, *pp, 8);
         *pp += 8; *remaining -= 8;
-        if (count < 0) return ray_error("corrupt", NULL);
+        if (count < 0) return ray_error("corrupt", "column file: negative list count %lld", (long long)count);
 
         ray_t* list = ray_list_new(count);
         if (!list || RAY_IS_ERR(list)) return list;
@@ -778,7 +789,7 @@ static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining) {
     }
 
     if (type == RAY_TABLE) {
-        if (*remaining < 16) return ray_error("corrupt", NULL);
+        if (*remaining < 16) return ray_error("corrupt", "column file: the table header is truncated");
         int64_t ncols, nrows;
         memcpy(&ncols, *pp, 8);
         *pp += 8; *remaining -= 8;
@@ -786,12 +797,12 @@ static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining) {
         *pp += 8; *remaining -= 8;
         (void)nrows;  /* nrows is reconstructed from columns */
 
-        if (ncols < 0) return ray_error("corrupt", NULL);
+        if (ncols < 0) return ray_error("corrupt", "column file: negative column count %lld", (long long)ncols);
         ray_t* tbl = ray_table_new(ncols);
         if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
         for (int64_t c = 0; c < ncols; c++) {
-            if (*remaining < 8) { ray_release(tbl); return ray_error("corrupt", NULL); }
+            if (*remaining < 8) { ray_release(tbl); return ray_error("corrupt", "column file: the table is truncated at column %lld", (long long)c); }
             int64_t name_sym;
             memcpy(&name_sym, *pp, 8);
             *pp += 8; *remaining -= 8;
@@ -1819,7 +1830,7 @@ static ray_err_t col_validate_str_region(ray_t* hdr, const void* ptr,
 static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
     size_t mapped_size = 0;
     void* ptr = ray_vm_map_file(path, &mapped_size);
-    if (!ptr) return ray_error("io", NULL);
+    if (!ptr) return ray_error("io", "column \"%s\": cannot map the file: %s", EPATH(path), COL_MAP_REASON);
 
     /* Reject extended-format files early.  STRV / STRL / LIST / TABLE
      * encode their payload and cannot satisfy the raw 32-byte ray_t
@@ -1843,7 +1854,7 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
 
     if (mapped_size < 32) {
         ray_vm_unmap_file(ptr, mapped_size);
-        return ray_error("corrupt", NULL);
+        return ray_error("corrupt", "column \"%s\": the file is shorter than its 32-byte header", EPATH(path));
     }
 
     ray_t* hdr = (ray_t*)ptr;
@@ -1857,11 +1868,11 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
     int gen = ray_col_gen_of(ptr);
     if (gen == RAY_ENC_GEN_VERSION) {
         ray_vm_unmap_file(ptr, mapped_size);
-        return ray_error("version", "column %s: bad format version", path);
+        return ray_error("version", "column %s: bad format version", EPATH(path));
     }
     if (gen == RAY_ENC_GEN_CORRUPT) {
         ray_vm_unmap_file(ptr, mapped_size);
-        return ray_error("corrupt", "column %s: format byte and generation marker disagree", path);
+        return ray_error("corrupt", "column %s: format byte and generation marker disagree", EPATH(path));
     }
     if (gen == 2) {
         out->gen2        = true;
@@ -1879,7 +1890,7 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
     }
     if (hdr->len < 0) {
         ray_vm_unmap_file(ptr, mapped_size);
-        return ray_error("corrupt", NULL);
+        return ray_error("corrupt", "column \"%s\": negative length %lld", EPATH(path), (long long)hdr->len);
     }
 
     uint8_t esz = ray_sym_elem_size(hdr->type, hdr->attrs);
@@ -1892,12 +1903,12 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
     /* Overflow check: ensure len*esz fits in size_t with 32-byte header room */
     if ((uint64_t)hdr->len > (SIZE_MAX - 32) / (esz ? esz : 1)) {
         ray_vm_unmap_file(ptr, mapped_size);
-        return ray_error("io", NULL);
+        return ray_error("io", "column \"%s\": length %lld overflows the address space", EPATH(path), (long long)hdr->len);
     }
     size_t data_size = (size_t)hdr->len * esz;
     if (32 + data_size > mapped_size) {
         ray_vm_unmap_file(ptr, mapped_size);
-        return ray_error("corrupt", NULL);
+        return ray_error("corrupt", "column \"%s\": the file is shorter than its data", EPATH(path));
     }
 
     out->data_size = data_size;
@@ -1905,7 +1916,7 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
         ray_err_t se = col_validate_str_region(hdr, ptr, mapped_size, out);
         if (se != RAY_OK) {
             ray_vm_unmap_file(ptr, mapped_size);
-            return ray_error(ray_err_code_str(se), NULL);
+            return ray_error(ray_err_code_str(se), "column \"%s\": the string pool region is %s", EPATH(path), se == RAY_ERR_CORRUPT ? "corrupt" : ray_err_code_str(se));
         }
     } else {
         out->has_str_pool = false;
@@ -1994,13 +2005,13 @@ ray_err_t ray_col_set_index_order(const char* path, int64_t code) {
 
 static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
                             bool require_dom) {
-    if (!path) return ray_error("io", NULL);
+    if (!path) return ray_error("io", "column load: no path");
 
     /* Read file into temp mmap for validation, then copy to buddy block.
      * This avoids the mmap lifecycle problem (mmod=1 blocks are never freed). */
     size_t mapped_size = 0;
     void* ptr = ray_vm_map_file(path, &mapped_size);
-    if (!ptr) return ray_error("io", NULL);
+    if (!ptr) return ray_error("io", "column \"%s\": cannot map the file: %s", EPATH(path), COL_MAP_REASON);
 
     /* Check for extended format magic numbers (first 4 bytes) */
     if (mapped_size >= 4) {
@@ -2093,7 +2104,7 @@ static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
                 ray_release(vec);
                 return ray_error("corrupt",
                     "column %s: saved sym count %u exceeds symfile count %lld",
-                    path, cm.saved_sym_count, (long long)dcount);
+                    EPATH(path), cm.saved_sym_count, (long long)dcount);
             }
             if (cm.saved_sym_count == 0) {
                 uint32_t bound = dcount > UINT32_MAX ? UINT32_MAX : (uint32_t)dcount;
@@ -2101,7 +2112,7 @@ static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
                                                         vec->attrs, bound);
                 if (sym_err != RAY_OK) {
                     ray_release(vec);
-                    return ray_error(ray_err_code_str(sym_err), NULL);
+                    return ray_error(ray_err_code_str(sym_err), "column \"%s\": a SYM cell is outside the symfile's %u symbols", EPATH(path), bound);
                 }
             }
         } else if (require_dom) {
@@ -2111,20 +2122,20 @@ static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
             ray_release(vec);
             return ray_error("sym",
                 "column %s: SYM data but no symfile resolved "
-                "(missing <dir>/.sym -- a file named \"sym\" is not read -- or explicit sym argument)", path);
+                "(missing <dir>/.sym -- a file named \"sym\" is not read -- or explicit sym argument)", EPATH(path));
         } else {
             /* Bare load: process-local runtime-id semantics. */
             vec->sym_domain = ray_sym_runtime_domain();
             uint32_t cur_sc = ray_sym_count();
             if (cm.saved_sym_count > 0 && cur_sc > 0 && cur_sc < cm.saved_sym_count) {
                 ray_release(vec);
-                return ray_error("corrupt", NULL);
+                return ray_error("corrupt", "column \"%s\": saved with %u symbols, the runtime table holds %u", EPATH(path), cm.saved_sym_count, cur_sc);
             }
             ray_err_t sym_err = validate_sym_bounds(ray_data(vec), vec->len,
                                                     vec->attrs, cur_sc);
             if (sym_err != RAY_OK) {
                 ray_release(vec);
-                return ray_error(ray_err_code_str(sym_err), NULL);
+                return ray_error(ray_err_code_str(sym_err), "column \"%s\": a SYM cell is outside the runtime table's %u symbols", EPATH(path), cur_sc);
             }
         }
     }
@@ -2153,7 +2164,7 @@ ray_t* ray_col_load_dom(const char* path, struct ray_sym_domain_s* dom) {
 
 static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
                             bool require_dom) {
-    if (!path) return ray_error("io", NULL);
+    if (!path) return ray_error("io", "column map: no path");
 
     col_mapped_t cm = {0};
     ray_t* err = col_validate_mapped(path, &cm);
@@ -2176,7 +2187,7 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
                 ray_vm_unmap_file(cm.mapped, cm.mapped_size);
                 return ray_error("corrupt",
                     "column %s: saved sym count %u exceeds symfile count %lld",
-                    path, cm.saved_sym_count, (long long)dcount);
+                    EPATH(path), cm.saved_sym_count, (long long)dcount);
             }
             if (cm.saved_sym_count == 0) {
                 uint32_t bound = dcount > UINT32_MAX ? UINT32_MAX
@@ -2185,14 +2196,14 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
                     (const char*)cm.mapped + 32, vec->len, vec->attrs, bound);
                 if (sym_err != RAY_OK) {
                     ray_vm_unmap_file(cm.mapped, cm.mapped_size);
-                    return ray_error(ray_err_code_str(sym_err), NULL);
+                    return ray_error(ray_err_code_str(sym_err), "column \"%s\": a SYM cell is outside the symfile's %u symbols", EPATH(path), bound);
                 }
             }
         } else if (require_dom) {
             ray_vm_unmap_file(cm.mapped, cm.mapped_size);
             return ray_error("sym",
                 "column %s: SYM data but no symfile resolved "
-                "(missing <dir>/.sym -- a file named \"sym\" is not read -- or explicit sym argument)", path);
+                "(missing <dir>/.sym -- a file named \"sym\" is not read -- or explicit sym argument)", EPATH(path));
         } else {
             /* Bare load: process-local runtime-id semantics.  Fast-reject a
              * file whose saved dictionary count exceeds the live table — it
@@ -2201,13 +2212,13 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
             if (cm.saved_sym_count > 0 && cur_sc > 0 &&
                 cur_sc < cm.saved_sym_count) {
                 ray_vm_unmap_file(cm.mapped, cm.mapped_size);
-                return ray_error("corrupt", NULL);
+                return ray_error("corrupt", "column \"%s\": saved with %u symbols, the runtime table holds %u", EPATH(path), cm.saved_sym_count, cur_sc);
             }
             ray_err_t sym_err = validate_sym_bounds(
                 (const char*)cm.mapped + 32, vec->len, vec->attrs, cur_sc);
             if (sym_err != RAY_OK) {
                 ray_vm_unmap_file(cm.mapped, cm.mapped_size);
-                return ray_error(ray_err_code_str(sym_err), NULL);
+                return ray_error(ray_err_code_str(sym_err), "column \"%s\": a SYM cell is outside the runtime table's %u symbols", EPATH(path), cur_sc);
             }
         }
     }

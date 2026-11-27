@@ -165,7 +165,7 @@ static __attribute__((noinline, cold)) ray_t* env_frame_force(ray_scope_frame_t*
          * (RAY_LAZY_G_FAILED): the bindings keep it too, so a later read
          * raises the value's own error again, not an undefined name. */
         ray_retain(lazy);
-        return concrete ? concrete : ray_error("type", NULL);
+        return concrete ? concrete : ray_error("type", "lazy local: materializing answered no value");
     }
     f->vals[i] = ok ? concrete : NULL;
     if (f->slot_values)
@@ -175,7 +175,7 @@ static __attribute__((noinline, cold)) ray_t* env_frame_force(ray_scope_frame_t*
             if (ok) ray_retain(concrete);
             f->slot_values[j] = ok ? concrete : NULL;
         }
-    return ok ? concrete : (concrete ? concrete : ray_error("type", NULL));
+    return ok ? concrete : (concrete ? concrete : ray_error("type", "lazy local: materializing answered no value"));
 }
 
 /* A frame's value at `i`, as a read sees it: a lazy handle forced. */

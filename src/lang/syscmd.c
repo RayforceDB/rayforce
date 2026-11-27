@@ -578,7 +578,7 @@ ray_t* ray_syscmd_string_dispatch_fn(ray_t* x) {
  * straight to the named handler, no string parsing. */
 static ray_t* invoke_by_name(const char* name, ray_t* arg) {
     const ray_syscmd_t* e = ray_syscmd_lookup(name, strlen(name));
-    if (!e || !e->fn) return ray_error("nyi", NULL);
+    if (!e || !e->fn) return ray_error("nyi", "command: :%s is not a known command", name);
     if (e->flags & RAY_SYSCMD_REPL_ONLY)
         return ray_error("domain", "command is REPL-only");
     ray_syscmd_ctx_t ctx = { NULL, false };

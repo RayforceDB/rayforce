@@ -53,6 +53,7 @@ uint64_t ray_vm_willneed_bytes(void) {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>        /* the failing call's errno, kept by ray_vm_map_file (#1886) */
 #include <stdatomic.h>    /* the lazily read page size and read-ahead step */
 #if defined(RAY_OS_MACOS)
 #include <sys/sysctl.h>   /* sysctlbyname — hw.physicalcpu */
@@ -104,9 +105,13 @@ void* ray_vm_map_file_id(const char* path, size_t* out_size, ray_file_id_t* id) 
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
 
+    /* A failure leaves errno as the failing call set it (close keeps it),
+     * and an empty file leaves it 0, so a caller can name the reason (#1886). */
     struct stat st;
     if (fstat(fd, &st) != 0) {
+        int e = errno;
         close(fd);
+        errno = e;
         return NULL;
     }
     if (id) {
@@ -125,14 +130,16 @@ void* ray_vm_map_file_id(const char* path, size_t* out_size, ray_file_id_t* id) 
     if (st.st_size <= 0) {
         close(fd);
         if (out_size) *out_size = 0;
+        errno = 0;
         return NULL;
     }
 
     size_t len = (size_t)st.st_size;
     void* p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    int map_errno = errno;
     close(fd);
 
-    if (p == MAP_FAILED) return NULL;
+    if (p == MAP_FAILED) { errno = map_errno; return NULL; }
 
     ray_sys_track_file_add((int64_t)len);   /* file-backed mapping */
     if (out_size) *out_size = len;
@@ -1697,6 +1704,7 @@ void ray_sem_signal(ray_sem_t* s) {
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <errno.h>        /* the failing call's errno, kept by ray_vm_map_file (#1886) */
 #include <fcntl.h>
 #include <unistd.h>
 #include "mem/sys.h"
@@ -1736,17 +1744,21 @@ void* ray_vm_map_file(const char* path, size_t* out_size) {
     if (fd < 0) return NULL;
 
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    int st_rc = fstat(fd, &st);
+    if (st_rc != 0 || st.st_size <= 0) {
+        int e = st_rc != 0 ? errno : 0;
         close(fd);
         if (out_size) *out_size = 0;
+        errno = e;   /* the failing call's, or 0 for an empty file (#1886) */
         return NULL;
     }
 
     size_t len = (size_t)st.st_size;
     void* p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    int map_errno = errno;
     close(fd);
 
-    if (p == MAP_FAILED) return NULL;
+    if (p == MAP_FAILED) { errno = map_errno; return NULL; }
     ray_sys_track_file_add((int64_t)len);
     if (out_size) *out_size = len;
     return p;

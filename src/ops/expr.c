@@ -4107,7 +4107,7 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
             break;
         }
     }
-    if (!ref_parted) { ray_release(out); return ray_error("nyi", NULL); }
+    if (!ref_parted) { ray_release(out); return ray_error("nyi", "parted expression: no parted column to evaluate over"); }
 
     int64_t n_segs = expr_nsegs(ref_parted);
     uint8_t esz = ray_elem_size(expr->out_type);

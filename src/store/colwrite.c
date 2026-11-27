@@ -39,6 +39,9 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include "core/errpath.h"
+/* a path as messages show it: a long one by its tail (#1886) */
+#define EPATH(p) ray_err_path((p), (char[RAY_ERR_PATH_MAX + 1]){0})
 
 /* tmp -> fsync (durable) -> rename -> dir sync; removes a stale .link
  * sidecar (generation-2 columns are never linked). */
@@ -103,7 +106,7 @@ static void colw_region_msg(const char* path) {
     if (!m || strncmp(m, "index region:", 13) != 0) return;
     char copy[256];
     snprintf(copy, sizeof copy, "%s", m);
-    ray_error_free(ray_error("io", "column %s: %s", path, copy));   /* sets the message; code unused */
+    ray_error_free(ray_error("io", "column %s: %s", EPATH(path), copy));   /* sets the message; code unused */
 }
 
 static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8_t ik_override,

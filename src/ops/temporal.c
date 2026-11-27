@@ -749,7 +749,7 @@ ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
     if (!input || RAY_IS_ERR(input)) return input;
 
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
+    if (!ext) { ray_release(input); return ray_error("nyi", "extract: the plan node has no extension"); }
 
     int64_t field = ext->sym;
     if (field == RAY_EXTRACT_DATE || field == RAY_EXTRACT_TIME) {
@@ -814,7 +814,7 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
     if (!input || RAY_IS_ERR(input)) return input;
 
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
+    if (!ext) { ray_release(input); return ray_error("nyi", "trunc: the plan node has no extension"); }
 
     ray_t* result = ray_temporal_truncate(input, (int)ext->sym);
     ray_release(input);

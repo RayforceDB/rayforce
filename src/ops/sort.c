@@ -3823,11 +3823,11 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "sort: the plan node has no extension");
 
     int64_t nrows = ray_table_nrows(tbl);
     int64_t ncols = ray_table_ncols(tbl);
-    if (ncols > 4096) return ray_error("nyi", NULL); /* stack safety */
+    if (ncols > 4096) return ray_error("nyi", "sort: more than 4096 columns"); /* stack safety */
     uint32_t n_sort = ext->sort.n_cols;
 
     /* ---- Top-K shortcut ----
@@ -3903,7 +3903,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
                                 name ? (int)ray_str_len(name) : 0,
                                 name ? ray_str_ptr(name) : "");
             }
-            if (!err) err = ray_error("nyi", NULL);
+            if (!err) err = ray_error("nyi", "sort: a sort key has no value");
             for (uint32_t j = 0; j < k; j++) {
                 if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
                     ray_release(sort_vecs[j]);

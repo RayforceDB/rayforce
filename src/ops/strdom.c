@@ -30,6 +30,9 @@
 
 #include <stdint.h>
 #include <string.h>
+#include "core/errpath.h"
+/* a path as messages show it: a long one by its tail (#1886) */
+#define EPATH(p) ray_err_path((p), (char[RAY_ERR_PATH_MAX + 1]){0})
 
 /* Open addressing over the interned strings, at most half full.  A slot
  * holds 0 (empty) or the id + 1 in its low 40 bits under a 24-bit tag from
@@ -227,7 +230,7 @@ static int sd_view(sd_build_t* b, int64_t v, int64_t vrows, ray_t** err) {
          * vrows and b->sdict, so this cannot fire on any file */
         if (got > 0 && (b->vv->n != vrows || b->vv->dict_n != b->sdict->n)) {
             *err = ray_error("corrupt", "column %s: string domain: vector %lld holds %d rows of %u entries",
-                             b->se->path, (long long)v, b->vv->n, b->vv->dict_n);
+                             EPATH(b->se->path), (long long)v, b->vv->n, b->vv->dict_n);
             return -1;
         }
         if (got > 0 && !b->remap) {

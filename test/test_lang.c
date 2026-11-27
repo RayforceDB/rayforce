@@ -16668,6 +16668,35 @@ static test_result_t test_csv_import_cause_kept(void) {
     PASS();
 }
 
+/* A column file cut short names what is truncated (#1886); a missing one
+ * names the file and the OS reason.  Codes are as before: corrupt, io. */
+static test_result_t test_col_file_messages(void) {
+#if !defined(RAY_OS_WINDOWS)   /* the fixture is cut with POSIX truncate */
+    const char* path = ray_test_tmp("/tmp/rf_col_msg_v");
+    ray_t* v = ray_eval_str("(til 1000)");
+    TEST_ASSERT(v && !RAY_IS_ERR(v), "fixture");
+    TEST_ASSERT_EQ_I(ray_col_save(v, path), RAY_OK);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(truncate(path, 40), 0);
+    ray_t* r = ray_col_load(path);
+    bool corrupt = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "corrupt") == 0;
+    char m1[256];
+    snprintf(m1, sizeof m1, "%s", corrupt && ray_err_msg(r) ? ray_err_msg(r) : "(none)");
+    if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+    (void)unlink(path);
+    ray_t* r2 = ray_col_load(path);
+    bool io = r2 && RAY_IS_ERR(r2) && strcmp(ray_err_code(r2), "io") == 0;
+    char m2[256];
+    snprintf(m2, sizeof m2, "%s", io && ray_err_msg(r2) ? ray_err_msg(r2) : "(none)");
+    if (r2) { if (RAY_IS_ERR(r2)) ray_error_free(r2); else ray_release(r2); }
+    TEST_ASSERT_TRUE(corrupt);
+    TEST_ASSERT_FMT(strstr(m1, "column") && strstr(m1, "shorter than its data"), "truncated: %s", m1);
+    TEST_ASSERT_TRUE(io);
+    TEST_ASSERT_FMT(strstr(m2, "column \"") && strstr(m2, strerror(ENOENT)), "missing: %s", m2);
+#endif
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/query/group_wide_null_masks", test_group_wide_null_masks, lang_setup, lang_teardown },
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
@@ -17223,5 +17252,6 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/restricted_query_mapped", test_eval_restricted_query_mapped, lang_setup, lang_teardown },
     { "lang/read_os_reason", test_read_os_reason, lang_setup, lang_teardown },
     { "lang/csv_import_cause_kept", test_csv_import_cause_kept, lang_setup, lang_teardown },
+    { "lang/col_file_messages", test_col_file_messages, lang_setup, lang_teardown },
     { NULL, NULL, NULL, NULL },
 };

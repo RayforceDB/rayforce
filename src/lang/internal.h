@@ -338,7 +338,7 @@ static inline ray_t* collection_elem(ray_t* coll, int64_t i, int *allocated) {
             const char* sp = ray_str_vec_get(coll, i, &slen);
             return ray_str(sp ? sp : "", sp ? slen : 0);
         }
-        default:            *allocated = 0; return ray_error("type", NULL);
+        default:            *allocated = 0; return ray_error("type", "element: a %s value has no elements", ray_type_name(coll->type));
     }
 }
 

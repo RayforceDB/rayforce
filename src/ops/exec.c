@@ -22,6 +22,9 @@
  */
 
 #include "ops/internal.h"
+#include "core/errpath.h"
+/* a path as messages show it: a long one by its tail (#1886) */
+#define EPATH(p) ray_err_path((p), (char[RAY_ERR_PATH_MAX + 1]){0})
 #include "ops/colgather.h"   /* ray_col_gather_slot: the refinement over encoded columns */
 #include "ops/colbind.h"
 #include "ops/cdfuse.h"     /* ray_cd_bounded_all: count distinct of an encoded scan */
@@ -575,7 +578,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op);
 /* Broadcast a scalar atom to a column vector of nrows elements.
  * Returns a new vector (caller owns).  On failure returns ray_error(). */
 ray_t* broadcast_scalar(ray_t* atom, int64_t nrows) {
-    if (!atom) return ray_error("domain", NULL);
+    if (!atom) return ray_error("domain", "broadcast: no atom to broadcast");
     if (nrows <= 0) {
         /* Empty table: return an empty vector of the matching type */
         int8_t at = atom->type;
@@ -1840,7 +1843,7 @@ static bool str_seg_fill(const str_sel_ctx_t* x, str_seg_sel_t* s, ray_col_scrat
                         const int64_t k0 = row - v * RAY_ENC_VEC;
                         if (k0 + piece > vv.n) {
                             ray_scan_fail_note(x->fail, key, ray_error("corrupt",
-                                "column %s: STR selection: vector %lld holds %d rows", s->e->path, (long long)v, vv.n));
+                                "column %s: STR selection: vector %lld holds %d rows", EPATH(s->e->path), (long long)v, vv.n));
                             return false;
                         }
                         const uint32_t* cd = vv.codes + k0;
@@ -1859,7 +1862,7 @@ static bool str_seg_fill(const str_sel_ctx_t* x, str_seg_sel_t* s, ray_col_scrat
         ray_col_range_t rv;
         ray_t* err = ray_col_range(s->rs, row, n - at, sc, &rv);
         if (!err && rv.n <= 0)
-            err = s->e ? ray_error("range", "column %s: STR selection: empty range read at row %lld", s->e->path, (long long)row)
+            err = s->e ? ray_error("range", "column %s: STR selection: empty range read at row %lld", EPATH(s->e->path), (long long)row)
                        : ray_error("range", "column %.*s: STR selection: empty range read at row %lld",
                                    x->cname_len, x->cname, (long long)row);
         if (err) { ray_scan_fail_note(x->fail, key, err); return false; }
@@ -3975,7 +3978,7 @@ static ray_t* exec_elementwise_tree(ray_graph_t* g, ray_op_t* root) {
         if (state[id] != EW_NEW) continue;
         state[id] = EW_SEEN;
         ray_op_t* n = op_node(g, id);
-        if (!n) { result = ray_error("nyi", NULL); goto done; }
+        if (!n) { result = ray_error("nyi", "execute: a node of the expression is missing from the plan"); goto done; }
         for (int k = 0; k < n->arity; k++) {
             ray_op_t* c = op_child(g, n, k);
             if (c && op_is_elementwise(c->opcode)) {
@@ -3990,7 +3993,7 @@ static ray_t* exec_elementwise_tree(ray_graph_t* g, ray_op_t* root) {
     while (sp > 0) {
         ew_ent_t e = stk[--sp];
         ray_op_t* n = op_node(g, e.id);
-        if (!n) { result = ray_error("nyi", NULL); goto done; }
+        if (!n) { result = ray_error("nyi", "execute: a node of the expression is missing from the plan"); goto done; }
 
         if (e.phase == 0) {                       /* discover */
             if (state[e.id] == EW_DONE)           /* shared node, evaluated */
@@ -3999,7 +4002,7 @@ static ray_t* exec_elementwise_tree(ray_graph_t* g, ray_op_t* root) {
                 /* Re-discovering a node whose emit is still pending means
                  * the node is its own ancestor — a cyclic graph.  Refuse
                  * rather than read a missing value. */
-                result = ray_error("nyi", NULL);
+                result = ray_error("nyi", "execute: the expression's plan is cyclic");
                 goto done;
             }
             state[e.id] = EW_PENDING;
@@ -4040,7 +4043,7 @@ static ray_t* exec_elementwise_tree(ray_graph_t* g, ray_op_t* root) {
                 ray_op_t* c = op_child(g, n, k);
                 if (c && op_is_elementwise(c->opcode)) {
                     in[k] = vals[c->id];
-                    if (!in[k]) { result = ray_error("nyi", NULL); goto emit_fail; }
+                    if (!in[k]) { result = ray_error("nyi", "execute: an input of an element-wise node has no value"); goto emit_fail; }
                 } else {
                     in[k] = exec_node(g, c);      /* may recurse; depth-guarded */
                     owned[k] = true;
@@ -4309,7 +4312,7 @@ void ray_exec_memo_pop(ray_graph_t* g, const ray_exec_memo_save_t* save) {
 static RAY_TLS int tl_filter_depth;
 
 ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
-    if (!op) return ray_error("nyi", NULL);
+    if (!op) return ray_error("nyi", "execute: no plan node");
 
     /* Shared node already computed: hand out a ref (the memo's own ref goes
      * at exec_memo_end). */
@@ -4805,17 +4808,17 @@ static ray_t* exec_keep_cols(ray_t* tbl, const int64_t* keep, int keep_n) {
 }
 
 static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
-    if (!op) return ray_error("nyi", NULL);
+    if (!op) return ray_error("nyi", "execute: no plan node");
 
     switch (op->opcode) {
         case OP_SCAN: {
             ray_op_ext_t* ext = find_ext(g, op->id);
-            if (!ext) return ray_error("nyi", NULL);
+            if (!ext) return ray_error("nyi", "execute: the scan node has no extension");
 
             ray_t* scan_tbl = scan_table_of(g, ext);
-            if (!scan_tbl) return ray_error("schema", NULL);
+            if (!scan_tbl) return ray_error("schema", "execute: the scan node has no table");
             ray_t* col = ray_table_col(scan_tbl, ext->sym);
-            if (!col) return ray_error("schema", NULL);
+            if (!col) return ray_error("schema", "execute: the scanned column is not in the table");
             if (RAY_IS_ERR(col)) return col;     /* a failed decode keeps its own code and message */
             if (col->type == RAY_MAPCOMMON)
                 return materialize_mapcommon(col);
@@ -4835,7 +4838,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
 
         case OP_CONST: {
             ray_op_ext_t* ext = find_ext(g, op->id);
-            if (!ext || !ext->literal) return ray_error("nyi", NULL);
+            if (!ext || !ext->literal) return ray_error("nyi", "execute: the constant node has no value");
             ray_retain(ext->literal);
             return ext->literal;
         }
@@ -6655,10 +6658,10 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             if (!input || RAY_IS_ERR(input)) return input;
             if (input->type != RAY_TABLE) {
                 ray_release(input);
-                return ray_error("nyi", NULL);
+                return ray_error("nyi", "execute: the projection's input is not a table");
             }
             ray_op_ext_t* ext = find_ext(g, op->id);
-            if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
+            if (!ext) { ray_release(input); return ray_error("nyi", "execute: the projection node has no extension"); }
             uint32_t n_cols = ext->sort.n_cols;
             uint32_t* columns = ext->sort.columns;
 
@@ -6723,7 +6726,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         ray_release(result);
                         g->table = saved_table;
                         ray_release(input);
-                        return vec ? vec : ray_error("nyi", NULL);
+                        return vec ? vec : ray_error("nyi", "execute: a projected column has no value");
                     }
                     /* A scalar atom becomes a one-element column, widened
                      * below only if another column carries the input's
@@ -6737,7 +6740,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             ray_release(result);
                             g->table = saved_table;
                             ray_release(input);
-                            return vec ? vec : ray_error("nyi", NULL);
+                            return vec ? vec : ray_error("nyi", "execute: a projected column has no value");
                         }
                     }
                     /* Synthetic name: _expr_0, _expr_1, ... */
@@ -7039,7 +7042,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         }
 
         default:
-            return ray_error("nyi", NULL);
+            return ray_error("nyi", "execute: plan opcode %d is not implemented", (int)op->opcode);
     }
 }
 
@@ -7075,7 +7078,7 @@ ray_t* ray_result_merge(ray_t* accum, ray_t* partial) {
             }
             if (!a_col || !p_col) {
                 ray_release(merged);
-                return ray_error("schema", NULL);
+                return ray_error("schema", "parted merge: a column is missing from a partition's result");
             }
             ray_t* combined = ray_vec_concat(a_col, p_col);
             if (!combined || RAY_IS_ERR(combined)) {
@@ -7137,13 +7140,13 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
              * value across seg_rows elements. */
             if (col->len < 2) {
                 ray_release(seg_tbl);
-                return ray_error("schema", NULL);
+                return ray_error("schema", "parted segment: the partition key column holds fewer than 2 cells");
             }
             ray_t** mc_ptrs = (ray_t**)ray_data(col);
             ray_t* kv = mc_ptrs[0];  /* key_values */
             if (!kv || seg_idx >= kv->len) {
                 ray_release(seg_tbl);
-                return ray_error("schema", NULL);
+                return ray_error("schema", "parted segment: segment %d is past the partition key", (int)seg_idx);
             }
             int8_t kv_type = kv->type;
             size_t esz = (size_t)ray_sym_elem_size(kv_type, kv->attrs);
@@ -7178,7 +7181,7 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
         } else if (RAY_IS_PARTED(m.type)) {
             if (seg_idx >= m.n_segs) {
                 ray_release(seg_tbl);
-                return ray_error("schema", NULL);
+                return ray_error("schema", "parted segment: segment %d is past the column's %d segments", (int)seg_idx, (int)m.n_segs);
             }
             ray_t* seg = ray_table_parted_seg_idx(parted_tbl, c, seg_idx);
             if (!seg) {
@@ -7235,7 +7238,7 @@ ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
              * streaming should have been rejected by ray_execute().
              * Error here as defense-in-depth to avoid silent duplication. */
             ray_release(seg_tbl);
-            return ray_error("schema", NULL);
+            return ray_error("schema", "parted segment: a column would be gathered twice");
         }
     }
     return seg_tbl;
@@ -7507,7 +7510,7 @@ static _Thread_local int exec_depth;   /* nesting of ray_execute on this thread 
  * result.  Do not revalidate every OP_SCAN against g->table here: graph APIs
  * legitimately scan derived columns produced by upstream operators. */
 static ray_t* validate_scan_columns(ray_graph_t* g) {
-    if (!g) return ray_error("nyi", NULL);
+    if (!g) return ray_error("nyi", "execute: no plan");
 
     for (uint32_t i = 0; i < g->node_count; i++) {
         ray_op_t* op = &g->nodes[i];
@@ -7810,7 +7813,7 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cance
             g->compile_err = NULL;
             return e;
         }
-        return ray_error("nyi", NULL);
+        return ray_error("nyi", "execute: no plan to run");
     }
 
     /* Lazy-init the global thread pool on first call */
@@ -7858,7 +7861,7 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cance
                 if (seg_count == 0)
                     seg_count = (int32_t)m.n_segs;
                 else if ((int32_t)m.n_segs != seg_count)
-                    return ray_error("schema", NULL);
+                    return ray_error("schema", "parted execute: the columns disagree on the number of partitions");
             } else if (m.type != RAY_MAPCOMMON) {
                 has_flat = true;
             }
@@ -7956,7 +7959,7 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cance
      * count, which is a schema error.  Surface it rather than
      * silently dropping data. */
     if (seg_mask && seg_mask_count != (int64_t)seg_count)
-        return ray_error("schema", NULL);
+        return ray_error("schema", "parted execute: the partition mask does not cover every partition");
 
     ray_t* saved_table = g->table;
     ray_t* result = NULL;

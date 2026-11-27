@@ -106,10 +106,10 @@ static ray_t* exec_expand_factorized(ray_rel_t* rel, uint8_t direction, ray_t* s
  * Count-then-fill pattern (same as exec_join). */
 ray_t* exec_expand(ray_graph_t* g, ray_op_t* op, ray_t* src_vec) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "expand: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "expand: no graph is bound to the plan node");
 
     /* Factorized mode: emit pre-aggregated degree counts */
     if (ext->graph.factorized)
@@ -303,10 +303,10 @@ ray_t* exec_expand(ray_graph_t* g, ray_op_t* op, ray_t* src_vec) {
 /* exec_var_expand: iterative BFS with depth limit and cycle detection */
 ray_t* exec_var_expand(ray_graph_t* g, ray_op_t* op, ray_t* start_vec) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "var-expand: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "var-expand: no graph is bound to the plan node");
 
     uint8_t direction = ext->graph.direction;
     uint8_t min_depth = ext->graph.min_depth;
@@ -490,10 +490,10 @@ cleanup:;
 ray_t* exec_shortest_path(ray_graph_t* g, ray_op_t* op,
                                  ray_t* src_val, ray_t* dst_val) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "shortest path: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "shortest path: no graph is bound to the plan node");
     uint8_t direction = ext->graph.direction;
     ray_csr_t* csr = (direction == 1) ? &rel->rev : &rel->fwd;
     ray_csr_t* csr_rev = &rel->rev;
@@ -669,10 +669,10 @@ bfs_done:
  * -------------------------------------------------------------------------- */
 ray_t* exec_pagerank(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "pagerank: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "pagerank: no graph is bound to the plan node");
 
     int64_t n       = rel->fwd.n_nodes;
     uint16_t iters  = ext->graph.max_iter;
@@ -775,10 +775,10 @@ ray_t* exec_pagerank(ray_graph_t* g, ray_op_t* op) {
  * -------------------------------------------------------------------------- */
 ray_t* exec_connected_comp(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "connected components: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "connected components: no graph is bound to the plan node");
 
     int64_t n = rel->fwd.n_nodes;
     if (n <= 0) return ray_error("length", "graph.connected: graph must have at least one node, got %lld", (long long)n);
@@ -963,11 +963,11 @@ static double dijkstra_masked(
 ray_t* exec_dijkstra(ray_graph_t* g, ray_op_t* op,
                              ray_t* src_val, ray_t* dst_val) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "dijkstra: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
-    if (!rel->fwd.props) return ray_error("schema", NULL); /* need edge properties */
+    if (!rel) return ray_error("schema", "dijkstra: no graph is bound to the plan node");
+    if (!rel->fwd.props) return ray_error("schema", "dijkstra: the graph has no edge properties; build it with a weight column"); /* need edge properties */
 
     int64_t n = rel->fwd.n_nodes;
     int64_t m = rel->fwd.n_edges;
@@ -983,8 +983,8 @@ ray_t* exec_dijkstra(ray_graph_t* g, ray_op_t* op,
     ray_t* props = rel->fwd.props;
     ray_t* weight_vec = ray_table_col(props, weight_sym);
     if (weight_vec && RAY_IS_ERR(weight_vec)) return weight_vec;
-    if (!weight_vec) return ray_error("schema", NULL);
-    if (weight_vec->type != RAY_F64) return ray_error("schema", NULL);
+    if (!weight_vec) return ray_error("schema", "dijkstra: the edge properties have no weight column");
+    if (weight_vec->type != RAY_F64) return ray_error("schema", "dijkstra: the weight column must be F64");
     double* weights = (double*)ray_data(weight_vec);
 
     /* Dijkstra requires non-negative edge weights */
@@ -1113,14 +1113,14 @@ ray_t* exec_dijkstra(ray_graph_t* g, ray_op_t* op,
 /* exec_wco_join: Worst-Case Optimal Join via general Leapfrog Triejoin */
 ray_t* exec_wco_join(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "wco join: the plan node has no graph extension");
 
     ray_rel_t** rels = (ray_rel_t**)ext->wco.rels;
     uint8_t n_rels = ext->wco.n_rels;
     uint8_t n_vars = ext->wco.n_vars;
 
-    if (!rels || n_rels == 0) return ray_error("schema", NULL);
-    if (n_vars > LFTJ_MAX_VARS) return ray_error("nyi", NULL);
+    if (!rels || n_rels == 0) return ray_error("schema", "wco join: no relations to join");
+    if (n_vars > LFTJ_MAX_VARS) return ray_error("nyi", "wco join: more variables than the join supports");
 
     /* Validate sorted CSR (both fwd and rev, since LFTJ may use either) */
     for (uint8_t r = 0; r < n_rels; r++) {
@@ -1132,7 +1132,7 @@ ray_t* exec_wco_join(ray_graph_t* g, ray_op_t* op) {
     lftj_enum_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     if (!lftj_build_default_plan(&ctx, rels, n_rels, n_vars))
-        return ray_error("nyi", NULL);
+        return ray_error("nyi", "wco join: no join plan for these relations");
 
     /* Allocate output buffers */
     int64_t out_cap = 4096;
@@ -1219,10 +1219,10 @@ ray_t* exec_wco_join(ray_graph_t* g, ray_op_t* op) {
  * -------------------------------------------------------------------------- */
 ray_t* exec_louvain(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "louvain: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "louvain: no graph is bound to the plan node");
 
     int64_t n = rel->fwd.n_nodes;
     int64_t m = rel->fwd.n_edges;
@@ -1376,10 +1376,10 @@ ray_t* exec_louvain(ray_graph_t* g, ray_op_t* op) {
  * -------------------------------------------------------------------------- */
 ray_t* exec_degree_cent(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "degree centrality: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "degree centrality: no graph is bound to the plan node");
 
     int64_t n = rel->fwd.n_nodes;
     if (n <= 0) return ray_error("length", "graph.degree: graph must have at least one node, got %lld", (long long)n);
@@ -1443,10 +1443,10 @@ ray_t* exec_degree_cent(ray_graph_t* g, ray_op_t* op) {
  * -------------------------------------------------------------------------- */
 ray_t* exec_topsort(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "topsort: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "topsort: no graph is bound to the plan node");
 
     int64_t n = rel->fwd.n_nodes;
     if (n <= 0) return ray_error("length", "graph.topsort: graph must have at least one node, got %lld", (long long)n);
@@ -1538,10 +1538,10 @@ ray_t* exec_topsort(ray_graph_t* g, ray_op_t* op) {
  * -------------------------------------------------------------------------- */
 ray_t* exec_cluster_coeff(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "clustering coefficient: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "clustering coefficient: no graph is bound to the plan node");
 
     int64_t n = rel->fwd.n_nodes;
     if (n <= 0) return ray_error("length", "graph.cluster: graph must have at least one node, got %lld", (long long)n);
@@ -1643,9 +1643,9 @@ ray_t* exec_cluster_coeff(ray_graph_t* g, ray_op_t* op) {
  * -------------------------------------------------------------------------- */
 ray_t* exec_betweenness(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "betweenness: the plan node has no graph extension");
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "betweenness: no graph is bound to the plan node");
 
     int64_t n = rel->fwd.n_nodes;
     if (n <= 0) return ray_error("length", "graph.betweenness: graph must have at least one node, got %lld", (long long)n);
@@ -1831,9 +1831,9 @@ ray_t* exec_betweenness(ray_graph_t* g, ray_op_t* op) {
  * -------------------------------------------------------------------------- */
 ray_t* exec_closeness(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "closeness: the plan node has no graph extension");
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "closeness: no graph is bound to the plan node");
 
     int64_t n = rel->fwd.n_nodes;
     if (n <= 0) return ray_error("length", "graph.closeness: graph must have at least one node, got %lld", (long long)n);
@@ -1980,9 +1980,9 @@ static bool uf_union(int64_t* parent, int64_t* rank_arr, int64_t a, int64_t b) {
 
 ray_t* exec_mst(ray_graph_t* g, ray_op_t* op) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "mst: the plan node has no graph extension");
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel || !rel->fwd.props) return ray_error("schema", NULL);
+    if (!rel || !rel->fwd.props) return ray_error("schema", "mst: the graph has no edge properties; build it with a weight column");
 
     int64_t n = rel->fwd.n_nodes;
     int64_t m = rel->fwd.n_edges;
@@ -1991,7 +1991,7 @@ ray_t* exec_mst(ray_graph_t* g, ray_op_t* op) {
     int64_t weight_sym = ext->graph.weight_col_sym;
     ray_t* weight_vec = ray_table_col(rel->fwd.props, weight_sym);
     if (weight_vec && RAY_IS_ERR(weight_vec)) return weight_vec;
-    if (!weight_vec || weight_vec->type != RAY_F64) return ray_error("schema", NULL);
+    if (!weight_vec || weight_vec->type != RAY_F64) return ray_error("schema", "mst: the edge properties need an F64 weight column");
     double* weights = (double*)ray_data(weight_vec);
 
     int64_t* fwd_off = (int64_t*)ray_data(rel->fwd.offsets);
@@ -2082,9 +2082,9 @@ ray_t* exec_mst(ray_graph_t* g, ray_op_t* op) {
  * -------------------------------------------------------------------------- */
 ray_t* exec_random_walk(ray_graph_t* g, ray_op_t* op, ray_t* src_val) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "random walk: the plan node has no graph extension");
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "random walk: no graph is bound to the plan node");
 
     int64_t n = rel->fwd.n_nodes;
     uint16_t walk_len = ext->graph.max_iter;
@@ -2152,10 +2152,10 @@ ray_t* exec_random_walk(ray_graph_t* g, ray_op_t* op, ray_t* src_val) {
  * -------------------------------------------------------------------------- */
 ray_t* exec_dfs(ray_graph_t* g, ray_op_t* op, ray_t* src_val) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "dfs: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "dfs: no graph is bound to the plan node");
 
     int64_t n = rel->fwd.n_nodes;
     uint8_t max_depth = ext->graph.max_depth;
@@ -2277,14 +2277,14 @@ ray_t* exec_dfs(ray_graph_t* g, ray_op_t* op, ray_t* src_val) {
 ray_t* exec_astar(ray_graph_t* g, ray_op_t* op,
                          ray_t* src_val, ray_t* dst_val) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "astar: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel) return ray_error("schema", NULL);
-    if (!rel->fwd.props) return ray_error("schema", NULL);
+    if (!rel) return ray_error("schema", "astar: no graph is bound to the plan node");
+    if (!rel->fwd.props) return ray_error("schema", "astar: the graph has no edge properties; build it with a weight column");
 
     ray_t* np = (ray_t*)ext->graph.node_props;
-    if (!np) return ray_error("schema", NULL);
+    if (!np) return ray_error("schema", "astar: the graph has no node properties for the coordinates");
 
     int64_t n = rel->fwd.n_nodes;
     int64_t m = rel->fwd.n_edges;
@@ -2299,7 +2299,7 @@ ray_t* exec_astar(ray_graph_t* g, ray_op_t* op,
     int64_t weight_sym = ext->graph.weight_col_sym;
     ray_t* weight_vec = ray_table_col(rel->fwd.props, weight_sym);
     if (weight_vec && RAY_IS_ERR(weight_vec)) return weight_vec;
-    if (!weight_vec) return ray_error("schema", NULL);
+    if (!weight_vec) return ray_error("schema", "astar: the edge properties have no weight column");
     double* weights_arr = (double*)ray_data(weight_vec);
 
     /* Resolve coordinate columns from node properties */
@@ -2307,7 +2307,7 @@ ray_t* exec_astar(ray_graph_t* g, ray_op_t* op,
     if (lat_vec && RAY_IS_ERR(lat_vec)) return lat_vec;
     ray_t* lon_vec = ray_table_col(np, ext->graph.coord_col_syms[1]);
     if (lon_vec && RAY_IS_ERR(lon_vec)) return lon_vec;
-    if (!lat_vec || !lon_vec) return ray_error("schema", NULL);
+    if (!lat_vec || !lon_vec) return ray_error("schema", "astar: the node properties have no coordinate columns");
     double* lat = (double*)ray_data(lat_vec);
     double* lon = (double*)ray_data(lon_vec);
 
@@ -2429,10 +2429,10 @@ ray_t* exec_astar(ray_graph_t* g, ray_op_t* op,
 ray_t* exec_k_shortest(ray_graph_t* g, ray_op_t* op,
                                ray_t* src_val, ray_t* dst_val) {
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext) return ray_error("nyi", NULL);
+    if (!ext) return ray_error("nyi", "k shortest paths: the plan node has no graph extension");
 
     ray_rel_t* rel = (ray_rel_t*)ext->graph.rel;
-    if (!rel || !rel->fwd.props) return ray_error("schema", NULL);
+    if (!rel || !rel->fwd.props) return ray_error("schema", "k shortest paths: the graph has no edge properties; build it with a weight column");
 
     int64_t n = rel->fwd.n_nodes;
     int64_t m = rel->fwd.n_edges;
@@ -2446,7 +2446,7 @@ ray_t* exec_k_shortest(ray_graph_t* g, ray_op_t* op,
     int64_t weight_sym = ext->graph.weight_col_sym;
     ray_t* weight_vec = ray_table_col(rel->fwd.props, weight_sym);
     if (weight_vec && RAY_IS_ERR(weight_vec)) return weight_vec;
-    if (!weight_vec) return ray_error("schema", NULL);
+    if (!weight_vec) return ray_error("schema", "k shortest paths: the edge properties have no weight column");
     double* weights_k = (double*)ray_data(weight_vec);
 
     int64_t* fwd_off = (int64_t*)ray_data(rel->fwd.offsets);
