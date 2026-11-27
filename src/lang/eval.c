@@ -6557,6 +6557,26 @@ op_scope_begin: {
      * OP_CALLD that follows can resolve them via the tree walker. */
     bool eval_window = code[ip - 1] == OP_SCOPE_EVAL;
     ray_t *syms = POP();
+    /* A lazy handle is single-use, so every other way of reaching a local
+     * forces it (op_loadenv, op_loadenvg, a closure's capture, the tree
+     * walker's lambda call).  The frame's slots are bound as they are, and a
+     * lazy-aware call inside the window (count, first, distinct, ...) appends
+     * to the handle in place and then consumes it: the slot would be left
+     * holding a dead handle, and the next read of that local, in the window or
+     * after it, fails with "lazy handle already materialized" (#1860).  Force
+     * the lazy locals into their slots first, as op_loadenv does for one. */
+    for (int64_t i = 0; i < syms->len; i++) {
+        ray_t *lv = LOCAL(i);
+        if (((const int64_t*)ray_data(syms))[i] < 0 || !lv || !ray_is_lazy(lv)) continue;
+        lv = ray_lazy_materialize(lv);   /* consumes the slot's ref */
+        if (!lv || RAY_IS_ERR(lv)) {
+            vm_err_obj = lv ? lv : ray_error("type", NULL);
+            LOCAL(i) = NULL;             /* ref already consumed */
+            ray_release(syms);
+            goto vm_error;
+        }
+        LOCAL(i) = lv;
+    }
     /* The locals' row provenance travels with the bindings, so the tree
      * walker inside the window sees it as it sees any local's. */
     ray_err_t err = ray_env_scope_bind((const int64_t*)ray_data(syms),

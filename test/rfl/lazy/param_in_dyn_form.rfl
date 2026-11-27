@@ -1,0 +1,33 @@
+;; A lazy parameter (the result of distinct) read first inside a form the compiler hands to
+;; the tree walker -- and, or, or an if whose condition holds one -- survives its next read.
+;; The frame's slots are bound into the walker's scope as they are, and a lazy-aware call
+;; there appends to the shared handle in place and consumes it, so the slot used to be left
+;; holding a dead handle: "lazy handle already materialized" (#1860).
+(set _lpa (fn [v] (do (and true (> (count v) 0)) (count v))))
+(_lpa (distinct [1 2 1])) -- 2
+
+(set _lpo (fn [v] (do (or false (count v)) (sum v))))
+(_lpo (distinct [1 2 1])) -- 3
+
+;; The same local read twice inside one form.
+(set _lpt (fn [v] (and (> (count v) 0) (> (count v) 1))))
+(_lpt (distinct [1 2 1])) -- true
+
+;; An if whose condition holds an and.
+(set _lpi (fn [v] (do (if (and true (> (count v) 0)) 1 2) (count v))))
+(_lpi (distinct [1 2 1])) -- 2
+
+;; A first read that is not count.
+(set _lpf (fn [v] (do (and true (> (first v) 0)) (count v))))
+(_lpf (distinct [1 2 1])) -- 2
+
+;; Two parameters, both lazy.
+(set _lp2 (fn [a b] (do (and true (> (count a) 0) (> (count b) 0)) (+ (count a) (count b)))))
+(_lp2 (distinct [1 2 1]) (distinct [3 3 4 5])) -- 5
+
+;; Unchanged: a plain read first, a single use, and a value bound by let.
+(set _lpk (fn [v] (do (count v) (and true (> (count v) 0)) (count v))))
+(_lpk (distinct [1 2 1])) -- 2
+((fn [v] (and true (count v))) (distinct [1 2 1])) -- true
+(set _lpl (distinct [1 2 1]))
+(_lpa _lpl) -- 2
