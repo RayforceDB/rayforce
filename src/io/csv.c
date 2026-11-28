@@ -72,6 +72,11 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #endif
+#if defined(__GNUC__) && defined(__AVX2__)
+#include <immintrin.h>
+#elif defined(__GNUC__) && defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 /* --------------------------------------------------------------------------
  * Constants
@@ -850,6 +855,108 @@ RAY_INLINE void fast_guid(const char* p, size_t len, uint8_t* dst, bool* is_null
 #define CSV_SCAN_CHUNKS(pool)   ((int64_t)ray_pool_total_workers(pool) * 4)
 #endif
 
+/* Line ends (#1891).  A row, the header included, ends at LF, CRLF, a lone
+ * CR, or LFCR, read greedily left to right (csv_eol_len), with quotes in
+ * the file or without.  The fast scan (no quotes) finds the
+ * next LF or CR and the byte-at-a-time scan (quotes) walks to it; both take
+ * the line end there by csv_eol_len, so they split a file the same way. */
+
+#if defined(_MSC_VER)
+#define CSV_NOINLINE __declspec(noinline)
+#else
+#define CSV_NOINLINE __attribute__((noinline))
+#endif
+
+/* The length of the line end at p (1 or 2); p is at an LF or a CR.  Line
+ * ends are read greedily left to right: a CRLF or an LFCR whenever the byte
+ * at p starts one, else the one byte (#1895), so "\n\r\n\r" is two. */
+RAY_INLINE size_t csv_eol_len(const char* p, const char* end) {
+    return (p + 1 < end && (p[1] == '\n' || p[1] == '\r') && p[1] != p[0]) ? 2 : 1;
+}
+
+/* Past one line end at p, if p is at one. */
+RAY_INLINE const char* csv_skip_eol(const char* p, const char* end) {
+    return (p < end && (*p == '\n' || *p == '\r')) ? p + csv_eol_len(p, end) : p;
+}
+
+/* The first LF or CR in [p, end), or NULL: the fast scan's search, one
+ * pass for both bytes.  With AVX2 it reads aligned 32-byte blocks, as the
+ * C library's memchr does: an aligned block never crosses a page, so the
+ * bytes of the first block before p and of the last one past end are
+ * mapped and are masked off.  [p, end) must lie in the file mapping every
+ * caller scans (ray_vm_map_fd_ro: page-aligned, whole pages). */
+RAY_INLINE const char* csv_find_eol(const char* p, const char* end) {
+    if (p >= end) return NULL;
+#if defined(__GNUC__) && defined(__AVX2__)
+    const __m256i lf = _mm256_set1_epi8('\n'), cr = _mm256_set1_epi8('\r');
+#define CSV_EOL_MASK(q) ((unsigned)_mm256_movemask_epi8(_mm256_or_si256( \
+        _mm256_cmpeq_epi8(_mm256_load_si256((const __m256i*)(const void*)(q)), lf), \
+        _mm256_cmpeq_epi8(_mm256_load_si256((const __m256i*)(const void*)(q)), cr))))
+    const char* blk = (const char*)((uintptr_t)p & ~(uintptr_t)31);
+    unsigned m = CSV_EOL_MASK(blk) >> (unsigned)(p - blk);
+    if (m) { const char* r = p + __builtin_ctz(m); return r < end ? r : NULL; }
+    for (blk += 32; blk < end; blk += 32) {
+        m = CSV_EOL_MASK(blk);
+        if (m) { const char* r = blk + __builtin_ctz(m); return r < end ? r : NULL; }
+    }
+    return NULL;
+#undef CSV_EOL_MASK
+#else
+#if defined(__GNUC__) && defined(__SSE2__)
+    const __m128i lf = _mm_set1_epi8('\n'), cr = _mm_set1_epi8('\r');
+    while (end - p >= 16) {
+        __m128i x = _mm_loadu_si128((const __m128i*)(const void*)p);
+        unsigned m = (unsigned)_mm_movemask_epi8(
+            _mm_or_si128(_mm_cmpeq_epi8(x, lf), _mm_cmpeq_epi8(x, cr)));
+        if (m) return p + __builtin_ctz(m);
+        p += 16;
+    }
+#endif
+    for (; p < end; p++)
+        if (*p == '\n' || *p == '\r') return p;
+    return NULL;
+#endif
+}
+
+/* The first LF, CR or quote in [p, end), or NULL: csv_find_eol with the
+ * quote as a third byte, for the quoted scan outside a quoted cell; the
+ * same aligned blocks and the same mapping precondition. */
+RAY_INLINE const char* csv_find_qeol(const char* p, const char* end) {
+    if (p >= end) return NULL;
+#if defined(__GNUC__) && defined(__AVX2__)
+    const __m256i lf = _mm256_set1_epi8('\n'), cr = _mm256_set1_epi8('\r'),
+                  qt = _mm256_set1_epi8('"');
+#define CSV_EOL_MASK(q) ((unsigned)_mm256_movemask_epi8(_mm256_or_si256(_mm256_or_si256( \
+        _mm256_cmpeq_epi8(_mm256_load_si256((const __m256i*)(const void*)(q)), lf), \
+        _mm256_cmpeq_epi8(_mm256_load_si256((const __m256i*)(const void*)(q)), cr)), \
+        _mm256_cmpeq_epi8(_mm256_load_si256((const __m256i*)(const void*)(q)), qt))))
+    const char* blk = (const char*)((uintptr_t)p & ~(uintptr_t)31);
+    unsigned m = CSV_EOL_MASK(blk) >> (unsigned)(p - blk);
+    if (m) { const char* r = p + __builtin_ctz(m); return r < end ? r : NULL; }
+    for (blk += 32; blk < end; blk += 32) {
+        m = CSV_EOL_MASK(blk);
+        if (m) { const char* r = blk + __builtin_ctz(m); return r < end ? r : NULL; }
+    }
+    return NULL;
+#undef CSV_EOL_MASK
+#else
+#if defined(__GNUC__) && defined(__SSE2__)
+    const __m128i lf = _mm_set1_epi8('\n'), cr = _mm_set1_epi8('\r'), qt = _mm_set1_epi8('"');
+    while (end - p >= 16) {
+        __m128i x = _mm_loadu_si128((const __m128i*)(const void*)p);
+        unsigned m = (unsigned)_mm_movemask_epi8(
+            _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(x, lf), _mm_cmpeq_epi8(x, cr)),
+                         _mm_cmpeq_epi8(x, qt)));
+        if (m) return p + __builtin_ctz(m);
+        p += 16;
+    }
+#endif
+    for (; p < end; p++)
+        if (*p == '\n' || *p == '\r' || *p == '"') return p;
+    return NULL;
+#endif
+}
+
 typedef struct {
     const char*  buf;
     size_t       file_size;
@@ -886,6 +993,72 @@ static void csv_scan_count_fn(void* arg, uint32_t worker_id,
     }
 }
 
+/* Pass 2 over one chunk [p, cend) of a file without quotes: the row starts
+ * into out, their count returned.  Mirrors the serial fast path exactly:
+ * the next LF or CR ends the line, csv_eol_len deciding how long the line
+ * end is.  Out of line, as is the quoted one below, so that neither loop is
+ * compiled around the other's code. */
+CSV_NOINLINE static int64_t csv_scan_chunk_fast(const char* buf, const char* end,
+                                                const char* p, const char* cend,
+                                                int64_t* out) {
+    int64_t n = 0;
+    size_t checked = 0;
+    while (p < cend) {
+        if (RAY_UNLIKELY((++checked & 0xFFFF) == 0 && ray_interrupted())) break;
+        const char* nl = csv_find_eol(p, cend);
+        if (!nl) break;
+        p = nl + csv_eol_len(nl, end);
+        if (p >= end) break;
+        out[n++] = (int64_t)(p - buf);
+    }
+    return n;
+}
+
+/* The same for a file with quotes.  Mirrors the serial slow path exactly:
+ * quote parity gates the terminators, '\r' alone ends a row, "\r\n" and
+ * "\n\r" end exactly one (csv_eol_len).
+ *
+ * Two shortcuts, provably equivalent.  INSIDE a quoted field the serial
+ * loop's only reachable action is "p++" until it meets the closing '"' (the
+ * newline arm is gated on !in_quote), so memchr jumps straight to that
+ * quote.  OUTSIDE one its only actions besides "p++" are at a quote or a
+ * line end, so csv_find_qeol jumps to the next of those: the scan never
+ * walks bytes one at a time.  (#1895: as a byte loop, the quoted scan's
+ * speed hung on how a compiler laid it out -- one build ran it 37% slower
+ * than dev's identical loop.) */
+CSV_NOINLINE static int64_t csv_scan_chunk_quoted(const char* buf, const char* end,
+                                                  const char* p, const char* cend,
+                                                  int64_t* out, bool in_quote) {
+    int64_t n = 0;
+    size_t checked = 0;
+    if (in_quote) {
+        const char* q = (const char*)memchr(p, '"', (size_t)(cend - p));
+        if (!q) return 0;
+        p = q + 1;
+    }
+    while (p < cend) {
+        if (RAY_UNLIKELY((++checked & 0xFFF) == 0 && ray_interrupted())) break;
+        /* outside a quoted cell only a quote and a line end matter: find
+         * the next of them, as the byte-at-a-time walk would reach it */
+        const char* e = csv_find_qeol(p, cend);
+        if (!e) break;
+        if (*e == '"') {
+            /* Bounding the search at cend is defensive, not required: the
+             * `p < cend` guard already stops the loop after an overshoot,
+             * so searching to the file end would find the same offsets.
+             * Bounded because a chunk has no business reading past its own
+             * slice. */
+            const char* q = (const char*)memchr(e + 1, '"', (size_t)(cend - e - 1));
+            if (!q) break;
+            p = q + 1;
+            continue;
+        }
+        p = e + csv_eol_len(e, end);
+        if (p < end) out[n++] = (int64_t)(p - buf);
+    }
+    return n;
+}
+
 static void csv_scan_rows_fn(void* arg, uint32_t worker_id,
                              int64_t start, int64_t end_i) {
     (void)worker_id;
@@ -897,78 +1070,34 @@ static void csv_scan_rows_fn(void* arg, uint32_t worker_id,
         const char* p    = buf + ctx->bound[i];
         const char* cend = buf + ctx->bound[i + 1];
         int64_t* out = ctx->offs + ctx->slot[i];
-        int64_t  n   = 0;
-
-        if (RAY_LIKELY(!ctx->has_quotes)) {
-            /* Mirrors the serial fast path exactly: only '\n' terminates a
-             * row, and an optional '\r' immediately after it is absorbed. */
-            size_t checked = 0;
-            while (p < cend) {
-                if (RAY_UNLIKELY((++checked & 0xFFFF) == 0 && ray_interrupted())) break;
-                const char* nl = (const char*)memchr(p, '\n', (size_t)(cend - p));
-                if (!nl) break;
-                p = nl + 1;
-                if (p < end && *p == '\r') p++;
-                if (p >= end) break;
-                out[n++] = (int64_t)(p - buf);
-            }
-        } else {
-            /* Mirrors the serial slow path exactly: quote parity gates the
-             * terminators, '\r' alone ends a row, "\r\n" ends exactly one.
-             *
-             * One shortcut, provably equivalent: INSIDE a quoted field the
-             * serial loop's only reachable action is "p++" until it meets the
-             * closing '"' (the newline arm is gated on !in_quote), so memchr
-             * can jump straight to that quote.  Worth doing because a quoted
-             * field is where the byte-at-a-time loop spends its time — long
-             * URL/title columns are exactly the quoted ones. */
-            bool in_quote = ctx->start_quoted[i] != 0;
-            size_t checked = 0;
-            while (p < cend) {
-                if (in_quote) {
-                    if (RAY_UNLIKELY((++checked & 0xFFF) == 0 && ray_interrupted())) break;
-                    /* Bounding the search at cend is defensive, not required:
-                     * the `p < cend` guard above already stops the loop after
-                     * an overshoot, so searching to the file end would find
-                     * the same offsets (it would just do the next chunk's
-                     * work).  Bounded because a chunk has no business reading
-                     * past its own slice. */
-                    const char* q = (const char*)memchr(p, '"', (size_t)(cend - p));
-                    if (!q) { p = cend; break; }
-                    p = q + 1;
-                    in_quote = false;
-                    continue;
-                }
-                /* Outside a quoted field (in_quote is false for the rest of
-                 * this iteration by construction). */
-                if (RAY_UNLIKELY((++checked & 0xFFFF) == 0 && ray_interrupted())) break;
-                char c = *p;
-                if (c == '"') {
-                    in_quote = true;
-                    p++;
-                } else if (c == '\n' || c == '\r') {
-                    if (c == '\r' && p + 1 < end && *(p + 1) == '\n') p++;
-                    p++;
-                    if (p < end) out[n++] = (int64_t)(p - buf);
-                } else {
-                    p++;
-                }
-            }
-        }
-        ctx->n_out[i] = n;
+        ctx->n_out[i] = RAY_LIKELY(!ctx->has_quotes)
+            ? csv_scan_chunk_fast(buf, end, p, cend, out)
+            : csv_scan_chunk_quoted(buf, end, p, cend, out, ctx->start_quoted[i] != 0);
     }
 }
 
-/* Nudge a chunk boundary right so a two-byte line terminator is never split.
+/* Nudge a chunk boundary s right, by at most one byte, so that it falls
+ * where a line end starts, as the serial scan reads the file: a two-byte
+ * line end is never split.  lo is the boundary before, already resolved.
  * Quoted or not, the left chunk's state machine consumes both bytes of the
  * pair, so the byte after it must belong to the left chunk as well. */
 static size_t csv_scan_split_at(const char* buf, size_t file_size, size_t s,
-                                bool has_quotes) {
-    if (s == 0 || s >= file_size) return s;
-    char prev = buf[s - 1], cur = buf[s];
-    if (has_quotes) { if (prev == '\r' && cur == '\n') s++; }
-    else            { if (prev == '\n' && cur == '\r') s++; }
-    return s;
+                                size_t lo) {
+    if (s <= lo || s >= file_size) return s;
+#define CSV_IS_EOL(c) ((c) == '\n' || (c) == '\r')
+    if (!CSV_IS_EOL(buf[s - 1]) || !CSV_IS_EOL(buf[s])) return s;
+    /* Inside a run of line-end bytes (#1895).  Read greedily, a run starts
+     * a line end at its first byte, and at every k where buf[k-1] ==
+     * buf[k] (the byte before ends a line end, a single or the second of a
+     * pair); between such points the bytes alternate and pair up.  So the
+     * nearest such point at or before s -- or lo, the boundary before this
+     * one, which starts a line end too -- fixes s by parity.  The walk
+     * never passes lo, so the boundaries' walks are disjoint: at most one
+     * read of each byte over all of them, and none in an LF or CR run. */
+    size_t k = s;
+    while (k > lo && CSV_IS_EOL(buf[k - 1]) && buf[k - 1] != buf[k]) k--;
+#undef CSV_IS_EOL
+    return ((s - k) & 1) ? s + 1 : s;
 }
 
 /* Returns the row count (>=0), -1 if interrupted, or -2 when the parallel
@@ -1056,9 +1185,8 @@ static int64_t build_row_offsets_par(const char* buf, size_t buf_size,
      * byte skipped is always '\n' or '\r', never '"', so the parities
      * computed above stay exact. */
     for (int64_t i = 1; i < n_chunks; i++) {
-        size_t s = csv_scan_split_at(buf, buf_size, bound[i], ctx.has_quotes);
-        if (s < bound[i - 1]) s = bound[i - 1];
-        bound[i] = s;
+        size_t s = bound[i] < bound[i - 1] ? bound[i - 1] : bound[i];
+        bound[i] = csv_scan_split_at(buf, buf_size, s, bound[i - 1]);
     }
 
     /* Slice sizing: a chunk emits at most one row start per line-terminator
@@ -1141,9 +1269,9 @@ static int64_t build_row_offsets_serial(const char* buf, size_t buf_size,
     bool has_quotes = (memchr(p, '"', remaining) != NULL);
 
     if (RAY_LIKELY(!has_quotes)) {
-        /* Fast path: no quotes, use memchr for newlines.
-         * Only scans for \n; pure \r line endings (old Mac) treated as single row.
-         * Empty lines are preserved as rows (for NULL handling). */
+        /* Fast path: no quotes; the next LF or CR ends the line, with the
+         * line end csv_eol_len reads there.  Empty lines are preserved as
+         * rows (for NULL handling). */
         for (;;) {
             if (RAY_UNLIKELY((n & 0xFFFF) == 0)) {
                 if (ray_interrupted()) {
@@ -1156,11 +1284,9 @@ static int64_t build_row_offsets_serial(const char* buf, size_t buf_size,
                     (uint64_t)((double)prog_len * (double)(size_t)(p - buf - (ptrdiff_t)data_offset)
                                / (double)remaining));
             }
-            const char* nl = (const char*)memchr(p, '\n', (size_t)(end - p));
+            const char* nl = csv_find_eol(p, end);
             if (!nl) break;
-            p = nl + 1;
-            /* Skip optional \r after \n (unusual \n\r endings) */
-            if (p < end && *p == '\r') p++;
+            p = nl + csv_eol_len(nl, end);
             if (p >= end) break;
 
             if (n >= est) {
@@ -1173,8 +1299,10 @@ static int64_t build_row_offsets_serial(const char* buf, size_t buf_size,
             offs[n++] = (int64_t)(p - buf);
         }
     } else {
-        /* Slow path: track quote parity, byte-by-byte.
-         * Empty lines preserved as rows (for NULL handling). */
+        /* Slow path: track quote parity.  Inside a quoted cell memchr jumps
+         * to its closing quote, outside one csv_find_qeol to the next quote
+         * or line end (as csv_scan_chunk_quoted does).  Empty lines
+         * preserved as rows (for NULL handling). */
         bool in_quote = false;
         size_t checked = 0;
         while (p < end) {
@@ -1190,25 +1318,30 @@ static int64_t build_row_offsets_serial(const char* buf, size_t buf_size,
                     (uint64_t)((double)prog_len * (double)(size_t)(p - buf - (ptrdiff_t)data_offset)
                                / (double)remaining));
             }
-            char c = *p;
-            if (c == '"') {
-                in_quote = !in_quote;
-                p++;
-            } else if (!in_quote && (c == '\n' || c == '\r')) {
-                if (c == '\r' && p + 1 < end && *(p + 1) == '\n') p++;
-                p++;
-                if (p < end) {
-                    if (n >= est) {
-                        est *= 2;
-                        offs = (int64_t*)scratch_realloc(&hdr,
-                            (size_t)n * sizeof(int64_t),
-                            (size_t)est * sizeof(int64_t));
-                        if (!offs) { scratch_free(hdr); *offsets_out = NULL; *hdr_out = NULL; return 0; }
-                    }
-                    offs[n++] = (int64_t)(p - buf);
+            if (in_quote) {
+                const char* q = (const char*)memchr(p, '"', (size_t)(end - p));
+                if (!q) { p = end; break; }
+                p = q + 1;
+                in_quote = false;
+                continue;
+            }
+            const char* e = csv_find_qeol(p, end);
+            if (!e) { p = end; break; }
+            if (*e == '"') {
+                p = e + 1;
+                in_quote = true;
+                continue;
+            }
+            p = e + csv_eol_len(e, end);
+            if (p < end) {
+                if (n >= est) {
+                    est *= 2;
+                    offs = (int64_t*)scratch_realloc(&hdr,
+                        (size_t)n * sizeof(int64_t),
+                        (size_t)est * sizeof(int64_t));
+                    if (!offs) { scratch_free(hdr); *offsets_out = NULL; *hdr_out = NULL; return 0; }
                 }
-            } else {
-                p++;
+                offs[n++] = (int64_t)(p - buf);
             }
         }
     }
@@ -1318,13 +1451,12 @@ static int64_t build_row_offsets_limited(const char* buf, size_t buf_size,
                 scratch_free(hdr);
                 return -1;
             }
-            const char* nl = (const char*)memchr(p, '\n', (size_t)(end - p));
+            const char* nl = csv_find_eol(p, end);
             if (!nl) {
                 p = end;
                 break;
             }
-            p = nl + 1;
-            if (p < end && *p == '\r') p++;
+            p = nl + csv_eol_len(nl, end);
             if (p >= end) break;
             if (n >= max_rows) break;
             if (n >= est) {
@@ -1352,31 +1484,38 @@ static int64_t build_row_offsets_limited(const char* buf, size_t buf_size,
                     return -1;
                 }
             }
-            char c = *p;
-            if (c == '"') {
-                in_quote = !in_quote;
-                p++;
-            } else if (!in_quote && (c == '\n' || c == '\r')) {
-                if (c == '\r' && p + 1 < end && *(p + 1) == '\n') p++;
-                p++;
-                if (p >= end) break;
-                if (n >= max_rows) break;
-                if (n >= est) {
-                    int64_t new_est = est * 2;
-                    if (new_est > max_rows) new_est = max_rows;
-                    offs = (int64_t*)scratch_realloc(&hdr,
-                        (size_t)n * sizeof(int64_t),
-                        (size_t)new_est * sizeof(int64_t));
-                    if (!offs) {
-                        scratch_free(hdr);
-                        return 0;
-                    }
-                    est = new_est;
-                }
-                offs[n++] = (int64_t)(p - buf);
-            } else {
-                p++;
+            /* as the serial slow path: jump to the closing quote, or to
+             * the next quote or line end */
+            if (in_quote) {
+                const char* q = (const char*)memchr(p, '"', (size_t)(end - p));
+                if (!q) { p = end; break; }
+                p = q + 1;
+                in_quote = false;
+                continue;
             }
+            const char* e = csv_find_qeol(p, end);
+            if (!e) { p = end; break; }
+            if (*e == '"') {
+                p = e + 1;
+                in_quote = true;
+                continue;
+            }
+            p = e + csv_eol_len(e, end);
+            if (p >= end) break;
+            if (n >= max_rows) break;
+            if (n >= est) {
+                int64_t new_est = est * 2;
+                if (new_est > max_rows) new_est = max_rows;
+                offs = (int64_t*)scratch_realloc(&hdr,
+                    (size_t)n * sizeof(int64_t),
+                    (size_t)new_est * sizeof(int64_t));
+                if (!offs) {
+                    scratch_free(hdr);
+                    return 0;
+                }
+                est = new_est;
+            }
+            offs[n++] = (int64_t)(p - buf);
         }
     }
 
@@ -2243,7 +2382,7 @@ fail:
 
 /* The first bad row a strict parse saw (#1885); row INT64_MAX: none. */
 enum { CSV_BAD_CELLS = 1, CSV_BAD_CELL, CSV_BAD_AFTER_QUOTE, CSV_BAD_UNCLOSED,
-       CSV_BAD_LONE_CR, CSV_BAD_RANGE, CSV_BAD_NULLV, CSV_BAD_PRECISION,
+       CSV_BAD_RANGE, CSV_BAD_NULLV, CSV_BAD_PRECISION,
        CSV_BAD_UNDERFLOW };
 typedef struct {
     int64_t row;
@@ -2283,9 +2422,7 @@ typedef struct {
  * (INT16_MIN in an I16), or turns into an infinity (1e39 in an F32) -- is
  * bad too: a wrapped value is worse than a null.  (Out-of-range I64 and
  * non-finite F64 text already parses to a null.)  An empty cell is a null
- * in both modes.  A file
- * without quotes splits rows at LF only, and a cell ends at CR, so text
- * after a lone CR inside a row is never read: strict refuses it too. */
+ * in both modes. */
 static bool csv_quote_closed(const char* p, const char* buf_end) {
     for (p++; p < buf_end; p++) {
         if (*p != '"') continue;
@@ -2892,16 +3029,11 @@ static void csv_parse_fn_strict(void* arg, uint32_t worker_id,
                  bad_kind == CSV_BAD_NULLV || bad_kind == CSV_BAD_PRECISION ||
                  bad_kind == CSV_BAD_UNDERFLOW) &&
                 cells != n_cols) bad_kind = 0;
-            if (!bad_kind && cells == n_cols) {
-                const char* q = p;
-                while (q < row_end && (*q == '\r' || *q == '\n')) q++;
-                if (q < row_end) bad_kind = CSV_BAD_LONE_CR;
-            }
             csv_bad_t* bad = &ctx->worker_bad[worker_id];
             if ((bad_kind || cells != n_cols) && row < bad->row) {
                 bad->row  = row;
                 bad->kind = bad_kind ? bad_kind : (uint8_t)CSV_BAD_CELLS;
-                bad->col  = (bad_kind && bad_kind != CSV_BAD_LONE_CR) ? bad_col : -1;
+                bad->col  = bad_kind ? bad_col : -1;
             }
         }
     }
@@ -2913,11 +3045,6 @@ static void csv_parse_fn_strict(void* arg, uint32_t worker_id,
 
 /* Not inlined into its one caller, csv_parse_all: inlined there it ran more
  * instructions per row than it does on its own. */
-#if defined(_MSC_VER)
-#define CSV_NOINLINE __declspec(noinline)
-#else
-#define CSV_NOINLINE __attribute__((noinline))
-#endif
 CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                               const int64_t* row_offsets, int64_t n_rows,
                               int n_cols, char delim,
@@ -3207,20 +3334,19 @@ static size_t csv_show(const char* p, size_t len, bool more, char* out, size_t c
     return o;
 }
 
-/* The file's line `at` starts on, 1-based: a line ends at LF, CRLF (or
- * LFCR) or a lone CR, as a row can. */
+/* The file's line `at` starts on, 1-based: the line ends before it, read
+ * as the row scans read them -- left to right, csv_eol_len deciding each
+ * one's length -- so a run such as CRLF then a lone CR is two (#1895).
+ * Newlines inside quoted cells count too: the line is the one an editor
+ * shows.  Error path only. */
 static int64_t csv_line_of(const char* buf, const char* buf_end, const char* at) {
     int64_t line = 1;
-    for (const char* q = buf; q < at; ) {
-        q = memchr(q, '\n', (size_t)(at - q));
-        if (!q) break;
-        line++; q++;
-    }
-    for (const char* q = buf; q < at; ) {
-        q = memchr(q, '\r', (size_t)(at - q));
-        if (!q) break;
-        if ((q + 1 >= buf_end || q[1] != '\n') && (q == buf || q[-1] != '\n')) line++;
-        q++;
+    const char* p = buf;
+    while (p < at) {
+        const char* e = csv_find_eol(p, at);
+        if (!e) break;
+        line++;
+        p = e + csv_eol_len(e, buf_end);
     }
     return line;
 }
@@ -3329,10 +3455,6 @@ static ray_t* csv_strict_error(const ray_csv_opts_t* opts, const char* path,
     case CSV_BAD_CELLS:
         snprintf(post, sizeof post, ": expected %d cell%s, got %d", ncols, ncols == 1 ? "" : "s", cells);
         return csv_strict_msg(op, path, line, NULL, 0, post, NULL, 0, false, "", rsv);
-    case CSV_BAD_LONE_CR:
-        return csv_strict_msg(op, path, line, NULL, 0,
-                              ": text after a CR inside the row (a row ends at LF or CRLF)",
-                              NULL, 0, false, "", rsv);
     case CSV_BAD_UNCLOSED:
         return csv_strict_msg(op, path, line, name, name_len,
                               ": a quoted cell with no closing quote", NULL, 0, false, "", rsv);
@@ -3799,8 +3921,7 @@ static const char* csv_skip_matching_header(const char* p, const char* buf_end,
         if (dyn) ray_sys_free(dyn);
     }
     if (!is_header) return NULL;
-    if (p < buf_end && *p == '\r') p++;
-    if (p < buf_end && *p == '\n') p++;
+    p = csv_skip_eol(p, buf_end);   /* LF, CRLF, CR or LFCR (#1891) */
     return p;
 }
 
@@ -3879,7 +4000,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
      * was considered but adds complexity for a rare edge case. */
     if (delimiter == 0) {
         int commas = 0, tabs = 0;
-        for (const char* p = text; p < buf_end && *p != '\n'; p++) {
+        for (const char* p = text; p < buf_end && *p != '\n' && *p != '\r'; p++) {
             if (*p == ',') commas++;
             if (*p == '\t') tabs++;
         }
@@ -3941,8 +4062,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
         /* Consume exactly one line terminator (\r, \n, or \r\n) after the
          * header row — NOT a run of newlines, because subsequent empty
          * lines are null data rows. */
-        if (p < buf_end && *p == '\r') p++;
-        if (p < buf_end && *p == '\n') p++;
+        p = csv_skip_eol(p, buf_end);   /* LF, CRLF, CR or LFCR (#1891) */
     } else if (col_names_in) {
         for (int c = 0; c < ncols; c++)
             col_name_ids[c] = col_names_in[c];
@@ -4445,7 +4565,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
 
     if (delimiter == 0) {
         int commas = 0, tabs = 0;
-        for (const char* q = text; q < buf_end && *q != '\n'; q++) {
+        for (const char* q = text; q < buf_end && *q != '\n' && *q != '\r'; q++) {
             if (*q == ',') commas++;
             if (*q == '\t') tabs++;
         }
@@ -4495,8 +4615,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
             col_name_ids[c] = ray_sym_intern(fld, flen);
             if (dyn_esc) ray_sys_free(dyn_esc);
         }
-        if (p < buf_end && *p == '\r') p++;
-        if (p < buf_end && *p == '\n') p++;
+        p = csv_skip_eol(p, buf_end);   /* LF, CRLF, CR or LFCR (#1891) */
     } else if (col_names_in) {
         for (int c = 0; c < ncols; c++)
             col_name_ids[c] = col_names_in[c];
@@ -4897,7 +5016,7 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
 
     if (delimiter == 0) {
         int commas = 0, tabs = 0;
-        for (const char* q = text; q < buf_end && *q != '\n'; q++) {
+        for (const char* q = text; q < buf_end && *q != '\n' && *q != '\r'; q++) {
             if (*q == ',') commas++;
             if (*q == '\t') tabs++;
         }
@@ -4947,8 +5066,7 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
             col_name_ids[c] = ray_sym_intern(fld, flen);
             if (dyn_esc) ray_sys_free(dyn_esc);
         }
-        if (p < buf_end && *p == '\r') p++;
-        if (p < buf_end && *p == '\n') p++;
+        p = csv_skip_eol(p, buf_end);   /* LF, CRLF, CR or LFCR (#1891) */
     } else if (col_names_in) {
         for (int c = 0; c < ncols; c++)
             col_name_ids[c] = col_names_in[c];

@@ -25,6 +25,8 @@ Signatures:
 
 Returns: a `table`. Empty fields use the selected type's missing-input behavior. Sentinel-nullable columns record nulls with `RAY_ATTR_HAS_NULLS`; `SYM`/`STR` fields collapse to ordinary empty values and those columns do not acquire `RAY_ATTR_HAS_NULLS` from them.
 
+A row, and the header, ends at a line end, with quotes in the file or without: line ends are read greedily from left to right, a CRLF or an LFCR whenever the byte at the position starts one, else the single LF or CR (so `\n\r\n\r` is two line ends); inside a quoted cell these bytes are part of the text. `.csv.write` ends rows with LF and quotes every cell that holds a CR or an LF, so what it writes reads back cell for cell. Files that read differently before this rule: a file without quotes in which a CR stands alone under that reading (rows were split at LF only, and the text after such a CR in a line was dropped), a file with quotes that holds an LFCR (each read as two line ends, an empty row after each), a file whose header ends in LFCR (its first data row read as nulls), and a file whose header ends in a CR (its delimiter was guessed from the header and the data after it).
+
 A UTF-8 byte-order mark (the bytes `EF BB BF`, as spreadsheet exports write) at the start of the file is skipped: it is part of neither the first column name nor, in a file without a header, the first cell. `.csv.splayed` and `.csv.parted` skip it too.
 
 Errors: `type` (bad arg), `domain` (path is null / too long, zero columns, or a bad options dict), `io` (open/read failure), `limit` (>256 columns), `parse` (a bad row under `{strict: true}`).
@@ -65,7 +67,6 @@ The rule: a non-empty cell must be stored as the value its text says. A strict l
 - the text spells the type's null: `"-32768" reads as a null I16`. These are the values each type keeps as its null sentinel: the minimum of `I16`, `I32`, `I64`, `TIME` (`-596:31:23.648`) and `TIMESTAMP` (`1707-09-22T00:12:43.145224192`), the all-zero `GUID`, and `0Nn` for a `TIMESPAN`;
 - a time has more fraction digits than its type holds and they are not zeros: `"10:00:00.1234" has more fraction digits than a TIME holds` (`TIME` keeps milliseconds, `TIMESPAN` and `TIMESTAMP` nanoseconds);
 - a quoted cell has text after its closing quote (`"ab"cd`) or no closing quote. The header's quoted cells are held to the same: `line 1: header cell 1: text after the closing quote`;
-- in a file without quotes, where rows end at LF (or CRLF), text follows a lone CR inside the row: the default never reads it.
 
 Without a schema the types checked are the inferred ones: a column inferred from the sample as `I64` refuses a later cell of text, so give a schema when the sample may not show every kind of value. An empty cell (`,,` or `""`) is a null in both modes. A final line without a newline is an ordinary row. The line is the file's: the header is line 1 when there is one, and newlines inside quoted cells count, so the line is the one an editor shows the row starting on. When several rows are bad the error names the first in the file, whatever the parallel split.
 

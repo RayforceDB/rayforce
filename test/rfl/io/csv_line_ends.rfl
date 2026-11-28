@@ -1,0 +1,80 @@
+;; @requires: posix  (fixtures are written through a POSIX shell via .sys.exec)
+;; Line ends (#1891): a row, and the header, ends at LF, CRLF, a lone CR or
+;; LFCR, in any mix, with quotes in the file or without; inside a quoted cell
+;; they are text.  A file without quotes used to split at LF only, so a
+;; CR-only file read as one row, and the header reader took CRLF but not
+;; LFCR, so the first row after an LFCR header read as empty.
+;; Fixtures use the rf_test_csvle_ prefix (the Makefile removes rf_test_*.csv).
+
+(.sys.exec "rm -rf rf_test_csvle_* rf_test_csvle_sp rf_test_csvle_pt") -- 0
+
+;; ── CR line ends read the same with quotes in the file and without ─────────
+(.sys.exec "printf 'a,b\\r1,2\\r3,4\\r' > rf_test_csvle_cr.csv; printf 'a,b\\r1,\"2\"\\r3,4\\r' > rf_test_csvle_crq.csv") -- 0
+(set T (.csv.read [I64 I64] "rf_test_csvle_cr.csv"))
+(count T) -- 2
+(at T 'a) -- [1 3]
+(at T 'b) -- [2 4]
+(identical T (.csv.read [I64 I64] "rf_test_csvle_crq.csv")) -- true
+;; inferred types see every row too
+(at (.csv.read "rf_test_csvle_cr.csv") 'b) -- [2 4]
+
+;; ── an LFCR header no longer swallows the first row ────────────────────────
+(.sys.exec "printf 'a,b\\n\\r1,2\\n\\r3,4\\n\\r' > rf_test_csvle_lfcr.csv") -- 0
+(set L (.csv.read [I64 I64] "rf_test_csvle_lfcr.csv"))
+(at L 'a) -- [1 3]
+(at L 'b) -- [2 4]
+(.sys.exec "printf 'a,b\\n\\r1,\"2\"\\n\\r3,4\\n\\r' > rf_test_csvle_lfcrq.csv") -- 0
+(identical L (.csv.read [I64 I64] "rf_test_csvle_lfcrq.csv")) -- true
+
+;; ── every kind of line end in one file ─────────────────────────────────────
+;; LF, CRLF, CR, LFCR, then LF + CRLF (an empty line between)
+(.sys.exec "printf 'a,b\\n1,2\\r\\n3,4\\r5,6\\n\\r7,8\\n\\r\\n9,10\\n' > rf_test_csvle_mix.csv") -- 0
+(set X (.csv.read [I64 I64] "rf_test_csvle_mix.csv"))
+(at X 'a) -- [1 3 5 7 0Nl 9]
+(at X 'b) -- [2 4 6 8 0Nl 10]
+(.sys.exec "printf 'a,b\\n1,2\\r\\n3,4\\r5,6\\n\\r7,8\\n\\r\\n9,\"10\"\\n' > rf_test_csvle_mixq.csv") -- 0
+(identical X (.csv.read [I64 I64] "rf_test_csvle_mixq.csv")) -- true
+;; strict counts each of them as a line
+(.sys.exec "printf 'a,b\\n1,2\\r\\n3,4\\r5,6\\n\\r7,x\\n' > rf_test_csvle_mixbad.csv") -- 0
+(try (.csv.read {strict: true} [I64 I64] "rf_test_csvle_mixbad.csv") (fn [e] (at e 'msg))) -- ".csv.read \"rf_test_csvle_mixbad.csv\": line 5, column b: \"x\" is not an I64"
+
+;; ── inside quotes a CR or an LF is text, whatever the line ends are ────────
+(.sys.exec "printf 'a,b\\r\"x\\ry\",1\\r\"p\\r\\nq\",2\\r\"\\n\\r\",3\\r' > rf_test_csvle_qcr.csv") -- 0
+(set Q (.csv.read [STR I64] "rf_test_csvle_qcr.csv"))
+(at Q 'a) -- (list "x\ry" "p\r\nq" "\n\r")
+(at Q 'b) -- [1 2 3]
+
+;; ── what .csv.write writes reads back cell for cell ────────────────────────
+(set W (table [s n] (list (list "x\ry" "p\r\nq" "\n\r" "plain" "\r") [1 2 3 4 5])))
+(.csv.write W "rf_test_csvle_w.csv")
+(identical (at (.csv.read [STR I64] "rf_test_csvle_w.csv") 's) (at W 's)) -- true
+
+;; ── past the parallel scan's 4 MB, with and without quotes ─────────────────
+(.sys.exec "awk 'BEGIN{printf \"a,b\\r\"; for(i=1;i<=400000;i++) printf \"%d,%d\\r\", i, i%7}' > rf_test_csvle_bigcr.csv") -- 0
+(set B (.csv.read [I64 I64] "rf_test_csvle_bigcr.csv"))
+(count B) -- 400000
+(sum (at B 'a)) -- 80000200000
+(.sys.exec "awk 'BEGIN{printf \"a,b\\n\\r\"; for(i=1;i<=400000;i++) printf \"%d,%d\\n\\r\", i, i%7}' > rf_test_csvle_biglfcr.csv") -- 0
+(set B2 (.csv.read [I64 I64] "rf_test_csvle_biglfcr.csv"))
+(count B2) -- 400000
+(identical (at B 'b) (at B2 'b)) -- true
+(.sys.exec "awk 'BEGIN{printf \"a,b\\r\"; for(i=1;i<=400000;i++) printf \"%d,\\\"%d\\\"\\r\", i, i%7}' > rf_test_csvle_bigcrq.csv") -- 0
+(identical B (.csv.read [I64 I64] "rf_test_csvle_bigcrq.csv")) -- true
+;; LF and CRLF files take the fast scan as before
+(.sys.exec "awk 'BEGIN{printf \"a,b\\r\\n\"; for(i=1;i<=400000;i++) printf \"%d,%d\\r\\n\", i, i%7}' > rf_test_csvle_bigcrlf.csv") -- 0
+(identical B (.csv.read [I64 I64] "rf_test_csvle_bigcrlf.csv")) -- true
+
+;; ── .csv.splayed and .csv.parted split rows the same way ───────────────────
+(set SP (.csv.splayed [I64 I64] "rf_test_csvle_bigcr.csv" "rf_test_csvle_sp"))
+(count SP) -- 400000
+(sum (at SP 'a)) -- 80000200000
+(set PT (.csv.parted [I64 I64] "rf_test_csvle_biglfcr.csv" 150000 "rf_test_csvle_pt" 't))
+(count PT) -- 400000
+(count (.csv.splayed [I64 I64] "rf_test_csvle_mix.csv" "rf_test_csvle_sp")) -- 6
+
+;; ── edges: a header alone, a last line without its CR ──────────────────────
+(.sys.exec "printf 'a,b\\r' > rf_test_csvle_h.csv; printf 'a,b\\r1,2\\r3,4' > rf_test_csvle_nocr.csv") -- 0
+(count (.csv.read [I64 I64] "rf_test_csvle_h.csv")) -- 0
+(at (.csv.read [I64 I64] "rf_test_csvle_nocr.csv") 'b) -- [2 4]
+
+(.sys.exec "rm -rf rf_test_csvle_* rf_test_csvle_sp rf_test_csvle_pt") -- 0

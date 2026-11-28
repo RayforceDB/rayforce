@@ -2569,8 +2569,9 @@ static test_result_t test_csv_strict_matrix(void) {
                             why = ", column v: text after the closing quote"; break;
                     case 7: snprintf(bad, sizeof bad, "%%d,\"%s", tc->good);
                             why = ", column v: a quoted cell with no closing quote"; break;
-                    case 8: snprintf(bad, sizeof bad, "%%d,%s\rjunk", tc->good);
-                            why = ": text after a CR inside the row"; break;
+                    case 8: /* a lone CR ends the row (#1891): "junk" is the next, one cell */
+                            snprintf(bad, sizeof bad, "%%d,%s\rjunk", tc->good);
+                            why = ": expected 2 cells, got 1"; break;
                     case 9: case 10: {
                             const char* u = rule == 9 ? tc->underflow : tc->underflow_neg;
                             if (!u) continue;
@@ -2588,7 +2589,8 @@ static test_result_t test_csv_strict_matrix(void) {
                         ray_t* res = ray_read_csv_ex(path, ',', hdr, types, 2,
                                                      hdr ? NULL : names, hdr ? 0 : 2, &opts);
                         char head[128];
-                        snprintf(head, sizeof head, ".csv.read \"%s\": line %d", path, r + 1 + hdr);
+                        snprintf(head, sizeof head, ".csv.read \"%s\": line %d", path,
+                                 r + 1 + hdr + (rule == 8));
                         const char* msg = res && RAY_IS_ERR(res) ? ray_err_msg(res) : NULL;
                         bool good = msg && strcmp(ray_err_code(res), "parse") == 0 &&
                                     strncmp(msg, head, strlen(head)) == 0 && strstr(msg, want);
@@ -2716,6 +2718,196 @@ static test_result_t test_csv_escaped_alloc_fail(void) {
     PASS();
 }
 
+/* The strict error's line counts line ends as the reader splits rows (#1895
+ * review): every pair and triple of LF, CRLF, CR and LFCR placed back to
+ * back between a valid row and a bad one, in a one-column file where each
+ * empty line is a row, so the bad row's line is the number of rows the
+ * lenient reader finds; with quotes in the file and without. */
+static test_result_t test_csv_strict_line_ends(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    static const char* const ends[4] = { "\n", "\r\n", "\r", "\n\r" };
+    const char* path = TMP_CSV;
+    int64_t name = ray_sym_intern("v", 1);
+    int8_t i64[1] = { RAY_I64 }, str[1] = { RAY_STR };
+    char msg[512];
+    int checked = 0;
+    for (int k = 2; k <= 3; k++) {
+        int combos = k == 2 ? 16 : 64;
+        for (int c = 0; c < combos; c++) {
+            for (int quoted = 0; quoted < 2; quoted++) {
+                char text[64];
+                int o = snprintf(text, sizeof text, "%s", quoted ? "\"1\"" : "1");
+                for (int j = 0, x = c; j < k; j++, x /= 4)
+                    o += snprintf(text + o, sizeof text - (size_t)o, "%s", ends[x % 4]);
+                snprintf(text + o, sizeof text - (size_t)o, "x");
+                FILE* f = fopen(path, "wb");
+                TEST_ASSERT_TRUE(f != NULL);
+                fputs(text, f);
+                fclose(f);
+                ray_t* lenient = ray_read_csv_ex(path, ',', false, str, 1, &name, 1, NULL);
+                TEST_ASSERT_TRUE(lenient && !RAY_IS_ERR(lenient));
+                int64_t rows = ray_table_nrows(lenient);
+                ray_release(lenient);
+                ray_csv_opts_t opts = { .strict = true, .op = ".csv.read" };
+                ray_t* res = ray_read_csv_ex(path, ',', false, i64, 1, &name, 1, &opts);
+                char want[160];
+                snprintf(want, sizeof want, ".csv.read \"%s\": line %lld, column v: \"x\"",
+                         path, (long long)rows);
+                const char* got = res && RAY_IS_ERR(res) ? ray_err_msg(res) : "no error";
+                if (strncmp(got, want, strlen(want)) != 0) {
+                    char shown[128]; size_t so = 0;
+                    for (const char* q = text; *q && so + 4 < sizeof shown; q++)
+                        so += (size_t)snprintf(shown + so, sizeof shown - so, *q == '\n' ? "\\n" : *q == '\r' ? "\\r" : "%c", *q);
+                    snprintf(msg, sizeof msg, "%s: got %s; want %s", shown, got, want);
+                    if (res && RAY_IS_ERR(res)) ray_error_free(res); else if (res) ray_release(res);
+                    FAIL(strdup(msg));
+                }
+                ray_error_free(res);
+                checked++;
+            }
+        }
+    }
+    unlink(path);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    TEST_ASSERT_EQ_I(checked, 160);
+    PASS();
+}
+
+/* Line ends against a reference written from the rule (#1895): "line ends
+ * are read greedily left to right, a CRLF or an LFCR whenever the byte at
+ * the position starts one, else the one byte".  Files of cells (digits,
+ * quoted digits, quoted text holding line ends) between runs of 1 to 4
+ * line-end bytes, every such run among them; read as one STR column, rows
+ * and cells must be the reference's, and a malformed last row must be
+ * reported at the reference's line.  Small files take the serial scan,
+ * larger ones the parallel one, whose 64-byte test chunks then split runs. */
+static size_t le_ref_len(const char* t, size_t i, size_t n) {
+    return (i + 1 < n && (t[i + 1] == '\n' || t[i + 1] == '\r') && t[i + 1] != t[i]) ? 2 : 1;
+}
+
+static uint32_t le_rand(uint32_t* s) { *s = *s * 1664525u + 1013904223u; return *s >> 8; }
+
+static test_result_t test_csv_line_end_reference(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    const char* path = TMP_CSV;
+    int64_t name = ray_sym_intern("v", 1);
+    int8_t str[1] = { RAY_STR };
+    size_t cap = 1 << 20;
+    char* t = (char*)malloc(cap);
+    size_t* rs = (size_t*)malloc(sizeof(size_t) * 200000);
+    size_t* re = (size_t*)malloc(sizeof(size_t) * 200000);
+    char msg[512];
+    TEST_ASSERT_TRUE(t && rs && re);
+    int checked = 0;
+    /* big 0: serial; 1: parallel; 2: parallel with long runs (up to 3000
+     * bytes, alternating, of one byte, or random), so that several chunk
+     * boundaries fall inside one run */
+    for (int big = 0; big < 3; big++) {
+        for (int seed = 1; seed <= 20; seed++) {
+            for (int strict = 0; strict < 2; strict++) {
+                uint32_t st = (uint32_t)(seed * 7919 + big * 104729 + strict);
+                int rows = big == 2 ? 120 : big ? 3000 : 60;
+                size_t n = 0;
+                for (int r = 0; r < rows; r++) {
+                    uint32_t k = le_rand(&st) % 6;
+                    if (k < 3) n += (size_t)snprintf(t + n, cap - n, "%u", le_rand(&st) % 100000);
+                    else if (k < 5) n += (size_t)snprintf(t + n, cap - n, "\"%u\"", le_rand(&st) % 1000);
+                    else {                       /* quoted text with line ends in it */
+                        t[n++] = '"'; t[n++] = 'q';
+                        for (uint32_t j = 1 + le_rand(&st) % 4; j > 0; j--) t[n++] = (le_rand(&st) & 1) ? '\n' : '\r';
+                        t[n++] = 'q'; t[n++] = '"';
+                    }
+                    /* the run after the cell: each of the 30 runs of 1-4 bytes
+                     * in turn, then random ones */
+                    if (big == 2 && le_rand(&st) % 3 == 0) {
+                        uint32_t len = 1 + le_rand(&st) % 3000, kind = le_rand(&st) % 3;
+                        char first = (le_rand(&st) & 1) ? '\r' : '\n';
+                        for (uint32_t j = 0; j < len; j++)
+                            t[n++] = kind == 0 ? ((j & 1) ? (first == '\r' ? '\n' : '\r') : first)
+                                   : kind == 1 ? first
+                                   : ((le_rand(&st) & 1) ? '\r' : '\n');
+                        continue;
+                    }
+                    uint32_t len, bits;
+                    if (r < 30) { len = r < 2 ? 1 : r < 6 ? 2 : r < 14 ? 3 : 4;
+                                  bits = (uint32_t)(r - (len == 1 ? 0 : len == 2 ? 2 : len == 3 ? 6 : 14)); }
+                    else        { len = 1 + le_rand(&st) % 4; bits = le_rand(&st); }
+                    for (uint32_t j = 0; j < len; j++) t[n++] = ((bits >> j) & 1) ? '\r' : '\n';
+                }
+                size_t bad_at = n;
+                if (strict) n += (size_t)snprintf(t + n, cap - n, "\"x\"y");
+                else        n += (size_t)snprintf(t + n, cap - n, "%u", 7u);
+                /* the reference: rows, and the line of the last row */
+                size_t nr = 0, i = 0, start = 0;
+                bool inq = false;
+                while (i < n) {
+                    char c = t[i];
+                    if (c == '"') { inq = !inq; i++; }
+                    else if (!inq && (c == '\n' || c == '\r')) {
+                        rs[nr] = start; re[nr] = i; nr++;
+                        i += le_ref_len(t, i, n);
+                        start = i;
+                    } else i++;
+                }
+                if (start < n) { rs[nr] = start; re[nr] = n; nr++; }
+                int64_t line = 1;
+                for (size_t q = 0; q < bad_at; ) {
+                    if (t[q] == '\n' || t[q] == '\r') { line++; q += le_ref_len(t, q, n); } else q++;
+                }
+                FILE* f = fopen(path, "wb");
+                TEST_ASSERT_TRUE(f != NULL);
+                fwrite(t, 1, n, f);
+                fclose(f);
+                if (!strict) {
+                    ray_t* tb = ray_read_csv_ex(path, ',', false, str, 1, &name, 1, NULL);
+                    TEST_ASSERT_TRUE(tb && !RAY_IS_ERR(tb));
+                    bool same = ray_table_nrows(tb) == (int64_t)nr;
+                    ray_t* col = ray_table_get_col_idx(tb, 0);
+                    for (size_t r = 0; same && r < nr; r++) {
+                        const char* a = t + rs[r]; size_t al = re[r] - rs[r];
+                        if (al >= 2 && a[0] == '"' && a[al - 1] == '"') { a++; al -= 2; }
+                        size_t bl = 0;
+                        const char* b = ray_str_vec_get(col, (int64_t)r, &bl);
+                        same = bl == al && (al == 0 || memcmp(a, b, al) == 0);
+                        if (!same) {
+                            snprintf(msg, sizeof msg, "%s seed %d: row %zu differs from the reference (%zu rows)",
+                                     big == 2 ? "long runs" : big ? "parallel" : "serial", seed, r, nr);
+                        }
+                    }
+                    if (ray_table_nrows(tb) != (int64_t)nr)
+                        snprintf(msg, sizeof msg, "%s seed %d: %lld rows, reference %zu",
+                                 big == 2 ? "long runs" : big ? "parallel" : "serial", seed, (long long)ray_table_nrows(tb), nr);
+                    ray_release(tb);
+                    if (!same) FAIL(strdup(msg));
+                } else {
+                    ray_csv_opts_t opts = { .strict = true, .op = ".csv.read" };
+                    ray_t* res = ray_read_csv_ex(path, ',', false, str, 1, &name, 1, &opts);
+                    char want[160];
+                    snprintf(want, sizeof want, ".csv.read \"%s\": line %lld, column v: text after the closing quote",
+                             path, (long long)line);
+                    const char* got = res && RAY_IS_ERR(res) ? ray_err_msg(res) : "no error";
+                    if (strcmp(got, want) != 0) {
+                        snprintf(msg, sizeof msg, "%s seed %d: got %s; want %s", big == 2 ? "long runs" : big ? "parallel" : "serial", seed, got, want);
+                        if (res && RAY_IS_ERR(res)) ray_error_free(res); else if (res) ray_release(res);
+                        FAIL(strdup(msg));
+                    }
+                    ray_error_free(res);
+                }
+                checked++;
+            }
+        }
+    }
+    free(t); free(rs); free(re);
+    unlink(path);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    TEST_ASSERT_EQ_I(checked, 120);
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
     { "csv/splayed_cancel", test_csv_splayed_cancel, NULL, NULL },
     { "csv/splayed_cancel_hash", test_csv_splayed_cancel_hash, NULL, NULL },
@@ -2785,5 +2977,7 @@ const test_entry_t csv_entries[] = {
     { "csv/streaming_infers_like_read", test_csv_streaming_infers_like_read, NULL, NULL },
     { "csv/strict_matrix",        test_csv_strict_matrix,                   NULL, NULL },
     { "csv/escaped_alloc_fail",   test_csv_escaped_alloc_fail,              NULL, NULL },
+    { "csv/strict_line_ends",     test_csv_strict_line_ends,                NULL, NULL },
+    { "csv/line_end_reference",   test_csv_line_end_reference,              NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
