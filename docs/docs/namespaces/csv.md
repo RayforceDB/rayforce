@@ -18,7 +18,7 @@ CSV is Rayfall's bulk text I/O format. The `.csv.*` builtins cover four shapes: 
 
 Signatures:
 
-- `(.csv.read "path")` — auto-detect column types from the header + a content sample.
+- `(.csv.read "path")` — auto-detect column types from the header + a content sample. A type is inferred only if the sampled values fit it: an integer past the `I64` range makes its column `F64`, and a timestamp past the `TIMESTAMP` range (below) is not read as one.
 - `(.csv.read [types] "path")` — types is a SYM vector naming `B8`, `I64`, `F64`, `STR`, `SYMBOL`, `F32`, `DATE`, `TIME`, `TIMESTAMP`, `GUID` (case-insensitive). One entry per column.
 - `(.csv.read [names] [types] "path")` — also override the column names. With explicit names the input is assumed to have **no header row**.
 - `(.csv.read {strict: true} ...)` — any arrangement above may start with an options dict. `strict` true refuses a malformed file instead of reading its bad cells as nulls; see [Strict mode](#csv-strict). `strict` is the only key: an unknown key, a non-bool value, a second options dict or one that is not the first argument is a `domain` error. Each arrangement takes exactly its own arguments; one more is an `arity` error.
@@ -51,7 +51,7 @@ Examples:
 
 ### Strict mode { #csv-strict }
 
-By default the reader is lenient: a cell it cannot read as its column's type becomes a null (`false` in a `B8` column, `0` in a `U8` one, which hold no null), a row with too few cells is padded with nulls, and cells past the last column are dropped. `{strict: true}` makes each of these an error instead, a `parse` error that names the file, its line and, for a cell, the column, its text and the type:
+By default the reader is lenient: a cell it cannot read as its column's type becomes a null (`false` in a `B8` column, `0` in a `U8` one, which hold no null), and so does a number outside its type's range (the ranges are listed below; a `TIME` is -596:31:23.647 to 596:31:23.647, and every `DATE` from year 0000 to 9999 fits), never a wrapped value, a row with too few cells is padded with nulls, and cells past the last column are dropped. `{strict: true}` makes each of these an error instead, a `parse` error that names the file, its line and, for a cell, the column, its text and the type:
 
 ```text
 .csv.read "bad.csv": line 3: expected 3 cells, got 2
@@ -62,7 +62,7 @@ The rule: a non-empty cell must be stored as the value its text says. A strict l
 
 - its cell count is not the schema's: a cell is a field ended by the delimiter, the line end or the end of the file, so a trailing delimiter adds an empty cell and a blank line is one empty cell — an error unless the table has one column. Without a header the first row is checked like any other (the schema, not the first line, says how many cells a row has);
 - a non-empty cell does not parse as its column's type: `"abc" is not an F64`. A number with a space before or after it (`" 1"`, `"2.5 "`) is such a cell; a leading `+` is not. `SYM` and `STR` cells hold any text;
-- a value is past its type's range: `"300" is out of range for a U8`. The default wraps these (300 in a `U8` reads as 44, 40000 in an `I16` as -25536, `9999-01-01T00:00:00` in a `TIMESTAMP` as an instant in 1815, `106752D00:00:00` in a `TIMESPAN` as a negative duration) or makes them an infinity (1e39 in an `F32`); a wrapped value is worse than a null. The ranges are `U8` 0 to 255; `I16`, `I32`, `I64` from their minimum plus one; `F32` and `F64` finite; `TIMESTAMP` 1707-09-22T00:12:43.145224193 to 2292-04-10T23:47:16.854775807; a finite `TIMESPAN` short of `0Wn`, the infinity it would otherwise read as (`0Wn` itself is accepted);
+- a value is past its type's range: `"300" is out of range for a U8`. The default reads these as nulls (`0` in a `U8`), as it does a cell that does not parse: 300 in a `U8`, 40000 in an `I16`, 1e39 in an `F32`, `9999-01-01T00:00:00` in a `TIMESTAMP` and `106752D00:00:00` in a `TIMESPAN` are each a null, not a wrapped value or an infinity. The ranges are `U8` 0 to 255; `I16`, `I32`, `I64` from their minimum plus one; `F32` and `F64` finite; `TIMESTAMP` 1707-09-22T00:12:43.145224193 to 2292-04-10T23:47:16.854775807, after any UTC offset is applied; a finite `TIMESPAN` short of `0Wn`, the infinity it would otherwise read as (`0Wn` itself is accepted);
 - a non-zero float text stores as zero: `"1e-400" underflows to zero for an F64` (`1e-50` in an `F32`), the counterpart of overflowing to an infinity. Rounding to the nearest value the type holds is not a loss and is accepted, a non-zero subnormal (`5e-324`, `1e-45` in an `F32`) included;
 - the text spells the type's null: `"-32768" reads as a null I16`. These are the values each type keeps as its null sentinel: the minimum of `I16`, `I32`, `I64`, `TIME` (`-596:31:23.648`) and `TIMESTAMP` (`1707-09-22T00:12:43.145224192`), the all-zero `GUID`, and `0Nn` for a `TIMESPAN`;
 - a time has more fraction digits than its type holds and they are not zeros: `"10:00:00.1234" has more fraction digits than a TIME holds` (`TIME` keeps milliseconds, `TIMESPAN` and `TIMESTAMP` nanoseconds);

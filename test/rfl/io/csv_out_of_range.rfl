@@ -1,0 +1,147 @@
+;; @requires: posix  (fixtures are written through a POSIX shell via .sys.exec)
+;; The default (lenient) .csv.read (#1892): a number outside its column's
+;; range is a null, as text that does not parse is, never a wrapped value; a
+;; U8, which has no null, stores 0 for it as for unparseable text.  The
+;; type's minimum, its null sentinel, reads as that null as before.  Each
+;; type is read from a small file (the serial parse) and from one with the
+;; same rows at its head and tail around 10000 filler rows (the parallel
+;; parse), by .csv.read, .csv.splayed and .csv.parted.  {strict: true}
+;; refuses these cells as before.
+;; Fixtures use the rf_test_csvor_ prefix (the Makefile removes rf_test_*.csv).
+
+(.sys.exec "rm -rf rf_test_csvor_*") -- 0
+(set M (fn [f] (try (do (f) "no error") (fn [e] (at e 'msg)))))
+;; the big file: the small file's rows, 10000 rows of fill, the rows again
+(set B (fn [s fill] (.sys.exec (format "awk -v f='%' 'NR==1{print;next}{r[NR]=$0;print}END{for(i=0;i<10000;i++)print f;for(j=2;j<=NR;j++)print r[j]}' rf_test_csvor_%.csv > rf_test_csvor_%b.csv" fill s s))))
+;; a column's head and tail, k cells each
+(set H (fn [v k] (concat (take v k) (take v (- 0 k)))))
+(set SP (fn [t] (at t 'v)))
+
+;; ── U8: 0 to 255 ────────────────────────────────────────────────────────────
+(.sys.exec "printf 'v\\n0\\n255\\n256\\n-1\\n100000\\n' > rf_test_csvor_u8.csv") -- 0
+(B "u8" "1") -- 0
+(at (.csv.read [U8] "rf_test_csvor_u8.csv") 'v) -- [0x00 0xff 0x00 0x00 0x00]
+(H (at (.csv.read [U8] "rf_test_csvor_u8b.csv") 'v) 5) -- [0x00 0xff 0x00 0x00 0x00 0x00 0xff 0x00 0x00 0x00]
+(SP (.csv.splayed [U8] "rf_test_csvor_u8.csv" "rf_test_csvor_sp")) -- [0x00 0xff 0x00 0x00 0x00]
+(H (SP (.csv.splayed [U8] "rf_test_csvor_u8b.csv" "rf_test_csvor_sp")) 5) -- [0x00 0xff 0x00 0x00 0x00 0x00 0xff 0x00 0x00 0x00]
+(SP (.csv.parted [U8] "rf_test_csvor_u8.csv" "rf_test_csvor_pt1" 't)) -- [0x00 0xff 0x00 0x00 0x00]
+(H (SP (.csv.parted [U8] "rf_test_csvor_u8b.csv" "rf_test_csvor_pt2" 't)) 5) -- [0x00 0xff 0x00 0x00 0x00 0x00 0xff 0x00 0x00 0x00]
+
+;; ── I16: -32767 to 32767; -32768 is the null ────────────────────────────────
+(.sys.exec "printf 'v\\n32767\\n-32767\\n32768\\n-32769\\n100000\\n-32768\\n' > rf_test_csvor_i16.csv") -- 0
+(B "i16" "1") -- 0
+(at (.csv.read [I16] "rf_test_csvor_i16.csv") 'v) -- [32767 -32767 0Nh 0Nh 0Nh 0Nh]
+(H (at (.csv.read [I16] "rf_test_csvor_i16b.csv") 'v) 6) -- [32767 -32767 0Nh 0Nh 0Nh 0Nh 32767 -32767 0Nh 0Nh 0Nh 0Nh]
+(SP (.csv.splayed [I16] "rf_test_csvor_i16.csv" "rf_test_csvor_sp")) -- [32767 -32767 0Nh 0Nh 0Nh 0Nh]
+(H (SP (.csv.splayed [I16] "rf_test_csvor_i16b.csv" "rf_test_csvor_sp")) 6) -- [32767 -32767 0Nh 0Nh 0Nh 0Nh 32767 -32767 0Nh 0Nh 0Nh 0Nh]
+(SP (.csv.parted [I16] "rf_test_csvor_i16.csv" "rf_test_csvor_pt3" 't)) -- [32767 -32767 0Nh 0Nh 0Nh 0Nh]
+(H (SP (.csv.parted [I16] "rf_test_csvor_i16b.csv" "rf_test_csvor_pt4" 't)) 6) -- [32767 -32767 0Nh 0Nh 0Nh 0Nh 32767 -32767 0Nh 0Nh 0Nh 0Nh]
+
+;; ── I32: -2147483647 to 2147483647; -2147483648 is the null ─────────────────
+(.sys.exec "printf 'v\\n2147483647\\n-2147483647\\n2147483648\\n-2147483649\\n99999999999\\n-2147483648\\n' > rf_test_csvor_i32.csv") -- 0
+(B "i32" "1") -- 0
+(at (.csv.read [I32] "rf_test_csvor_i32.csv") 'v) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
+(H (at (.csv.read [I32] "rf_test_csvor_i32b.csv") 'v) 6) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni 2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
+(SP (.csv.splayed [I32] "rf_test_csvor_i32.csv" "rf_test_csvor_sp")) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
+(H (SP (.csv.splayed [I32] "rf_test_csvor_i32b.csv" "rf_test_csvor_sp")) 6) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni 2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
+(SP (.csv.parted [I32] "rf_test_csvor_i32.csv" "rf_test_csvor_pt5" 't)) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
+(H (SP (.csv.parted [I32] "rf_test_csvor_i32b.csv" "rf_test_csvor_pt6" 't)) 6) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni 2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
+
+;; ── I64: from its minimum plus one; past it in either direction is a null ───
+(.sys.exec "printf 'v\\n9223372036854775807\\n-9223372036854775807\\n9223372036854775808\\n-9223372036854775809\\n-9223372036854775808\\n' > rf_test_csvor_i64.csv") -- 0
+(B "i64" "1") -- 0
+(at (.csv.read [I64] "rf_test_csvor_i64.csv") 'v) -- [9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl]
+(H (at (.csv.read [I64] "rf_test_csvor_i64b.csv") 'v) 5) -- [9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl 9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl]
+(SP (.csv.splayed [I64] "rf_test_csvor_i64.csv" "rf_test_csvor_sp")) -- [9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl]
+(H (SP (.csv.splayed [I64] "rf_test_csvor_i64b.csv" "rf_test_csvor_sp")) 5) -- [9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl 9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl]
+(SP (.csv.parted [I64] "rf_test_csvor_i64.csv" "rf_test_csvor_pt7" 't)) -- [9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl]
+(H (SP (.csv.parted [I64] "rf_test_csvor_i64b.csv" "rf_test_csvor_pt8" 't)) 5) -- [9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl 9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl]
+
+;; ── F32: finite; past its range a null, not an infinity ─────────────────────
+(.sys.exec "printf 'v\\n3.4e38\\n-3.4e38\\n3.5e38\\n-3.5e38\\n1e39\\n1e400\\n' > rf_test_csvor_f32.csv") -- 0
+(B "f32" "1") -- 0
+(nil? (at (.csv.read [F32] "rf_test_csvor_f32.csv") 'v)) -- [false false true true true true]
+(nil? (H (at (.csv.read [F32] "rf_test_csvor_f32b.csv") 'v) 6)) -- [false false true true true true false false true true true true]
+(nil? (SP (.csv.splayed [F32] "rf_test_csvor_f32.csv" "rf_test_csvor_sp"))) -- [false false true true true true]
+(nil? (H (SP (.csv.splayed [F32] "rf_test_csvor_f32b.csv" "rf_test_csvor_sp")) 6)) -- [false false true true true true false false true true true true]
+(nil? (SP (.csv.parted [F32] "rf_test_csvor_f32.csv" "rf_test_csvor_pt9" 't))) -- [false false true true true true]
+(nil? (H (SP (.csv.parted [F32] "rf_test_csvor_f32b.csv" "rf_test_csvor_pt10" 't)) 6)) -- [false false true true true true false false true true true true]
+;; and so is a non-finite F64, as before
+(.sys.exec "printf 'v\\n1.7e308\\n-1.7e308\\n1e400\\n-1e400\\n' > rf_test_csvor_f64.csv") -- 0
+(nil? (at (.csv.read [F64] "rf_test_csvor_f64.csv") 'v)) -- [false false true true]
+
+;; ── DATE: years 0000 to 9999, all inside the type ───────────────────────────
+(.sys.exec "printf 'v\\n0000-01-01\\n9999-12-31\\n' > rf_test_csvor_date.csv") -- 0
+(B "date" "2000-01-01") -- 0
+(at (.csv.read [DATE] "rf_test_csvor_date.csv") 'v) -- [0000.01.01 9999.12.31]
+(H (at (.csv.read [DATE] "rf_test_csvor_dateb.csv") 'v) 2) -- [0000.01.01 9999.12.31 0000.01.01 9999.12.31]
+(SP (.csv.splayed [DATE] "rf_test_csvor_dateb.csv" "rf_test_csvor_sp")) -- (at (.csv.read [DATE] "rf_test_csvor_dateb.csv") 'v)
+(SP (.csv.parted [DATE] "rf_test_csvor_date.csv" "rf_test_csvor_pt11" 't)) -- [0000.01.01 9999.12.31]
+
+;; ── TIME: -596:31:23.647 to 596:31:23.647; -596:31:23.648 is the null ───────
+;; (shown as its milliseconds: 2147483647 is 596:31:23.647)
+(.sys.exec "printf 'v\\n596:31:23.647\\n-596:31:23.647\\n596:31:23.648\\n-596:31:23.649\\n9999:00:00\\n-596:31:23.648\\n' > rf_test_csvor_time.csv") -- 0
+(B "time" "00:00:01") -- 0
+(as 'I32 (at (.csv.read [TIME] "rf_test_csvor_time.csv") 'v)) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
+(as 'I32 (H (at (.csv.read [TIME] "rf_test_csvor_timeb.csv") 'v) 6)) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni 2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
+(as 'I32 (SP (.csv.splayed [TIME] "rf_test_csvor_time.csv" "rf_test_csvor_sp"))) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
+(as 'I32 (H (SP (.csv.splayed [TIME] "rf_test_csvor_timeb.csv" "rf_test_csvor_sp")) 6)) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni 2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
+(as 'I32 (SP (.csv.parted [TIME] "rf_test_csvor_time.csv" "rf_test_csvor_pt12" 't))) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
+(as 'I32 (H (SP (.csv.parted [TIME] "rf_test_csvor_timeb.csv" "rf_test_csvor_pt13" 't)) 6)) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni 2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
+
+;; ── TIMESPAN: finite, short of the infinities; 0Wn itself is accepted ───────
+;; (parted uncompressed: a compressed parted import of a TIMESPAN column is nyi)
+(.sys.exec "printf 'v\\n106751D23:47:16.854775806\\n-106751D23:47:16.854775806\\n106751D23:47:16.854775807\\n-106751D23:47:16.854775807\\n106752D00:00:00\\n-106752D00:00:00\\n999999D00:00:00\\n0Wn\\n' > rf_test_csvor_ts.csv") -- 0
+(B "ts" "1D00:00:00") -- 0
+(at (.csv.read [TIMESPAN] "rf_test_csvor_ts.csv") 'v) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
+(H (at (.csv.read [TIMESPAN] "rf_test_csvor_tsb.csv") 'v) 8) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn 106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
+(SP (.csv.splayed [TIMESPAN] "rf_test_csvor_ts.csv" "rf_test_csvor_sp")) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
+(H (SP (.csv.splayed [TIMESPAN] "rf_test_csvor_tsb.csv" "rf_test_csvor_sp")) 8) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn 106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
+(SP (.csv.parted {compress: false} [TIMESPAN] "rf_test_csvor_ts.csv" "rf_test_csvor_pt14" 't)) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
+(H (SP (.csv.parted {compress: false} [TIMESPAN] "rf_test_csvor_tsb.csv" "rf_test_csvor_pt15" 't)) 8) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn 106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
+
+;; ── TIMESTAMP: 1707-09-22T00:12:43.145224193 to 2292-04-10T23:47:16.854775807
+;; and the instant a UTC offset gives must be inside too; the sentinel
+;; 1707-09-22T00:12:43.145224192 is the null.  Past the range the sum used to
+;; overflow (undefined, and a wrapped instant: 9999 read as 1815).  Shown as
+;; nanoseconds from 2000: the two ends are 9223372036854775807 and its negation
+(.sys.exec "printf 'v\\n2292-04-10T23:47:16.854775807\\n1707-09-22T00:12:43.145224193\\n2292-04-10T23:47:16.854775808\\n1707-09-22T00:12:43.145224191\\n9999-01-01T00:00:00\\n0001-01-01T00:00:00\\n2292-04-10T23:47:16.854775807-01:00\\n1707-09-22T00:12:43.145224193+01:00\\n1707-09-22T00:12:43.145224192\\n' > rf_test_csvor_tp.csv") -- 0
+(B "tp" "2000-01-01T00:00:00") -- 0
+(as 'I64 (at (.csv.read [TIMESTAMP] "rf_test_csvor_tp.csv") 'v)) -- [9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(as 'I64 (H (at (.csv.read [TIMESTAMP] "rf_test_csvor_tpb.csv") 'v) 9)) -- [9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(as 'I64 (SP (.csv.splayed [TIMESTAMP] "rf_test_csvor_tp.csv" "rf_test_csvor_sp"))) -- [9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(as 'I64 (H (SP (.csv.splayed [TIMESTAMP] "rf_test_csvor_tpb.csv" "rf_test_csvor_sp")) 9)) -- [9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(as 'I64 (SP (.csv.parted [TIMESTAMP] "rf_test_csvor_tp.csv" "rf_test_csvor_pt16" 't))) -- [9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(as 'I64 (H (SP (.csv.parted [TIMESTAMP] "rf_test_csvor_tpb.csv" "rf_test_csvor_pt17" 't)) 9)) -- [9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 9223372036854775807 -9223372036854775807 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+;; an instant inside the range written as the day past an end plus an offset
+(.sys.exec "printf 'v\\n2292-04-11T00:47:16.854775807+01:00\\n1707-09-21T23:12:43.145224193-01:00\\n2292-04-11T00:47:16.854775808+01:00\\n' > rf_test_csvor_tp3.csv") -- 0
+(as 'I64 (at (.csv.read [TIMESTAMP] "rf_test_csvor_tp3.csv") 'v)) -- [9223372036854775807 -9223372036854775807 0Nl]
+;; strict refuses only the last, one nanosecond past the end
+(M (fn [] (.csv.read {strict: true} [TIMESTAMP] "rf_test_csvor_tp3.csv"))) -- ".csv.read \"rf_test_csvor_tp3.csv\": line 4, column v: \"2292-04-11T00:47:16.854775808+01:00\" is out of range for a TIMESTAMP"
+(.sys.exec "printf 'v\\n2292-04-11T00:47:16.854775807+01:00\\n1707-09-21T23:12:43.145224193-01:00\\n' > rf_test_csvor_tp4.csv") -- 0
+(as 'I64 (at (.csv.read {strict: true} [TIMESTAMP] "rf_test_csvor_tp4.csv") 'v)) -- [9223372036854775807 -9223372036854775807]
+;; the days next to the checked ones, with the largest offsets, stay exact
+(.sys.exec "printf 'v\\n2292-04-08T23:59:59.999999999-23:59\\n1707-09-25T00:00:00+23:59\\n' > rf_test_csvor_tp2.csv") -- 0
+(as 'I64 (at (.csv.read [TIMESTAMP] "rf_test_csvor_tp2.csv") 'v)) -- [9223286339999999999 -9223199940000000000]
+
+;; ── type inference: a type is inferred only if the sampled values fit it ────
+;; an integer past I64's range infers F64 (it read as an I64 null before) ...
+(.sys.exec "printf 'v\\n1\\n99999999999999999999\\n' > rf_test_csvor_inf1.csv; printf 'v\\n1\\n9223372036854775807\\n-9223372036854775808\\n' > rf_test_csvor_inf2.csv") -- 0
+(type (at (.csv.read "rf_test_csvor_inf1.csv") 'v)) -- 'F64
+(at (.csv.read "rf_test_csvor_inf1.csv") 'v) -- [1.0 1e+20]
+;; ... while I64's own extremes, its null included, still infer I64
+(type (at (.csv.read "rf_test_csvor_inf2.csv") 'v)) -- 'I64
+;; a timestamp past the type's range is not a TIMESTAMP; inside it still is
+(.sys.exec "printf 'v\\n2000-01-01T00:00:00\\n9999-01-01T00:00:00\\n' > rf_test_csvor_inf3.csv; printf 'v\\n2292-04-10T23:47:16.854775807\\n1707-09-22T00:12:43.145224193\\n' > rf_test_csvor_inf4.csv") -- 0
+(type (at (.csv.read "rf_test_csvor_inf3.csv") 'v)) -- 'SYM
+(as 'I64 (at (.csv.read "rf_test_csvor_inf4.csv") 'v)) -- [9223372036854775807 -9223372036854775807]
+
+;; ── {strict: true} still refuses each of these, as before ───────────────────
+(M (fn [] (.csv.read {strict: true} [U8] "rf_test_csvor_u8.csv"))) -- ".csv.read \"rf_test_csvor_u8.csv\": line 4, column v: \"256\" is out of range for a U8"
+(M (fn [] (.csv.read {strict: true} [I16] "rf_test_csvor_i16.csv"))) -- ".csv.read \"rf_test_csvor_i16.csv\": line 4, column v: \"32768\" is out of range for an I16"
+(M (fn [] (.csv.read {strict: true} [I32] "rf_test_csvor_i32b.csv"))) -- ".csv.read \"rf_test_csvor_i32b.csv\": line 4, column v: \"2147483648\" is out of range for an I32"
+(M (fn [] (.csv.read {strict: true} [F32] "rf_test_csvor_f32.csv"))) -- ".csv.read \"rf_test_csvor_f32.csv\": line 4, column v: \"3.5e38\" is out of range for an F32"
+(M (fn [] (.csv.read {strict: true} [TIMESPAN] "rf_test_csvor_tsb.csv"))) -- ".csv.read \"rf_test_csvor_tsb.csv\": line 4, column v: \"106751D23:47:16.854775807\" is out of range for a TIMESPAN"
+(M (fn [] (.csv.read {strict: true} [TIMESTAMP] "rf_test_csvor_tp.csv"))) -- ".csv.read \"rf_test_csvor_tp.csv\": line 4, column v: \"2292-04-10T23:47:16.854775808\" is out of range for a TIMESTAMP"
+
+(.sys.exec "rm -rf rf_test_csvor_*") -- 0
