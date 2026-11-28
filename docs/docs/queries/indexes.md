@@ -97,7 +97,7 @@ Each kind has a one-arg attach builtin.  Attaching is idempotent — if a differ
 
 `(.idx.zone v)   (.idx.hash v)   (.idx.sort v)   (.idx.bloom v)`
 
-Attach an index of the named kind to a vector `v`.  Returns the column with the new index attached (the underlying values are unchanged).  All kinds accept the numeric/boolean types `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`; `.idx.hash` **additionally** accepts `RAY_SYM` (keyed on domain ids), `RAY_STR` and `RAY_GUID` (each keyed on a 64-bit hash of the bytes, payload compared on every hit).  `RAY_SYM` / `RAY_STR` / `RAY_GUID` on the non-hash kinds is deferred to v2.
+Attach an index of the named kind to a vector `v`.  Returns the column with the new index attached (the underlying values are unchanged).  All kinds accept the numeric/boolean types `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`, `RAY_TIMESPAN`; `.idx.hash` **additionally** accepts `RAY_SYM` (keyed on domain ids), `RAY_STR` and `RAY_GUID` (each keyed on a 64-bit hash of the bytes, payload compared on every hit).  `RAY_SYM` / `RAY_STR` / `RAY_GUID` on the non-hash kinds is deferred to v2.
 
 ### Examples
 
@@ -224,7 +224,7 @@ This design has three useful properties:
 
 ## Caveats and Limits
 
-- **Type support.**  All four kinds accept `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`; `.idx.hash` additionally accepts `RAY_SYM` (indexing the symbol domain ids), `RAY_STR` and `RAY_GUID` (indexing a hash of each row's bytes).  `RAY_SYM`, `RAY_STR` and `RAY_GUID` on the zone/sort/bloom kinds are not yet supported.
+- **Type support.**  All four kinds accept `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`, `RAY_TIMESPAN`; `.idx.hash` additionally accepts `RAY_SYM` (indexing the symbol domain ids), `RAY_STR` and `RAY_GUID` (indexing a hash of each row's bytes).  `RAY_SYM`, `RAY_STR` and `RAY_GUID` on the zone/sort/bloom kinds are not yet supported.
 - **One slot per column.**  A column carries at most one index kind at a time.  Calling a different kind's attach replaces the existing one.  Multiple indexes per column are deferred — the slot can point to a list-of-indexes in v2 if real workloads want both eq and range fast paths.
 - **In-memory only.**  Indexes do not persist across `ray_col_save` / `ray_col_load`; users rebuild explicitly after a load.  Unlike the HNSW handle (see [Vector Search](../graph/vector-search.md)), which has dedicated `.emb.hnsw.set` / `.emb.hnsw.get` builtins for explicit persistence, `.idx.*` has no on-disk format at all — rebuild is the only option.
 - **Float equality not indexed.**  Hash-EQ and hash-IN routes are integer-family only — float equality has NaN / -0 semantics that the unfused compare kernel handles; the index paths intentionally don't replicate that.

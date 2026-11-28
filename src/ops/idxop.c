@@ -1347,7 +1347,8 @@ ray_t* ray_index_attach_persisted(ray_t** vp, ray_t* root) {
 
 static bool idx_numeric_parent(int8_t t) {
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-           t == RAY_F32 || t == RAY_F64 || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+           t == RAY_F32 || t == RAY_F64 || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP ||
+           t == RAY_TIMESPAN;
 }
 
 bool ray_index_kind_admits(ray_idx_kind_t kind, int8_t t) {
