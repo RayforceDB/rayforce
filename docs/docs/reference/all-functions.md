@@ -247,7 +247,7 @@ Every builtin registered in `src/` in this checkout, by arity, with its one-line
 | `percentile` | Exact linear-interpolated percentile; probability is `0..100` |
 | `pow` | Power (x^y, returns f64; lowers in query expressions) |
 | `quantile` | Exact linear-interpolated quantile; probability is `0.0..1.0`; a vector of another type than numbers and temporals is a type error, empty or not |
-| `rand` | N random integers from 0 up to, not including, `max`; **deterministic**: the same sequence in every process |
+| `rand` | N random integers, uniform from 0 up to, not including, `max` (any positive I64); **deterministic**: the same sequence in every process, on every platform |
 | `remove` | Remove key from dictionary |
 | `rotate` | Rotate left by N positions (negative rotates right) |
 | `row` | Extract single row from table as dict |
@@ -708,7 +708,7 @@ Query `concat` joins text row by row when an operand comes from a source column,
 | `where` | unary | — | Indices where boolean vector is true | `(where [true false true])` → `[0 2]` |
 | `group` | unary | — | Group indices by value (returns dict) | `(group ['a 'b 'a])` → dict |
 | `diverse` | unary | — | Check if all elements are unique (no duplicates) | `(diverse [1 2 3])` → `true` |
-| `rand` | binary | — | N random integers from 0 up to, not including, `max`; **deterministic**: the same sequence in every process | `(rand 3 100)` → 3 random ints 0..99 |
+| `rand` | binary | — | N random integers, uniform from 0 up to, not including, `max` (any positive I64); **deterministic**: the same sequence in every process, on every platform | `(rand 3 100)` → 3 random ints 0..99 |
 | `bin` | binary | — | Binary search — left boundary (sorted input) | `(bin [10 20 30] 25)` → `1` |
 | `binr` | binary | — | Binary search — right boundary (sorted input) | `(binr [10 20 30] 25)` → `2` |
 
