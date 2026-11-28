@@ -389,7 +389,7 @@ static inline bool agg_is_binary_agg(uint16_t op) {
  *
  * The pivot starts at the first pair.  At every power of two from 2
  * (ray_comom_due) it moves to the running mean, pivot + sum/n, and the sums
- * are re-expressed about it exactly (ray_comom_repivot): after the move at
+ * are re-expressed about it exactly (ray_comom_repivot_cold): after the move at
  * the largest power of two up to n the pivot is the mean of at least half
  * the pairs, within about a standard deviation of the final mean, so the
  * final correction does not cancel whatever the order of the pairs.  A
@@ -397,7 +397,7 @@ static inline bool agg_is_binary_agg(uint16_t op) {
  * and adds them (ray_comom_merge).  The finalizers take the raw formula,
  * (sxy - sx*sy/n) / n, which is shift-invariant, with its correction
  * formed so that no intermediate passes DBL_MAX where the sums do not
- * (ray_comom_corr).
+ * (ray_comom_cov).
  *
  * Integer mode, per side (RAY_COMOM_IMX, RAY_COMOM_IMY: that side an
  * integer or temporal column): the side's pivot slot holds an int64
@@ -457,136 +457,28 @@ static inline void ray_comom_add(double dx, double dy, double* sx, double* sy, d
     *sx += dx; *sy += dy; *sxy += dx * dy;
 }
 
-/* Sums of n pairs about a pivot re-expressed about that pivot plus (ex, ey):
- *   sxy' = sxy - ex*sy - ey*sx + n*ex*ey    sx' = sx - n*ex    sy' = sy - n*ey */
-static inline void ray_comom_shift(double n, double* sx, double* sy, double* sxy,
-                                   double ex, double ey) {
-    *sxy = *sxy - ex * *sy - ey * *sx + n * ex * ey;
-    *sx -= n * ex;
-    *sy -= n * ey;
-}
-
-/* A value the optimizer may not reassociate through: the exact sums below
- * hold under -fassociative-math. */
-static inline double ray_comom_pin(double v) {
-#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
-    __asm__("" : "+x"(v));
-#elif defined(__GNUC__) && defined(__aarch64__)
-    __asm__("" : "+w"(v));
-#elif defined(__GNUC__)
-    __asm__("" : "+m"(v));
-#endif
-    return v;
-}
-
-/* b - a exactly, as hi + lo: exact in one subtraction when b and a are
- * within a factor of two of each other (Sterbenz) or one is 0, else
- * TwoSum. */
-static inline void ray_comom_diff2(double b, double a, double* hi, double* lo) {
-    if (a == 0.0 || b == 0.0 || (a > 0.0 ? (b >= 0.5 * a && b <= 2.0 * a)
-                                         : (b <= 0.5 * a && b >= 2.0 * a))) {
-        *hi = b - a; *lo = 0.0;
-        return;
-    }
-    double s = ray_comom_pin(b - a);
-    double bb = ray_comom_pin(s - b);
-    double e1 = ray_comom_pin(b - ray_comom_pin(s - bb));
-    double e2 = ray_comom_pin(-a - bb);
-    *hi = s; *lo = e1 + e2;
-}
-
-/* An int128 exactly as hi + lo doubles. */
-static inline void ray_comom_i128_2(__int128 d, double* hi, double* lo) {
-    double h = (double)d;
-    *hi = h;
-    *lo = (double)(d - (__int128)h);
-}
-
-/* One side's pivot slot moved by about m; its exact move as hi + lo.  An
- * integer pivot moves by m rounded to an integer, kept inside int64 (a move
- * past it stops at the last double-representable step inside). */
-static inline void ray_comom_move_side(bool im, double* k, double m, double* hi, double* lo) {
-    *hi = 0.0; *lo = 0.0;
-    if (!(__builtin_fabs(m) <= 1.7976931348623157e308)) return;   /* a NaN or an infinity */
-    if (im) {
-        if (!(__builtin_fabs(m) < 1e30)) return;   /* past any int64 move: from an overflowed sum */
-        int64_t kv = ray_comom_pivot_iv(*k), nk;
-        double r = __builtin_rint(m);
-        if (__builtin_fabs(r) < 0x1p62 && !__builtin_add_overflow(kv, (int64_t)r, &nk)) {
-            *k = ray_comom_pivot_i(nk);   /* the common case, in int64 */
-            *hi = r;
-            return;
-        }
-        __int128 t = (__int128)kv + (__int128)r;
-        if (t > (__int128)INT64_MAX || t < (__int128)INT64_MIN) {
-            __int128 lim = t > (__int128)INT64_MAX ? (__int128)INT64_MAX : (__int128)INT64_MIN;
-            r = (double)(lim - (__int128)kv);
-            while ((__int128)kv + (__int128)r > (__int128)INT64_MAX ||
-                   (__int128)kv + (__int128)r < (__int128)INT64_MIN)
-                r = __builtin_nextafter(r, 0.0);
-            t = (__int128)kv + (__int128)r;
-        }
-        *k = ray_comom_pivot_i((int64_t)t);
-        *hi = r;
-        return;
-    }
-    double nk = ray_comom_pin(*k + m);
-    ray_comom_diff2(nk, *k, hi, lo);
-    *k = nk;
-}
-
-/* The sums of n pairs about the pivot slot pair (pivx, pivy) re-expressed about
- * that pivot moved by about (mx, my), each side in its own mode. */
-static inline void ray_comom_move(unsigned im, double n, double* pivx, double* pivy, double* sx,
-                                  double* sy, double* sxy, double mx, double my) {
-    double hx, lx, hy, ly;
-    ray_comom_move_side((im & RAY_COMOM_IMX) != 0, pivx, mx, &hx, &lx);
-    ray_comom_move_side((im & RAY_COMOM_IMY) != 0, pivy, my, &hy, &ly);
-    ray_comom_shift(n, sx, sy, sxy, hx, hy);
-    if (lx != 0.0 || ly != 0.0) ray_comom_shift(n, sx, sy, sxy, lx, ly);
-}
-
-/* The final correction sx*sy/n of the finalizers.  The product is formed
- * while it is finite (the raw formula's own form); where it would pass
- * DBL_MAX, as sx*(sy/n), whose terms stay within the scale of the sums:
- * |sx*(sy/n)| <= sqrt(sxx*syy).  Both forms take one rounding. */
-static inline double ray_comom_corr(double sx, double sy, double dn) {
-    double p = sx * sy;
-    return __builtin_fabs(p) <= 1.7976931348623157e308 ? p / dn : sx * (sy / dn);
-}
-
+/* The arithmetic whose order its argument needs, out of line in
+ * src/ops/comom.c, compiled with strict IEEE flags in every profile
+ * (#1897): the release profile's -fassociative-math let clang rewrite the
+ * correction's overflow-safe form into the one that overflows. */
 /* The counts at which the pivot moves to the running mean: every power of
  * two from 2. */
 static inline bool ray_comom_due(int64_t n) { return n >= 2 && (n & (n - 1)) == 0; }
 
 /* At a due count n (a power of two, so sum/n is exact): the pivot moves to
- * the mean of the n pairs. */
-static inline void ray_comom_repivot(unsigned im, double n, double* pivx, double* pivy, double* sx,
-                                     double* sy, double* sxy) {
-    double inv = 1.0 / n;
-    ray_comom_move(im, n, pivx, pivy, sx, sy, sxy, *sx * inv, *sy * inv);
-}
-
-/* ray_comom_repivot out of line, for the row loops (one copy per
- * translation unit). */
-static __attribute__((noinline, unused)) void
-ray_comom_repivot_cold(unsigned im, double n, double* pivx, double* pivy, double* sx, double* sy,
-                       double* sxy) {
-    ray_comom_repivot(im, n, pivx, pivy, sx, sy, sxy);
-}
-
-/* The exact distance b - a of two pivot slots of one side, as hi + lo. */
-static inline void ray_comom_kdiff(bool im, double b, double a, double* hi, double* lo) {
-    if (im) {
-        int64_t d;
-        if (!__builtin_sub_overflow(ray_comom_pivot_iv(b), ray_comom_pivot_iv(a), &d) &&
-            d > -(INT64_C(1) << 53) && d < (INT64_C(1) << 53)) {
-            *hi = (double)d; *lo = 0.0;   /* exact in one double */
-            return;
-        }
-        ray_comom_i128_2((__int128)ray_comom_pivot_iv(b) - (__int128)ray_comom_pivot_iv(a), hi, lo);
-    } else
-        ray_comom_diff2(b, a, hi, lo);
+ * the mean of the n pairs, each side's move taken exactly (an integer
+ * pivot's in int64 / int128, a float pivot's as hi + lo by TwoSum), and the
+ * sums re-expressed about it. */
+void ray_comom_repivot_cold(unsigned im, double n, double* pivx, double* pivy, double* sx,
+                            double* sy, double* sxy);
+/* The same for a row loop that holds its pivot and sums in locals: through
+ * a copy, so that the locals are not taken by address by a function in
+ * another file, which would keep them in memory for the whole loop. */
+static inline void ray_comom_repivot_local(unsigned im, double n, double* pivx, double* pivy,
+                                           double* sx, double* sy, double* sxy) {
+    double k0 = *pivx, k1 = *pivy, s0 = *sx, s1 = *sy, s2 = *sxy;
+    ray_comom_repivot_cold(im, n, &k0, &k1, &s0, &s1, &s2);
+    *pivx = k0; *pivy = k1; *sx = s0; *sy = s1; *sxy = s2;
 }
 
 /* The source state (ns pairs) into the destination (nd pairs): the smaller
@@ -595,31 +487,14 @@ static inline void ray_comom_kdiff(bool im, double b, double a, double* hi, doub
  * pivot lies within about its own standard deviation of its mean, and that
  * mean within sqrt(ns/nd) standard deviations of the merged one.  The
  * caller adds the counts. */
-static __attribute__((noinline, unused)) void
-ray_comom_merge(unsigned im, double nd, double* pivx, double* pivy, double* sx, double* sy,
-                double* sxy, double ns, double kxs, double kys, double sxs, double sys,
-                double sxys) {
-    if (ns <= 0) return;
-    if (nd <= 0) {
-        *pivx = kxs; *pivy = kys; *sx = sxs; *sy = sys; *sxy = sxys;
-        return;
-    }
-    if (ns > nd) {
-        /* the source is the larger: its pivot is the one kept */
-        double t;
-        t = *pivx; *pivx = kxs; kxs = t;   t = *pivy; *pivy = kys; kys = t;
-        t = *sx; *sx = sxs; sxs = t;   t = *sy; *sy = sys; sys = t;
-        t = *sxy; *sxy = sxys; sxys = t;
-        t = nd; nd = ns; ns = t;
-    }
-    /* the source's sums about its pivot ks re-expressed about kd = ks + (kd - ks) */
-    double hx, lx, hy, ly;
-    ray_comom_kdiff((im & RAY_COMOM_IMX) != 0, *pivx, kxs, &hx, &lx);
-    ray_comom_kdiff((im & RAY_COMOM_IMY) != 0, *pivy, kys, &hy, &ly);
-    ray_comom_shift(ns, &sxs, &sys, &sxys, hx, hy);
-    if (lx != 0.0 || ly != 0.0) ray_comom_shift(ns, &sxs, &sys, &sxys, lx, ly);
-    *sx += sxs; *sy += sys; *sxy += sxys;
-}
+void ray_comom_merge(unsigned im, double nd, double* pivx, double* pivy, double* sx, double* sy,
+                     double* sxy, double ns, double kxs, double kys, double sxs, double sys,
+                     double sxys);
+
+/* The finaliser: (sxy - sx*sy/n) / div, cov's (div n) and scov's (div
+ * n - 1), with the correction formed so that no intermediate passes DBL_MAX
+ * where the sums do not. */
+double ray_comom_cov(double dn, double sx, double sy, double sxy, double div);
 
 static inline bool agg_is_truth_agg(uint16_t op) {
     return op == OP_ALL || op == OP_ANY;

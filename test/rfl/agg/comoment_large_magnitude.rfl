@@ -143,6 +143,20 @@
 (at (select {c: (cov y x) from: TM}) 'c) -- [1.25]
 (at (select {c: (cov x y) from: TM by: g where: (>= g 0)}) 'c) -- [1.0 1.0]
 
+;; sums whose product passes DBL_MAX: values up to 1e149, sorted, so the
+;; pairs after the last move all lie above the pivot and sx*sy overflows.
+;; The correction takes sx*(sy/n) there; on a release build that let the
+;; compiler reassociate it into (sx*sy)/n, cov and scov were 0Nf (#1897).
+;; Exact: cov (n^2 - 1)/12 * 1e286, scov n(n + 1)/12 * 1e286
+(set XB (* 1e143 (as 'F64 (til 1000000))))
+(set RB (fn [v w] (and (not (nil? v)) (< (abs (/ (- v w) w)) 1e-9))))
+(RB (cov XB XB) 8.333333333325e296) -- true
+(RB (scov XB XB) 8.333341666666667e296) -- true
+(RB (cov XB (- 0.0 XB)) -8.333333333325e296) -- true
+(set TB (table [g x] (list (% (til 1000000) 1) XB)))
+(RB (first (at (select {c: (cov x x) from: TB}) 'c)) 8.333333333325e296) -- true
+(RB (first (at (select {c: (scov x x) from: TB by: g}) 'c)) 8.333341666666667e296) -- true
+
 ;; values from 1e150: a difference, a product or the final correction can
 ;; overflow or cancel, and no answer is promised; they must not fail
 (cov [1e308 -1e308] [0.25 -0.25])
