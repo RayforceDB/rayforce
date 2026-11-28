@@ -543,47 +543,30 @@ void ray_vm_release(void* ptr, size_t size) {
 }
 
 /* The range of free block blk whose pages may go: [*s, *e), empty if none. */
-static void vm_block_range(void* blk, size_t bsize, bool hugepage,
+static void vm_block_range(void* blk, size_t bsize,
                            uintptr_t* s_out, uintptr_t* e_out) {
-    if (!hugepage) {
-        /* Release only whole pages strictly INSIDE the block, keeping its
-         * first page resident: the buddy free-list links (fl_prev/fl_next
-         * at offset 0-15) live there and the block stays linked on the
-         * freelist after this call.
-         *
-         * The page size is not always 4096 — macOS arm64 and some aarch64
-         * Linux kernels use 16K (or 64K) pages.  Worse, Darwin's madvise
-         * rounds an unaligned range OUTWARD (trunc_page(addr),
-         * round_page(addr+len)), so the old `blk + 4096` start was rounded
-         * back to `blk` on 16K pages and MADV_FREE hit the header page of
-         * a linked freelist block; once the kernel reclaimed it, fl_next
-         * read back as zero and the next GC freelist walk crashed on a
-         * NULL link (issue #240).  Rounding inward to page-aligned bounds
-         * makes the kernel's own rounding a no-op on every platform. */
-        size_t pg = vm_page_size();
-        *s_out = ((uintptr_t)blk + 32 + (pg - 1)) & ~(uintptr_t)(pg - 1);
-        *e_out = ((uintptr_t)blk + bsize) & ~(uintptr_t)(pg - 1);
-        return;
-    }
-    /* THP pool: release only the whole 2MB-aligned interior so a partial
-     * MADV_DONTNEED does not shatter the transparent huge page.
+    /* Release only whole pages strictly INSIDE the block, keeping its
+     * first page resident: the buddy free-list links (fl_prev/fl_next
+     * at offset 0-15) live there and the block stays linked on the
+     * freelist after this call.
      *
-     * Crucially, never discard the block's FIRST page: the free-list links
-     * (fl_prev/fl_next at offset 0-15) live there and the block stays linked
-     * after release, so dropping that page zeroes the links and corrupts the
-     * free-list for every later traversal (alloc, GC).  When blk is itself
-     * 2MB-aligned the rounded-up start equals blk and would MADV_DONTNEED the
-     * header; advance past the first 2MB region so the header survives — we
-     * still release only whole 2MB regions, so no THP shatter. */
-    uintptr_t s = ((uintptr_t)blk + (2u << 20) - 1) & ~((uintptr_t)(2u << 20) - 1);
-    if (s == (uintptr_t)blk) s += (2u << 20);
-    *s_out = s;
-    *e_out = ((uintptr_t)blk + bsize) & ~((uintptr_t)(2u << 20) - 1);
+     * The page size is not always 4096 — macOS arm64 and some aarch64
+     * Linux kernels use 16K (or 64K) pages.  Worse, Darwin's madvise
+     * rounds an unaligned range OUTWARD (trunc_page(addr),
+     * round_page(addr+len)), so the old `blk + 4096` start was rounded
+     * back to `blk` on 16K pages and MADV_FREE hit the header page of
+     * a linked freelist block; once the kernel reclaimed it, fl_next
+     * read back as zero and the next GC freelist walk crashed on a
+     * NULL link (issue #240).  Rounding inward to page-aligned bounds
+     * makes the kernel's own rounding a no-op on every platform. */
+    size_t pg = vm_page_size();
+    *s_out = ((uintptr_t)blk + 32 + (pg - 1)) & ~(uintptr_t)(pg - 1);
+    *e_out = ((uintptr_t)blk + bsize) & ~(uintptr_t)(pg - 1);
 }
 
-void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
+void ray_vm_release_block(void* blk, size_t bsize) {
     uintptr_t s, e;
-    vm_block_range(blk, bsize, hugepage, &s, &e);
+    vm_block_range(blk, bsize, &s, &e);
     if (e > s) ray_vm_release((void*)s, e - s);
 }
 
@@ -613,15 +596,15 @@ int ray_vm_release_locked(void* ptr, size_t size) {
 #endif
 }
 
-int ray_vm_release_block_locked(void* blk, size_t bsize, bool hugepage) {
+int ray_vm_release_block_locked(void* blk, size_t bsize) {
     uintptr_t s, e;
-    vm_block_range(blk, bsize, hugepage, &s, &e);
+    vm_block_range(blk, bsize, &s, &e);
     return e > s ? ray_vm_release_locked((void*)s, e - s) : 0;
 }
 
-int ray_vm_release_block_any(void* blk, size_t bsize, bool hugepage) {
+int ray_vm_release_block_any(void* blk, size_t bsize) {
     uintptr_t s, e;
-    vm_block_range(blk, bsize, hugepage, &s, &e);
+    vm_block_range(blk, bsize, &s, &e);
     if (e <= s) return 0;
 #if defined(RAY_OS_LINUX)
     if (madvise((void*)s, e - s, MADV_DONTNEED) == 0) return 0;
@@ -1528,8 +1511,7 @@ void ray_vm_release(void* ptr, size_t size) {
     DiscardVirtualMemory(ptr, size);
 }
 
-void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
-    (void)hugepage;
+void ray_vm_release_block(void* blk, size_t bsize) {
     if (bsize > 4096) ray_vm_release((char*)blk + 4096, bsize - 4096);
 }
 
@@ -1559,12 +1541,12 @@ bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return fal
 bool ray_vm_lock(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
 void ray_vm_unlock(void* ptr, size_t size) { (void)ptr; (void)size; }
 int ray_vm_release_locked(void* ptr, size_t size) { ray_vm_release(ptr, size); return 0; }
-int ray_vm_release_block_locked(void* blk, size_t bsize, bool hugepage) {
-    ray_vm_release_block(blk, bsize, hugepage);
+int ray_vm_release_block_locked(void* blk, size_t bsize) {
+    ray_vm_release_block(blk, bsize);
     return 0;
 }
-int ray_vm_release_block_any(void* blk, size_t bsize, bool hugepage) {
-    ray_vm_release_block(blk, bsize, hugepage);
+int ray_vm_release_block_any(void* blk, size_t bsize) {
+    ray_vm_release_block(blk, bsize);
     return 0;
 }
 bool ray_os_has_ipc_lock(void) { return false; }
@@ -1813,8 +1795,7 @@ bool ray_vm_resident(const void* ptr, size_t size)  { (void)ptr; (void)size; ret
 size_t ray_vm_resident_end(const void* ptr, size_t size) { (void)ptr; return size; }
 void ray_vm_release(void* ptr, size_t size)         { (void)ptr; (void)size; }
 
-void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
-    (void)hugepage;
+void ray_vm_release_block(void* blk, size_t bsize) {
     if (bsize > 4096) ray_vm_release((char*)blk + 4096, bsize - 4096);
 }
 
@@ -1831,12 +1812,12 @@ bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return fal
 bool ray_vm_lock(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
 void ray_vm_unlock(void* ptr, size_t size) { (void)ptr; (void)size; }
 int ray_vm_release_locked(void* ptr, size_t size) { ray_vm_release(ptr, size); return 0; }
-int ray_vm_release_block_locked(void* blk, size_t bsize, bool hugepage) {
-    ray_vm_release_block(blk, bsize, hugepage);
+int ray_vm_release_block_locked(void* blk, size_t bsize) {
+    ray_vm_release_block(blk, bsize);
     return 0;
 }
-int ray_vm_release_block_any(void* blk, size_t bsize, bool hugepage) {
-    ray_vm_release_block(blk, bsize, hugepage);
+int ray_vm_release_block_any(void* blk, size_t bsize) {
+    ray_vm_release_block(blk, bsize);
     return 0;
 }
 bool ray_os_has_ipc_lock(void) { return false; }

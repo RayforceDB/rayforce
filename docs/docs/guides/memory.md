@@ -116,8 +116,7 @@ leaves the process:
   A heap of another live thread, such as an embedding's own thread, is left
   to that thread.
 - A block keeps its first page, which holds its free-list links, and blocks
-  under 8 KiB keep all their pages. Under transparent huge pages only the
-  whole 2 MiB regions inside a block are released.
+  under 8 KiB keep all their pages.
 - The free pages of a [spill pool](#8-total-ram-and-out-of-core-spill) are
   the spill file's page cache, which releasing would not free. They go back
   only when the whole pool is empty and unmapped, and a heap keeps its last
