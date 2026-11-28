@@ -8,7 +8,7 @@
 ;; ----- 2. CSV ingest -----
 
 (.sys.exec "rm -f /tmp/rfl_f64_nan.csv")
-(.sys.exec "printf 'x\\n1.5\\n\\n3.5\\n' > /tmp/rfl_f64_nan.csv")
+(write "/tmp/rfl_f64_nan.csv" "x\n1.5\n\n3.5\n")
 (set Pf (.csv.read [F64] "/tmp/rfl_f64_nan.csv"))
 (count Pf)                  -- 3
 (nil? (at (at Pf 'x) 1))    -- true

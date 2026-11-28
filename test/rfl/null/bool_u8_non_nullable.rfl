@@ -11,7 +11,7 @@
 
 ;; CSV ingest: empty BOOL / U8 cells coerce to false / 0, not null.
 (.sys.exec "rm -f /tmp/rfl_bool_u8_non_nullable.csv")
-(.sys.exec "printf 'b,u\\ntrue,1\\n,\\nfalse,3\\n' > /tmp/rfl_bool_u8_non_nullable.csv")
+(write "/tmp/rfl_bool_u8_non_nullable.csv" "b,u\ntrue,1\n,\nfalse,3\n")
 (set BU (.csv.read [B8 U8] "/tmp/rfl_bool_u8_non_nullable.csv"))
 (count BU)                            -- 3
 (at BU 'b)                            -- [true false false]

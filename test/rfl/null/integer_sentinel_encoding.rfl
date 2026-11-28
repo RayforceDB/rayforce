@@ -18,7 +18,7 @@
 ;; ----- 2. CSV ingest (I64) -----
 
 (.sys.exec "rm -f /tmp/rfl_int_sentinel.csv")
-(.sys.exec "printf 'x\\n10\\n\\n30\\n' > /tmp/rfl_int_sentinel.csv")
+(write "/tmp/rfl_int_sentinel.csv" "x\n10\n\n30\n")
 (set Pi (.csv.read [I64] "/tmp/rfl_int_sentinel.csv"))
 (count Pi)                  -- 3
 (nil? (at (at Pi 'x) 1))    -- true

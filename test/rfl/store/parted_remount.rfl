@@ -46,7 +46,7 @@
 ;; row like 2024.01.03, so its id file fits in place.
 (.db.splayed.set "/tmp/rfl_parted_remount/2024.01.04/t" (table [id s] (list [9] (as 'sym ["h"]))) S)
 (count (.db.parted.get "/tmp/rfl_parted_remount" 't)) -- 6
-(.sys.exec "cp /tmp/rfl_parted_remount/2024.01.04/t/id /tmp/rfl_parted_remount/2024.01.03/t/id") -- 0
+(write-bytes "/tmp/rfl_parted_remount/2024.01.03/t/id" (read-bytes "/tmp/rfl_parted_remount/2024.01.04/t/id"))
 (set T5 (.db.parted.get "/tmp/rfl_parted_remount" 't))
 (count T5) -- 6
 (sum (get T5 'id)) -- 238

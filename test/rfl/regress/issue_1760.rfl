@@ -7,7 +7,7 @@
 ;; global stays one whole value; a vector of one value, or in a projection
 ;; of another length, keeps its per-row reading; in an aggregate another
 ;; length is the length error, as before.
-(.sys.exec "rm -rf /tmp/rf_issue_1760 && mkdir -p /tmp/rf_issue_1760") -- 0
+(.sys.exec "rm -rf /tmp/rf_issue_1760") -- 0
 (set TS [2024.03.01D10:00:00.000 2024.01.05D09:30:00.000 2024.03.01D23:59:00.000 2024.02.07D11:00:00.000])
 (set SS ["a,b" "c" "d,e,f" "g,h"])
 (set t (table [k ts s v] (list [1 2 1 2] TS SS [10 20 30 40])))

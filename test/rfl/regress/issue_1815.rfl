@@ -9,7 +9,7 @@
 ;; Under by: the outputs are left as written, and so is a head that reads
 ;; a name the select binds (an output, a let), and every head of a select
 ;; that can have an effect in any clause.
-(.sys.exec "rm -rf /tmp/rf_issue_1815 && mkdir -p /tmp/rf_issue_1815") -- 0
+(.sys.exec "rm -rf /tmp/rf_issue_1815") -- 0
 (set T (table [g c i] (list ['a 'a 'b 'b 'b 'c 'a 'c 'b 'a] [true false true false true false true true false false] [10 20 30 40 50 60 70 80 90 15])))
 (set D (dict ['r 'f 'l 'x] (list reverse filter (fn [x] (reverse x)) (fn [x] (set zc (+ zc 1)) (reverse x)))))
 (set rf (fn [] reverse))

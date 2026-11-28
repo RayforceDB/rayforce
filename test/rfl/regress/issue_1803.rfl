@@ -6,7 +6,7 @@
 ;; ...)) of such an operand is each group's too.  A free vector as long as
 ;; the table in filter's values or mask is a column, sliced per group (the
 ;; length rule of #1492); a LIST global stays one whole value.
-(.sys.exec "rm -rf /tmp/rf_issue_1803 && mkdir -p /tmp/rf_issue_1803") -- 0
+(.sys.exec "rm -rf /tmp/rf_issue_1803") -- 0
 (set T (table [g c i f k] (list ['a 'a 'b 'b] [true false true false] [10 20 30 40] [1.5 2.5 3.5 4.5] [1 0 1 0])))
 (.db.splayed.set "/tmp/rf_issue_1803/spl/t/" T "/tmp/rf_issue_1803/spl/.sym")
 (set S (.db.splayed.get "/tmp/rf_issue_1803/spl/t/" "/tmp/rf_issue_1803/spl/.sym"))

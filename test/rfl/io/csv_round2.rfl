@@ -27,7 +27,7 @@
 ;; 2. Quoted fields with embedded newline — forces the slow path in
 ;;    build_row_offsets and scan_field_quoted.
 ;; ────────────────────────────────────────────────────────────────────
-(.sys.exec "printf 'a,b\\n\"line1\\nline2\",10\\n\"single\",20\\n' > rf_test_csv_r2_qnl.csv") -- 0
+(write "rf_test_csv_r2_qnl.csv" "a,b\n\"line1\nline2\",10\n\"single\",20\n") -- 0
 (set Qnl (.csv.read [STR I64] "rf_test_csv_r2_qnl.csv"))
 (count Qnl) -- 2
 (at (at Qnl 'a) 1) -- "single"
@@ -48,7 +48,7 @@
 ;; 4. .csv.splayed: load CSV → splayed dir (covers the read+materialize
 ;;    splayed path csv_splayed_writer_open/append/close at csv.c:1834+).
 ;; ────────────────────────────────────────────────────────────────────
-(.sys.exec "printf 'a,b,c\\n1,1.5,alpha\\n2,2.5,beta\\n3,3.5,gamma\\n' > rf_test_csv_r2_sp.csv") -- 0
+(write "rf_test_csv_r2_sp.csv" "a,b,c\n1,1.5,alpha\n2,2.5,beta\n3,3.5,gamma\n") -- 0
 (set Tsp (.csv.splayed "rf_test_csv_r2_sp.csv" "rf_test_csv_r2_splayed/"))
 (count Tsp) -- 3
 (.sys.exec "rm -rf rf_test_csv_r2_splayed/ rf_test_csv_r2_sp.csv") -- 0
@@ -57,14 +57,14 @@
 ;; 5. Trailing comma / no trailing newline — boundary cases for the
 ;;    row scanner (csv_parse_serial + build_row_offsets_limited).
 ;; ────────────────────────────────────────────────────────────────────
-(.sys.exec "printf 'a,b,c\\n1,2,3\\n4,5,6' > rf_test_csv_r2_notrail.csv") -- 0
+(write "rf_test_csv_r2_notrail.csv" "a,b,c\n1,2,3\n4,5,6") -- 0
 (set Tnt (.csv.read [I64 I64 I64] "rf_test_csv_r2_notrail.csv"))
 (count Tnt) -- 2
 (at (at Tnt 'c) 1) -- 6
 (.sys.exec "rm -f rf_test_csv_r2_notrail.csv") -- 0
 
 ;; Empty cells in the middle of a row.
-(.sys.exec "printf 'a,b,c\\n1,,3\\n4,5,\\n' > rf_test_csv_r2_empty.csv") -- 0
+(write "rf_test_csv_r2_empty.csv" "a,b,c\n1,,3\n4,5,\n") -- 0
 (set Tem (.csv.read [I64 I64 I64] "rf_test_csv_r2_empty.csv"))
 (count Tem) -- 2
 ;; Empty integer cells → null (NULL_I64).

@@ -6,7 +6,7 @@
 ;; row by row; one read through map's collection, list's elements, a helper
 ;; or lambda given as a value, or the body of a helper called there, is
 ;; evaluated per group, as with any other length (#1772).
-(.sys.exec "rm -rf /tmp/rf_issue_1832 && mkdir -p /tmp/rf_issue_1832") -- 0
+(.sys.exec "rm -rf /tmp/rf_issue_1832") -- 0
 (set t (table [a c s] (list [1 2 3 4] [100 200 300 400] ['x 'y 'x 'y])))
 (set f (fn [v] (+ v c)))
 (set f2 (fn [x y] (+ x (+ y c))))

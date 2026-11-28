@@ -1,0 +1,15 @@
+;; @requires: posix  (a free port comes from test/serve.sh, run through a POSIX shell)
+;; syscmd_coverage.rfl, the .sys.listen success path: it needs a port no
+;; other suite holds, which test/serve.sh --port finds (#1140).
+(.sys.cmd "rm -f /tmp/rfl_syscmd_cov_port") -- 0
+;; Success path: binds and returns the listener's selector id.  The
+;; listener stays open until rfl_teardown destroys the poll.
+(.sys.exec "test/serve.sh --port > /tmp/rfl_syscmd_cov_port") -- 0
+(set lport (as 'i64 (trim (read "/tmp/rfl_syscmd_cov_port"))))
+(set listen-id (.sys.listen lport))
+(>= listen-id 0)      -- true
+;; Same port again — already bound by us → io.
+(.sys.listen lport)   !- io
+;; and through the .sys.cmd dispatcher (h_listen), a separate path
+(.sys.cmd (format "listen %" lport)) !- io
+(.sys.cmd "rm -f /tmp/rfl_syscmd_cov_port") -- 0

@@ -52,9 +52,10 @@ V -- [10 99 30]
 (msum 1 v) -- [1 2 3 4]
 (msum 0x02 v) -- [1 3 5 7]
 ;; .csv.parted rows per partition
-(.sys.exec "rm -rf /tmp/rf_key_count_types && mkdir -p /tmp/rf_key_count_types && printf 'a,b\n1,2\n3,4\n5,6\n' > /tmp/rf_key_count_types/p.csv")
-(.csv.parted "/tmp/rf_key_count_types/p.csv" 1.5 "/tmp/rf_key_count_types/db1" 't) !- type
-(.csv.parted "/tmp/rf_key_count_types/p.csv" true "/tmp/rf_key_count_types/db2" 't) !- type
-(try (.csv.parted "/tmp/rf_key_count_types/p.csv" 1.5 "/tmp/rf_key_count_types/db1" 't) msg) -- "csv.parted: rows per partition must be an integer, got f64"
-(count (.csv.parted "/tmp/rf_key_count_types/p.csv" 2 "/tmp/rf_key_count_types/db3" 't)) -- 3
-(.sys.exec "rm -rf /tmp/rf_key_count_types")
+(.sys.exec "rm -rf /tmp/rf_key_count_types /tmp/rf_key_count_types_p.csv")
+(write "/tmp/rf_key_count_types_p.csv" "a,b\n1,2\n3,4\n5,6\n")
+(.csv.parted "/tmp/rf_key_count_types_p.csv" 1.5 "/tmp/rf_key_count_types/db1" 't) !- type
+(.csv.parted "/tmp/rf_key_count_types_p.csv" true "/tmp/rf_key_count_types/db2" 't) !- type
+(try (.csv.parted "/tmp/rf_key_count_types_p.csv" 1.5 "/tmp/rf_key_count_types/db1" 't) msg) -- "csv.parted: rows per partition must be an integer, got f64"
+(count (.csv.parted "/tmp/rf_key_count_types_p.csv" 2 "/tmp/rf_key_count_types/db3" 't)) -- 3
+(.sys.exec "rm -rf /tmp/rf_key_count_types /tmp/rf_key_count_types_p.csv")

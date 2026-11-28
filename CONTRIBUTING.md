@@ -197,7 +197,14 @@ a focused subset with:
 A `.rfl` file that needs a POSIX shell or filesystem (fixtures built or
 checked through `.sys.exec`, `/proc`, `/dev/tcp`, …) carries the line
 `;; @requires: posix`; on Windows the runner reports it as `SKIP` rather
-than running it. C tests use `#ifndef RAY_OS_WINDOWS` / `SKIP(...)` for the
+than running it. On Windows `.sys.exec` runs its command through `cmd.exe`,
+so any shell syntax needs the marker: quoting, pipes, redirection, `$(…)`,
+`mkdir -p` (a `cmd.exe` builtin there), `printf`, `test`, or a child
+`./rayforce`. A plain `rm -f` / `rm -rf` of paths as cleanup does not: the
+Windows setup below puts MSYS2's `rm` on `PATH`, and the runner moves every
+`/tmp` path under its own root. Keep the platform-neutral assertions in an
+unmarked file and move the shell checks to a marked one, and write a text
+fixture with `(write path text)` rather than `printf`. C tests use `#ifndef RAY_OS_WINDOWS` / `SKIP(...)` for the
 same purpose. Prefer the shell-free helpers `ray_test_rm_rf` /
 `ray_test_mkdir_p` (`test/test.h`) over `system("rm -rf …")` in C tests.
 

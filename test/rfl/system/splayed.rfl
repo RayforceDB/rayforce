@@ -101,8 +101,9 @@
 ;; GUID is the pointer to its 16-byte payload: a fresh process dereferenced a
 ;; stale address (SIGSEGV), and in the writing process the loaded atom shared
 ;; the source's payload without a reference.  The atom is now written as its
-;; 16 bytes.  The source table is released before the read back, and a second
-;; process reads the same files.  The flat GUID column g is the reference.
+;; 16 bytes.  The source table is released before the read back; a second
+;; process reads the same files in splayed_process.rfl.  The flat GUID column
+;; g is the reference.
 (.sys.exec "rm -rf /tmp/rfl_splayed_guidatom /tmp/rfl_parted_guidatom /tmp/rfl_guidatom_read.rfl")
 (set GA (guid 3))
 (set GT (table [k g a] (list [0 1 2] GA (list (list (at GA 0) 1) (list 2 (list (at GA 1) (as 'GUID 0N))) (list (at GA 2))))))
@@ -123,8 +124,6 @@
 (nil? (last (last (at (at GP 'a) 4)))) -- true
 (set GR 0)
 (set GP 0)
-(.sys.exec "printf '%s\n' '(set R (.db.splayed.get \"/tmp/rfl_splayed_guidatom/\"))' '(set P (.db.parted.get \"/tmp/rfl_parted_guidatom/\" (quote t)))' '(println (and (== (first (at (at R (quote a)) 0)) (at (at R (quote g)) 0)) (== (first (last (at (at R (quote a)) 1))) (at (at R (quote g)) 1)) (nil? (last (last (at (at R (quote a)) 1)))) (== (first (at (at P (quote a)) 5)) (at (at P (quote g)) 2))))' > /tmp/rfl_guidatom_read.rfl") -- 0
-(.sys.exec "./rayforce /tmp/rfl_guidatom_read.rfl </dev/null | grep -qx true") -- 0
 
 ;; A typed-null BOOL/U8 atom carries its null mark in aux[0], which the 8-byte
 ;; atom encoding does not hold, so it reads back as false / 0 (serde keeps it).

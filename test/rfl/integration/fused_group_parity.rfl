@@ -217,7 +217,7 @@
 ;; gate, the fused path would compare local IDs against unrelated
 ;; global-dict strings and the answer would be non-deterministic.
 (.sys.exec "rm -f rf_test_local_dict_sym.csv") -- 0
-(.sys.exec "printf 'name,n\\nzebra,3\\napple,1\\nmango,2\\n' > rf_test_local_dict_sym.csv") -- 0
+(write "rf_test_local_dict_sym.csv" "name,n\nzebra,3\napple,1\nmango,2\n") -- 0
 (set Tld (.csv.read [SYMBOL I64] "rf_test_local_dict_sym.csv"))
 (at (at (select {name: name n: n from: Tld where: (>= n 0) asc: name take: 3}) 'name) 0) -- 'apple
 (at (at (select {name: name n: n from: Tld where: (>= n 0) asc: name take: 3}) 'name) 1) -- 'mango

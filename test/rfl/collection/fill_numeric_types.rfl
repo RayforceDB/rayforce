@@ -55,7 +55,7 @@
 (at (select {from: t r: (fill 2.5 x) where: (> g 0)}) 'r) -- [2 2 3]
 (at (select {from: t r: (sum (fill 2.5 x)) by: g}) 'r) -- [4 3]
 (at (update {x: (fill 2.5 x) from: t}) 'x) -- [2 2 3]
-(.sys.exec "rm -rf /tmp/rf_fill_numeric_types && mkdir -p /tmp/rf_fill_numeric_types")
+(.sys.exec "rm -rf /tmp/rf_fill_numeric_types")
 (.db.splayed.set "/tmp/rf_fill_numeric_types/s/" t)
 (at (select {from: (.db.splayed.get "/tmp/rf_fill_numeric_types/s/") r: (fill 2.5 x)}) 'r) -- [2 2 3]
 (.db.splayed.set "/tmp/rf_fill_numeric_types/p/2024.01.01/t/" t "/tmp/rf_fill_numeric_types/p/.sym")
