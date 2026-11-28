@@ -157,6 +157,20 @@
 (RB (first (at (select {c: (cov x x) from: TB}) 'c)) 8.333333333325e296) -- true
 (RB (first (at (select {c: (scov x x) from: TB by: g}) 'c)) 8.333341666666667e296) -- true
 
+;; pearson_corr takes each side's root apart: vx * vy can pass DBL_MAX or
+;; fall below DBL_MIN where each side does not.  On a release build the
+;; compiler had folded sqrt(vx) * sqrt(vy) into sqrt(vx * vy): these gave 0
+;; and -1, on every route (#1870); 200,010 pairs are within 1e-9 (6*n*u)
+(pearson_corr [0.0 1e100] [0.0 1e100]) -- 1.0
+(< (abs (+ (pearson_corr [0.0 0.0 1e-100] [0.0 1e-100 0.0]) 0.5)) 1e-12) -- true
+(set TP (table [g x y] (list (% (til 200010) 3) (take [0.0 1e100] 200010) (take [0.0 1e100] 200010))))
+(at (select {r: (pearson_corr x y) from: TP}) 'r) -- [1.0]
+(at (select {r: (pearson_corr x y) from: TP by: g}) 'r) -- [1.0 1.0 1.0]
+(set TQ (table [g x y] (list (% (til 200010) 3) (take [0.0 0.0 1e-100] 200010) (take [0.0 1e-100 0.0] 200010))))
+(< (abs (+ (first (at (select {r: (pearson_corr x y) from: TQ}) 'r)) 0.5)) 1e-9) -- true
+(set TQS (table [s x y] (list (.attr.set 'grouped (at ['a 'b] (% (til 200010) 2))) (take [0.0 0.0 1e-100] 200010) (take [0.0 1e-100 0.0] 200010))))
+(< (max (abs (+ (at (select {r: (pearson_corr x y) from: TQS by: s where: (in s ['a 'b])}) 'r) 0.5))) 1e-9) -- true
+
 ;; values from 1e150: a difference, a product or the final correction can
 ;; overflow or cancel, and no answer is promised; they must not fail
 (cov [1e308 -1e308] [0.25 -0.25])
@@ -167,3 +181,92 @@
 (set Y5 (as 'F64 (map (fn [i] (if (in i [0 63]) 0.0 1e8)) I4)))
 (cov X5 Y5)
 (select {c: (cov x y) s: (scov x y) from: (table [g x y] (list (% I4 3) X5 Y5)) by: g})
+
+;; ---- pearson_corr about the running mean (#1870) ----
+
+;; pearson_corr is translation-invariant: shifting both columns by a
+;; constant must not change it.  It was computed from the raw sums,
+;; (n*sxy - sx*sy) / sqrt((n*sxx - sx^2)(n*syy - sy^2)), which cancel to
+;; noise once the values are large next to their spread: 1e8 + [0 1 2 3]
+;; against 7 - 2x gave the null where the answer is -1, by: gave numbers
+;; outside [-1, 1] that changed with the worker count, and a constant 3e38
+;; column gave 1 (#1870).  It now sums about the running mean, on every
+;; route, as cov and scov do.
+(set n 200000)
+(set Y (+ 1e8 (as 'F64 (% (til n) 4))))
+(set Z (- 7.0 (* 2.0 Y)))
+(pearson_corr Y Z) -- -1.0
+(set TY (table [k x y] (list (% (til n) 3) Y Z)))
+(at (select {r: (pearson_corr x y) from: TY by: k}) 'r) -- [-1.0 -1.0 -1.0]
+(at (select {r: (pearson_corr x y) from: TY}) 'r) -- [-1.0]
+(at (select {r: (pearson_corr x y) from: TY by: k where: (> x 0.0)}) 'r) -- [-1.0 -1.0 -1.0]
+(set TH (table [k x y] (list (div (til n) 4) Y Z)))
+(distinct (at (select {r: (pearson_corr x y) from: TH by: k}) 'r)) -- [-1.0]
+
+;; a constant column has no correlation: the null, F32 at 3e38 included
+(pearson_corr (take 3e38e n) (take 3e38e n)) -- 0Nf
+(at (select {r: (pearson_corr x x) from: (table [k x] (list (take 'a n) (take 3e38e n))) by: k}) 'r) -- [0Nf]
+(pearson_corr (take 9223372036854775807 1000) (til 1000)) -- 0Nf
+
+;; integers past 2^53: their differences in integers, so the low bits stay
+(set XI [10000000000000000 10000000000000001 10000000000000002 10000000000000003])
+(pearson_corr XI [0 1 2 3]) -- 1.0
+(pearson_corr XI [0.0 1.0 2.0 3.0]) -- 1.0
+(set TI (table [g x y] (list (take 0 120000) (take XI 120000) (take [0 1 2 3] 120000))))
+(at (select {r: (pearson_corr x y) from: TI}) 'r) -- [1.0]
+(at (select {r: (pearson_corr x y) from: TI by: g}) 'r) -- [1.0]
+(at (select {r: (pearson_corr x y) from: TI by: g where: (>= y 0)}) 'r) -- [1.0]
+
+;; the index-slice route and a parted table
+(set S (take ['a 'b 'c] n))
+(set TS (table [s x y] (list (.attr.set 'grouped S) Y Z)))
+(at (select {r: (pearson_corr x y) from: TS by: s where: (in s ['a 'b])}) 'r) -- [-1.0 -1.0]
+(.sys.exec "rm -rf /tmp/rf_pearson_large")
+(.db.splayed.set "/tmp/rf_pearson_large/2024.01.01/t/" (table [k x y] (list (% (til 1000) 3) (take Y 1000) (take Z 1000))))
+(.db.splayed.set "/tmp/rf_pearson_large/2024.01.02/t/" (table [k x y] (list (% (til 1000) 3) (take Y 1000) (take Z 1000))))
+(set PT (.db.parted.get "/tmp/rf_pearson_large/" 't))
+(at (select {r: (pearson_corr x y) from: PT}) 'r) -- [-1.0]
+(at (select {r: (pearson_corr x y) from: PT by: k}) 'r) -- [-1.0 -1.0 -1.0]
+(.sys.exec "rm -rf /tmp/rf_pearson_large")
+
+;; outliers at rows 0 and 63 among small values leave no pivot far from the
+;; mean: the correlation of x with 2x + 1 is 1
+(set X4 (as 'F64 (map (fn [i] (if (in i [0 63]) 1e8 (as 'F64 (% i 5)))) (til 120000))))
+(< (abs (- (pearson_corr X4 (+ (* 2.0 X4) 1.0)) 1.0)) 1e-12) -- true
+(< (abs (- (first (at (select {r: (pearson_corr x y) from: (table [g x y] (list (take 0 120000) X4 (+ (* 2.0 X4) 1.0))) by: g}) 'r)) 1.0)) 1e-12) -- true
+
+;; too few pairs, and the ordinary case, keep their answers
+(pearson_corr [1.0] [2.0]) -- 0Nf
+(pearson_corr [1 2 3] [2 4 6]) -- 1.0
+(pearson_corr [1 2 3] [5 5 5]) -- 0Nf
+
+;; spreads below about 1e-150 underflow the squares and products: no answer
+;; is promised there (the docs' lower limit); they must not fail, and
+;; pearson_corr is the null where a side's sum of squares about the mean is
+;; below 2^-1000
+(pearson_corr [0.0 1e-200] [0.0 1e-200]) -- 0Nf
+(pearson_corr [0.0 1e-160 2e-160] [0.0 1e-160 3e-160]) -- 0Nf
+;; [0 0 1] * 2^-537 against [0 1 0] is -0.5, which the raw formula found
+;; and the pivoted one missed by a fifth: x^2 / 3 rounded to 0.  The null or
+;; the right answer for 2^-560 to 2^-440, the right one from 2^-499, on the
+;; direct call and by: a key
+(set R (map (fn [k] (pearson_corr (* [0.0 0.0 1.0] (pow 2.0 k)) [0.0 1.0 0.0])) (- (til 121) 560)))
+(all (map (fn [r] (or (nil? r) (< (abs (+ r 0.5)) 1e-12))) R)) -- true
+(distinct (drop R 61)) -- [-0.5]
+(set Q (map (fn [k] (pearson_corr (* [0.0 0.0 1.0] (pow 2.0 k)) (* [0.0 0.0 3.0] (pow 2.0 k)))) (- (til 121) 560)))
+(all (map (fn [r] (or (nil? r) (== r 1.0))) Q)) -- true
+(distinct (drop Q 61)) -- [1.0]
+(set RG (map (fn [k] (first (at (select {r: (pearson_corr x y) from: (table [g x y] (list [0 0 0] (* [0.0 0.0 1.0] (pow 2.0 k)) [0.0 1.0 0.0])) by: g}) 'r))) (- (til 121) 560)))
+(all (map (fn [r] (or (nil? r) (< (abs (+ r 0.5)) 1e-12))) RG)) -- true
+(distinct (drop RG 61)) -- [-0.5]
+(cov [0.0 1e-160 2e-160] [0.0 1e-160 3e-160])
+(select {p: (pearson_corr x y) c: (cov x y) from: (table [g x y] (list [0 0 0] [0.0 1e-160 2e-160] [0.0 1e-160 3e-160])) by: g})
+
+;; a narrow integer side beside a float side takes the float arithmetic,
+;; exact as a double: an I32 column against F64 gives the same correlation
+(set XJ (as 'I32 (% (til 100000) 37)))
+(set YJ (+ 1e8 (* 2.0 (as 'F64 XJ))))
+(pearson_corr XJ YJ) -- 1.0
+(pearson_corr YJ XJ) -- 1.0
+(at (select {r: (pearson_corr x y) from: (table [g x y] (list (% (til 100000) 7) XJ YJ)) by: g}) 'r) -- [1.0 1.0 1.0 1.0 1.0 1.0 1.0]
+

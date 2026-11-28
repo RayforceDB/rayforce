@@ -380,14 +380,16 @@ static inline bool agg_is_binary_agg(uint16_t op) {
            op == OP_WSUM || op == OP_WAVG;
 }
 
-/* cov and scov sum about a pivot pair (#1847) that follows the running
- * mean, so a group of large values close together keeps sums the size of
- * its spread.  pearson_corr, wsum and wavg read the raw sums.
+/* cov, scov (#1847) and pearson_corr (#1870) sum about a pivot pair that
+ * follows the running mean, so a group of large values close together
+ * keeps sums the size of its spread.  wsum and wavg read the raw sums.
  *
  * The state of n pairs: the pivot (pivx, pivy) and the sums of the differences
- * dx = x - pivx, dy = y - pivy: sx = sum dx, sy = sum dy, sxy = sum dx*dy.
+ * dx = x - pivx, dy = y - pivy: sx = sum dx, sy = sum dy, sxy = sum dx*dy, and
+ * for pearson_corr sxx = sum dx^2, syy = sum dy^2.  The helpers take sxx
+ * and syy as pointers, NULL for cov and scov.
  *
- * The pivot starts at the first pair.  At every power of two from 2
+ * The pivot starts at the first pair.  At every power of two from 8
  * (ray_comom_due) it moves to the running mean, pivot + sum/n, and the sums
  * are re-expressed about it exactly (ray_comom_repivot_cold): after the move at
  * the largest power of two up to n the pivot is the mean of at least half
@@ -399,19 +401,23 @@ static inline bool agg_is_binary_agg(uint16_t op) {
  * formed so that no intermediate passes DBL_MAX where the sums do not
  * (ray_comom_cov).
  *
- * Integer mode, per side (RAY_COMOM_IMX, RAY_COMOM_IMY: that side an
- * integer or temporal column): the side's pivot slot holds an int64
+ * Integer mode, per side (RAY_COMOM_IMX, RAY_COMOM_IMY, ray_comom_im):
+ * both sides when both are integer or temporal columns, and beside a float
+ * side a 64-bit integer side only.  The side's pivot slot holds an int64
  * exactly (its bits, ray_comom_pivot_i), first the first value and then the
  * mean rounded to an integer, anywhere in the int64 range, and a difference
  * is taken in integers (one rounding, to the double).  Integer data keeps
  * integer-valued sums, and a constant column, INT64_MAX included, sums
- * exact zeros.  A float side takes its differences in doubles; a mixed pair
- * keeps each side's own arithmetic.
+ * exact zeros.  A float side, and a narrower integer side beside it, takes
+ * its differences in doubles, exact for such an integer.
  *
  * Values from about 1e150 can overflow a difference, a product or the
- * final correction: no answer is promised for them. */
-static inline bool agg_is_cov_agg(uint16_t op) {
-    return op == OP_COV || op == OP_SCOV;
+ * final correction, and spreads below about 1e-150 underflow the products
+ * and squares: no answer is promised at either end, and pearson_corr is the
+ * null where a side's sum of squares about the mean is below 2^-1000 or not
+ * finite (ray_comom_pearson). */
+static inline bool agg_is_comoment_agg(uint16_t op) {
+    return op == OP_COV || op == OP_SCOV || op == OP_PEARSON_CORR;
 }
 
 /* Integer mode for one side's type: an integer or a temporal. */
@@ -421,8 +427,27 @@ static inline bool ray_comom_int_type(int8_t t) {
 }
 #define RAY_COMOM_IMX 1u
 #define RAY_COMOM_IMY 2u
-static inline unsigned ray_comom_im(int8_t tx, int8_t ty) {
+/* A 64-bit integer side (I64, TIMESTAMP, TIMESPAN): its values and their
+ * differences need not fit a double. */
+static inline bool ray_comom_wide_int_type(int8_t t) {
+    return t == RAY_I64 || t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
+}
+/* The pair's per-side integer mode: both sides when both are integers (so
+ * integer data keeps integer-valued sums); beside a float side, only a
+ * 64-bit integer side.  A narrower integer side (I32, I16, U8, BOOL, DATE,
+ * TIME) is exact as a double, and so are its differences, so beside a float
+ * it takes the float arithmetic, at the float's cost (#1870). */
+/* Every integer or temporal side in integer mode, beside a float side too:
+ * the v2 engine's rule, whose integer loops run its scattered wide keys
+ * faster than the float ones. */
+static inline unsigned ray_comom_im_all(int8_t tx, int8_t ty) {
     return (ray_comom_int_type(tx) ? RAY_COMOM_IMX : 0u) | (ray_comom_int_type(ty) ? RAY_COMOM_IMY : 0u);
+}
+static inline unsigned ray_comom_im(int8_t tx, int8_t ty) {
+    bool ix = ray_comom_int_type(tx), iy = ray_comom_int_type(ty);
+    if (ix && iy) return RAY_COMOM_IMX | RAY_COMOM_IMY;
+    return (ix && ray_comom_wide_int_type(tx) ? RAY_COMOM_IMX : 0u) |
+           (iy && ray_comom_wide_int_type(ty) ? RAY_COMOM_IMY : 0u);
 }
 
 /* A state's count with the integer-mode mask in bits 61-62, where the state
@@ -452,33 +477,62 @@ static inline double ray_comom_d_i(int64_t x, double kslot) {
     return (double)((__int128)x - (__int128)k);
 }
 
-/* One pair's differences into the sums. */
-static inline void ray_comom_add(double dx, double dy, double* sx, double* sy, double* sxy) {
+/* One pair's differences into the sums (sxx, syy NULL for cov). */
+/* always_inline: clang left it out of line in the hash rows' per-row loop
+ * once it took the optional squares (+8% keyless cov) */
+static inline __attribute__((always_inline)) void ray_comom_add(double dx, double dy, double* sx,
+                                                                double* sy, double* sxy,
+                                                                double* sxx, double* syy) {
     *sx += dx; *sy += dy; *sxy += dx * dy;
+    if (sxx) *sxx += dx * dx;
+    if (syy) *syy += dy * dy;
 }
 
 /* The arithmetic whose order its argument needs, out of line in
  * src/ops/comom.c, compiled with strict IEEE flags in every profile
  * (#1897): the release profile's -fassociative-math let clang rewrite the
- * correction's overflow-safe form into the one that overflows. */
+ * correction's overflow-safe form into the one that overflows, and
+ * sqrt(vx) * sqrt(vy) into sqrt(vx * vy). */
 /* The counts at which the pivot moves to the running mean: every power of
- * two from 2. */
-static inline bool ray_comom_due(int64_t n) { return n >= 2 && (n & (n - 1)) == 0; }
+ * two from RAY_COMOM_DUE0 = 8.
+ *
+ * Why the bound holds.  After the move at the largest power of two P <= n
+ * the pivot is the mean of the first P >= n/2 pairs, within a standard
+ * deviation of the final mean, so the sums carry the rounding of n terms of
+ * the spread's size: about 3*n*u of it for cov.  Below 8 pairs the pivot
+ * is the first pair, at some distance d from the mean of those m < 8 pairs;
+ * one pair that far makes their variance at least d^2/m, so (d/sigma)^2 <=
+ * m < 8, and the correction sx*sy/n is at most 8 times the spread's size:
+ * it adds about 8u, below the 3*n*u term from n = 3 on.  The first move at
+ * 8 then re-expresses those sums exactly, as every move does.  Starting at
+ * 8 rather than 2 saves three moves a group, most of the moves of a group
+ * of a few dozen pairs (#1870). */
+#define RAY_COMOM_DUE0 8
+static inline bool ray_comom_due(int64_t n) { return n >= RAY_COMOM_DUE0 && (n & (n - 1)) == 0; }
 
 /* At a due count n (a power of two, so sum/n is exact): the pivot moves to
  * the mean of the n pairs, each side's move taken exactly (an integer
  * pivot's in int64 / int128, a float pivot's as hi + lo by TwoSum), and the
- * sums re-expressed about it. */
+ * sums re-expressed about it; sxx, syy NULL for cov and scov.  For a row
+ * loop whose pivot and sums are in memory already. */
 void ray_comom_repivot_cold(unsigned im, double n, double* pivx, double* pivy, double* sx,
-                            double* sy, double* sxy);
+                            double* sy, double* sxy, double* sxx, double* syy);
+/* cov's and scov's (no squares), its arguments all in registers, so a
+ * caller's per-row loop keeps the frame it had without the squares. */
+void ray_comom_repivot_cold3(unsigned im, double n, double* pivx, double* pivy, double* sx,
+                             double* sy, double* sxy);
 /* The same for a row loop that holds its pivot and sums in locals: through
  * a copy, so that the locals are not taken by address by a function in
  * another file, which would keep them in memory for the whole loop. */
 static inline void ray_comom_repivot_local(unsigned im, double n, double* pivx, double* pivy,
-                                           double* sx, double* sy, double* sxy) {
+                                           double* sx, double* sy, double* sxy, double* sxx,
+                                           double* syy) {
     double k0 = *pivx, k1 = *pivy, s0 = *sx, s1 = *sy, s2 = *sxy;
-    ray_comom_repivot_cold(im, n, &k0, &k1, &s0, &s1, &s2);
+    double q0 = sxx ? *sxx : 0.0, q1 = syy ? *syy : 0.0;
+    ray_comom_repivot_cold(im, n, &k0, &k1, &s0, &s1, &s2, sxx ? &q0 : NULL, syy ? &q1 : NULL);
     *pivx = k0; *pivy = k1; *sx = s0; *sy = s1; *sxy = s2;
+    if (sxx) *sxx = q0;
+    if (syy) *syy = q1;
 }
 
 /* The source state (ns pairs) into the destination (nd pairs): the smaller
@@ -486,15 +540,32 @@ static inline void ray_comom_repivot_local(unsigned im, double n, double* pivx, 
  * the next due count moves the merged pivot as usual.  The larger part's
  * pivot lies within about its own standard deviation of its mean, and that
  * mean within sqrt(ns/nd) standard deviations of the merged one.  The
- * caller adds the counts. */
+ * caller adds the counts.  sxx, syy NULL for cov and scov. */
 void ray_comom_merge(unsigned im, double nd, double* pivx, double* pivy, double* sx, double* sy,
-                     double* sxy, double ns, double kxs, double kys, double sxs, double sys,
-                     double sxys);
+                     double* sxy, double* sxx, double* syy, double ns, double kxs, double kys,
+                     double sxs, double sys, double sxys, double sxxs, double syys);
 
-/* The finaliser: (sxy - sx*sy/n) / div, cov's (div n) and scov's (div
- * n - 1), with the correction formed so that no intermediate passes DBL_MAX
- * where the sums do not. */
+/* The finaliser of cov (div n) and scov (div n - 1): (sxy - sx*sy/n) / div,
+ * the correction formed so that no intermediate passes DBL_MAX where the
+ * sums do not. */
 double ray_comom_cov(double dn, double sx, double sy, double sxy, double div);
+
+/* pearson_corr of n pairs from their sums of differences about any pivot:
+ * (sxy - sx*sy/n) / sqrt((sxx - sx^2/n) * (syy - sy^2/n)), each correction
+ * formed as cov's is and the root of each side taken apart, so no
+ * intermediate passes DBL_MAX where the sums do not.  A side with no
+ * spread (a constant column, or fewer than two pairs) is NaN, the null.
+ *
+ * So is a side whose sum of squares about the mean, vx or vy, is below
+ * RAY_COMOM_PEARSON_MIN or not finite.  Every product and quotient that
+ * falls into the subnormals rounds by up to 2^-1075 on top of its relative
+ * rounding, at most about 2n+4 of them per sum; above 2^-1000 that adds
+ * under 2^-20 of the 6*n*u bound, and below it the sums can be wrong in
+ * their leading digits (x^2/n of x = 2^-537 rounds to 0).  Overflowed sums
+ * are inf or NaN.  Neither has a right answer to give, so neither gives
+ * one. */
+#define RAY_COMOM_PEARSON_MIN 0x1p-1000
+double ray_comom_pearson(double dn, double sx, double sy, double sxx, double syy, double sxy);
 
 static inline bool agg_is_truth_agg(uint16_t op) {
     return op == OP_ALL || op == OP_ANY;

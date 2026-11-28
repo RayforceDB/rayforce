@@ -7324,7 +7324,11 @@ static test_result_t test_plan_alloc_fail(void) {
         NULL, NULL, NULL, NULL, NULL,
         "(all (== (ser (select {from: Q asc: k})) (ser (select {from: R0 asc: k}))))",
         NULL, NULL,
-        "(all (== (ser (select {from: Q asc: j})) (ser (select {from: R0 asc: j}))))",
+        /* pearson_corr sums about each route's running mean (#1870): the
+         * same keys, nulls in the same places, the values to 1e-12 */
+        "(and (all (== (at (select {from: Q asc: j}) 'j) (at (select {from: R0 asc: j}) 'j))) "
+        "(all (== (nil? (at (select {from: Q asc: j}) 'c)) (nil? (at (select {from: R0 asc: j}) 'c)))) "
+        "(all (< (abs (- (at (select {from: Q asc: j}) 'c) (at (select {from: R0 asc: j}) 'c))) 1e-12)))",
         NULL, NULL,
     };
     aw_eval_ok("(set D (dict ['f] (list neg)))");   /* a computed call head: rewritten to its name */

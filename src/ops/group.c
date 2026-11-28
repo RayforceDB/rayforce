@@ -5904,13 +5904,15 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
             af2 |= GHT_AF2_VAR;
             out->need_flags |= GHT_NEED_VARK;
         }
-        if (agg_ops && vslot >= 0 && agg_is_cov_agg(agg_ops[a])) {
+        if (agg_ops && vslot >= 0 && agg_is_comoment_agg(agg_ops[a])) {
             af2 |= GHT_AF2_COMOM;
+            if (agg_ops[a] == OP_PEARSON_CORR) af2 |= GHT_AF2_COMOM_SQ;
             out->need_flags |= GHT_NEED_VARK;
             /* a mixed pair keeps its integer side's int64 (#1847) */
             if ((af & GHT_AF_F64) && agg_vecs[a] && agg_vecs2 && agg_vecs2[a]) {
-                if (ray_comom_int_type(agg_vecs[a]->type))  af2 |= GHT_AF2_X_I64;
-                if (ray_comom_int_type(agg_vecs2[a]->type)) af2 |= GHT_AF2_Y_I64;
+                unsigned im = ray_comom_im(agg_vecs[a]->type, agg_vecs2[a]->type);
+                if (im & RAY_COMOM_IMX) af2 |= GHT_AF2_X_I64;
+                if (im & RAY_COMOM_IMY) af2 |= GHT_AF2_Y_I64;
             }
         }
         if (vslot >= 0 && agg_vecs[a]) {
@@ -6724,7 +6726,7 @@ static inline void init_accum_from_entry(char* row, const char* entry,
             double xy = x * y;
             memcpy(row + ly->off_sumxy   + s * 8, &xy, 8);
             if (aflags2[a] & GHT_AF2_COMOM) {
-                /* cov / scov about the opening pair (#1847): it is the
+                /* cov / scov / pearson_corr about the opening pair (#1847): it is the
                  * pivot (an integer pair's exactly, ray_comom_pivot_i), so
                  * the sums start at 0 */
                 double pivx, pivy, dx = 0.0, dy = 0.0;
@@ -6738,6 +6740,10 @@ static inline void init_accum_from_entry(char* row, const char* entry,
                 memcpy(row + ly->off_sum + s * 8, &dx, 8);
                 memcpy(row + ly->off_sum_y + s * 8, &dy, 8);
                 memcpy(row + ly->off_sumxy + s * 8, &dxy, 8);
+                if (aflags2[a] & GHT_AF2_COMOM_SQ) {
+                    memcpy(row + ly->off_sumsq + s * 8, &dxy, 8);    /* 0 */
+                    memcpy(row + ly->off_sumsq_y + s * 8, &dxy, 8);
+                }
             }
         }
         /* Seed per-slot row-index bounds with the row that opened this
@@ -6778,7 +6784,7 @@ static inline void ght_var_add(char* row, const ght_layout_t* ly, int8_t s, uint
     }
 }
 
-/* A cov / scov pair (GHT_AF2_COMOM, #1847) at slots s, s+1 of an entry into
+/* A cov / scov / pearson_corr pair (GHT_AF2_COMOM, #1847) at slots s, s+1 of an entry into
  * slot s of an HT row, the n-th pair of the slot: about the row's pivot in
  * off_var_k (slots s, s+1), which the first pair seeds and each due count
  * moves to the running mean (ray_comom_repivot_cold); an integer pair's (no
@@ -6790,8 +6796,8 @@ static inline unsigned ght_comom_im(uint8_t af, uint8_t af2) {
     return ((af2 & GHT_AF2_X_I64) ? RAY_COMOM_IMX : 0u) | ((af2 & GHT_AF2_Y_I64) ? RAY_COMOM_IMY : 0u);
 }
 static inline __attribute__((always_inline)) void
-ght_comom_add(char* row, const ght_layout_t* ly, int8_t s, uint8_t af, uint8_t af2,
-              const char* agg_data, int64_t n) {
+ght_comom_add_sq(char* row, const ght_layout_t* ly, int8_t s, uint8_t af, uint8_t af2,
+                 const char* agg_data, int64_t n, const bool sq) {
     double* pivx = &ROW_WR_F64(row, ly->off_var_k, s);
     double* pivy = &ROW_WR_F64(row, ly->off_var_k, s + 1);
     double dx, dy, cx, cy;   /* the pair: a double, or an int64's bits per side */
@@ -6804,9 +6810,21 @@ ght_comom_add(char* row, const ght_layout_t* ly, int8_t s, uint8_t af, uint8_t a
     double* sx = &ROW_WR_F64(row, ly->off_sum, s);
     double* sy = &ROW_WR_F64(row, ly->off_sum_y, s);
     double* sxy = &ROW_WR_F64(row, ly->off_sumxy, s);
-    ray_comom_add(dx, dy, sx, sy, sxy);
-    if (RAY_UNLIKELY(ray_comom_due(n)))
-        ray_comom_repivot_cold(im, (double)n, pivx, pivy, sx, sy, sxy);
+    double* sxx = sq ? &ROW_WR_F64(row, ly->off_sumsq, s) : NULL;
+    double* syy = sq ? &ROW_WR_F64(row, ly->off_sumsq_y, s) : NULL;
+    ray_comom_add(dx, dy, sx, sy, sxy, sxx, syy);
+    if (RAY_UNLIKELY(ray_comom_due(n))) {
+        if (sq) ray_comom_repivot_cold(im, (double)n, pivx, pivy, sx, sy, sxy, sxx, syy);
+        else    ray_comom_repivot_cold3(im, (double)n, pivx, pivy, sx, sy, sxy);
+    }
+}
+/* cov and scov (no squares) and pearson_corr (GHT_AF2_COMOM_SQ) each with
+ * its own copy of the row step, the squares' test out of it */
+static inline __attribute__((always_inline)) void
+ght_comom_add(char* row, const ght_layout_t* ly, int8_t s, uint8_t af, uint8_t af2,
+              const char* agg_data, int64_t n) {
+    if (af2 & GHT_AF2_COMOM_SQ) ght_comom_add_sq(row, ly, s, af, af2, agg_data, n, true);
+    else                        ght_comom_add_sq(row, ly, s, af, af2, agg_data, n, false);
 }
 
 /* Accumulate into existing group from entry's inline agg values */
@@ -8628,8 +8646,8 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                              * NaN (canonicalize folds to null upstream). */
                             if ((op == OP_PEARSON_CORR || op == OP_SCOV) && nn < 2) { v = NULL_F64; grp_set_null(ao->vec, di); break; }
                             if ((op == OP_COV || op == OP_WAVG) && nn < 1) { v = NULL_F64; grp_set_null(ao->vec, di); break; }
-                            /* a cov / scov slot sums doubles whatever its types (#1847) */
-                            double sx  = sf || agg_is_cov_agg(op) ? ROW_RD_F64(row, ly->off_sum, s)
+                            /* a co-moment slot sums doubles whatever its types (#1847) */
+                            double sx  = sf || agg_is_comoment_agg(op) ? ROW_RD_F64(row, ly->off_sum, s)
                                             : (double)ROW_RD_I64(row, ly->off_sum, s);
                             double sxx = ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0;
                             double sy  = ly->off_sum_y   ? ROW_RD_F64(row, ly->off_sum_y,   s) : 0.0;
@@ -8641,15 +8659,12 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                              * count otherwise.  cnt here would overcount and
                              * skew pearson/cov whenever the group has nulls. */
                             double dn  = (double)nn;
-                            double num = dn * sxy - sx * sy;
-                            double dx  = dn * sxx - sx * sx;
-                            double dy  = dn * syy - sy * sy;
                             if (op == OP_WSUM) { v = sxy; break; }
                             if (op == OP_WAVG) { if (sx == 0.0) { v = NULL_F64; break; } v = sxy / sx; break; }
                             if (op == OP_COV) { v = ray_comom_cov(dn, sx, sy, sxy, dn); break; }
                             if (op == OP_SCOV) { v = ray_comom_cov(dn, sx, sy, sxy, dn - 1.0); break; }
-                            if (dx <= 0.0 || dy <= 0.0) { v = NULL_F64; break; }
-                            v = num / sqrt(dx * dy);
+                            /* about the slot's pivot (#1870); a side with no spread is NaN */
+                            v = ray_comom_pearson(dn, sx, sy, sxx, syy, sxy);
                             break;
                         }
                         default: v = 0.0; break;
@@ -9683,10 +9698,11 @@ static inline void da_var_merge(da_accum_t* dst, size_t di, da_accum_t* src, siz
     src->sumsq_f64[si] = 0;
 }
 
-/* A cov / scov slot (#1847) si of src into di
- * of dst: src's sums re-expressed about dst's pair (ray_comom_merge), then
- * left zero, as da_var_merge leaves them, for the merge that adds the rest. */
-static void da_comom_merge(da_accum_t* dst, size_t di, da_accum_t* src, size_t si) {
+/* A cov / scov / pearson_corr slot (#1847, #1870) si of src into di of
+ * dst: src's sums re-expressed about dst's pair (ray_comom_merge), with the
+ * squares when sq, then left zero, as da_var_merge leaves them, for the
+ * merge that adds the rest. */
+static void da_comom_merge(da_accum_t* dst, size_t di, da_accum_t* src, size_t si, bool sq) {
     int64_t ns = src->var_n[si] & RAY_COMOM_N_MASK;
     if (ns == 0) return;
     int64_t nd = dst->var_n[di] & RAY_COMOM_N_MASK;
@@ -9694,14 +9710,17 @@ static void da_comom_merge(da_accum_t* dst, size_t di, da_accum_t* src, size_t s
     double kxd = 0.0, kxs;
     if (nd) memcpy(&kxd, &dst->var_k[di], sizeof kxd);
     memcpy(&kxs, &src->var_k[si], sizeof kxs);
+    sq = sq && dst->sumsq_f64 && src->sumsq_f64;
     ray_comom_merge(im, (double)nd, &kxd, &dst->cov_ky[di], &dst->sum[di].f, &dst->sum_y[di],
-                    &dst->sumxy[di], (double)ns, kxs, src->cov_ky[si], src->sum[si].f,
-                    src->sum_y[si], src->sumxy[si]);
+                    &dst->sumxy[di], sq ? &dst->sumsq_f64[di] : NULL, sq ? &dst->sumsq_y[di] : NULL,
+                    (double)ns, kxs, src->cov_ky[si], src->sum[si].f, src->sum_y[si],
+                    src->sumxy[si], sq ? src->sumsq_f64[si] : 0.0, sq ? src->sumsq_y[si] : 0.0);
     memcpy(&dst->var_k[di], &kxd, sizeof kxd);
     dst->var_n[di] = RAY_COMOM_N_IM(im) | (nd + ns);
     src->sum[si].f = 0;
     src->sum_y[si] = 0;
     src->sumxy[si] = 0;
+    if (sq) { src->sumsq_f64[si] = 0; src->sumsq_y[si] = 0; }
 }
 
 /* Every variance-family and co-moment slot of slots [lo, hi) (n_aggs per
@@ -9714,8 +9733,8 @@ static void da_var_merge_slots(da_accum_t* dst, da_accum_t* src, size_t lo, size
         for (uint32_t a = 0; a < n_aggs; a++) {
             if (agg_op_is_var(ops[a]))
                 da_var_merge(dst, sl * n_aggs + a, src, sl * n_aggs + a, group_fp_type(types[a]));
-            else if (comom && agg_is_cov_agg(ops[a]))
-                da_comom_merge(dst, sl * n_aggs + a, src, sl * n_aggs + a);
+            else if (comom && agg_is_comoment_agg(ops[a]))
+                da_comom_merge(dst, sl * n_aggs + a, src, sl * n_aggs + a, ops[a] == OP_PEARSON_CORR);
         }
 }
 
@@ -9942,13 +9961,9 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                         double dn = (double)cnt;
                         if (agg_op == OP_COV) { v = ray_comom_cov(dn, sx, sy, sxy, dn); break; }
                         if (agg_op == OP_SCOV) { v = ray_comom_cov(dn, sx, sy, sxy, dn - 1.0); break; }
-                        double num = dn * sxy - sx * sy;
-                        double dx = dn * sxx - sx * sx;
-                        double dy = dn * syy - sy * sy;
-                        if (dx <= 0.0 || dy <= 0.0) {
-                            v = NULL_F64; ray_vec_set_null(new_col, gi, true); break;
-                        }
-                        v = num / sqrt(dx * dy);
+                        /* about the slot's pivot (#1870); a side with no spread is the null */
+                        v = ray_comom_pearson(dn, sx, sy, sxx, syy, sxy);
+                        if (v != v) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); }
                         break;
                     }
                     default:     v = 0.0; break;
@@ -12408,28 +12423,33 @@ RAY_INLINE void da_accum_row_body(da_ctx_t* c, da_accum_t* acc, int32_t gid, int
             double yval = y_is_f ? yv : (double)yi;
             bool y_null = y_is_f ? !(yval == yval) : false;
             if (RAY_LIKELY(!is_null && !y_null)) {
-                if (acc->cov_ky && agg_is_cov_agg(op)) {
-                    /* about the slot's pivot (#1847): an integer side's
+                if (acc->cov_ky && agg_is_comoment_agg(op)) {
+                    /* about the slot's pivot (#1847, #1870): an integer side's
                      * differences in integers, the per-side mode in var_n
                      * (RAY_COMOM_N_IM) */
-                    unsigned im = (is_f ? 0u : RAY_COMOM_IMX) | (y_is_f ? 0u : RAY_COMOM_IMY);
+                    unsigned im = ray_comom_im(c->agg_types[a], c->agg_types2[a]);
+                    bool fx = !(im & RAY_COMOM_IMX), fy = !(im & RAY_COMOM_IMY);
                     double pivx;
                     int64_t* vn = &acc->var_n[idx];
                     if (*vn == 0) {
-                        pivx = is_f ? xv : ray_comom_pivot_i(iv);
-                        acc->cov_ky[idx] = y_is_f ? yval : ray_comom_pivot_i(yi);
+                        pivx = fx ? xv : ray_comom_pivot_i(iv);
+                        acc->cov_ky[idx] = fy ? yval : ray_comom_pivot_i(yi);
                         memcpy(&acc->var_k[idx], &pivx, sizeof pivx);
                         *vn = RAY_COMOM_N_IM(im);
                     }
                     int64_t vc = (++*vn) & RAY_COMOM_N_MASK;
                     memcpy(&pivx, &acc->var_k[idx], sizeof pivx);
                     double pivy = acc->cov_ky[idx];
-                    double dx = is_f ? xv - pivx : ray_comom_d_i(iv, pivx);
-                    double dy = y_is_f ? yval - pivy : ray_comom_d_i(yi, pivy);
-                    ray_comom_add(dx, dy, &acc->sum[idx].f, &acc->sum_y[idx], &acc->sumxy[idx]);
+                    double dx = fx ? xv - pivx : ray_comom_d_i(iv, pivx);
+                    double dy = fy ? yval - pivy : ray_comom_d_i(yi, pivy);
+                    bool sq = op == OP_PEARSON_CORR && acc->sumsq_f64;
+                    double* pxx = sq ? &acc->sumsq_f64[idx] : NULL;
+                    double* pyy = sq ? &acc->sumsq_y[idx] : NULL;
+                    ray_comom_add(dx, dy, &acc->sum[idx].f, &acc->sum_y[idx], &acc->sumxy[idx], pxx, pyy);
                     if (RAY_UNLIKELY(ray_comom_due(vc))) {
                         ray_comom_repivot_cold(im, (double)vc, &pivx, &acc->cov_ky[idx],
-                                               &acc->sum[idx].f, &acc->sum_y[idx], &acc->sumxy[idx]);
+                                               &acc->sum[idx].f, &acc->sum_y[idx], &acc->sumxy[idx],
+                                               pxx, pyy);
                         memcpy(&acc->var_k[idx], &pivx, sizeof pivx);
                     }
                 } else {
@@ -15638,32 +15658,41 @@ static inline void sg_pair_accum(ray_t* x, ray_t* y, uint16_t op,
  * pivot held in locals.  The slice path admits no null. */
 static void sg_comom_accum(ray_t* x, ray_t* y, const int64_t* rows, int64_t n, bool contig,
                            int64_t r0, double* kxo, double* kyo, double* sx, double* sy,
-                           double* sxy) {
+                           double* sxy, double* sxx, double* syy) {
     unsigned im = ray_comom_im(x->type, y->type);
     bool imx = (im & RAY_COMOM_IMX) != 0, imy = (im & RAY_COMOM_IMY) != 0;
     bool f64 = x->type == RAY_F64 && y->type == RAY_F64;
     const void* xd = ray_data(x);
     const void* yd = ray_data(y);
-    double ax = 0.0, ay = 0.0, axy = 0.0, pivx = 0.0, pivy = 0.0;
+    double ax = 0.0, ay = 0.0, axy = 0.0, axx = 0.0, ayy = 0.0, pivx = 0.0, pivy = 0.0;
+    bool sq = sxx != NULL;
     if (n > 0) {
         int64_t rk = contig ? r0 : rows[0];
         pivx = imx ? ray_comom_pivot_i(read_col_i64(xd, rk, x->type, x->attrs)) : sg_num_at(x, rk);
         pivy = imy ? ray_comom_pivot_i(read_col_i64(yd, rk, y->type, y->attrs)) : sg_num_at(y, rk);
     }
-    #define SG_COMOM_SEG(ROW) do {                                                   \
+    #define SG_COMOM_SEG1(ROW, SQ) do {                                              \
         for (int64_t j_ = j; j_ < e; j_++) {                                         \
             int64_t r = contig ? r0 + j_ : rows[j_];                                 \
             double dx, dy;                                                           \
             ROW;                                                                     \
             ax += dx; ay += dy; axy += dx * dy;                                      \
+            if (SQ) { axx += dx * dx; ayy += dy * dy; }                              \
         }                                                                            \
     } while (0)
+    #define SG_COMOM_SEG(ROW) do {                                                   \
+        if (sq) SG_COMOM_SEG1(ROW, 1); else SG_COMOM_SEG1(ROW, 0);                   \
+    } while (0)
     for (int64_t j = 0; j < n; ) {
-        int64_t due = j ? 2 * j : 2, e = due < n ? due : n;
+        int64_t due = j ? 2 * j : RAY_COMOM_DUE0, e = due < n ? due : n;
         if (f64) {
             const double* xf = (const double*)xd;
             const double* yf = (const double*)yd;
             SG_COMOM_SEG((dx = xf[r] - pivx, dy = yf[r] - pivy));
+        } else if (x->type == RAY_F64 && y->type == RAY_I32 && !im) {
+            const double* xf = (const double*)xd;
+            const int32_t* yi = (const int32_t*)yd;
+            SG_COMOM_SEG((dx = xf[r] - pivx, dy = (double)yi[r] - pivy));
         } else if (im) {
             SG_COMOM_SEG((dx = imx ? ray_comom_d_i(read_col_i64(xd, r, x->type, x->attrs), pivx)
                                : sg_num_at(x, r) - pivx,
@@ -15673,11 +15702,15 @@ static void sg_comom_accum(ray_t* x, ray_t* y, const int64_t* rows, int64_t n, b
             SG_COMOM_SEG((dx = sg_num_at(x, r) - pivx, dy = sg_num_at(y, r) - pivy));
         }
         j = e;
-        if (j == due) ray_comom_repivot_local(im, (double)j, &pivx, &pivy, &ax, &ay, &axy);
+        if (j == due)
+            ray_comom_repivot_local(im, (double)j, &pivx, &pivy, &ax, &ay, &axy,
+                                   sq ? &axx : NULL, sq ? &ayy : NULL);
     }
     #undef SG_COMOM_SEG
+    #undef SG_COMOM_SEG1
     *kxo = pivx; *kyo = pivy;
     *sx = ax; *sy = ay; *sxy = axy;
+    if (sq) { *sxx = axx; *syy = ayy; }
 }
 
 /* The value a slice's VAR/STDDEV sums are taken about (#1666): its first
@@ -15722,11 +15755,12 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
             uint16_t op = c->agg_ops[a];
             if (agg_is_binary_agg(op)) {
                 double sx = 0.0, sy = 0.0, sxx = 0.0, syy = 0.0, sxy = 0.0;
-                if (agg_is_cov_agg(op) && c->partial_k)
+                if (agg_is_comoment_agg(op) && c->partial_k)
                     /* about the task's own pivot; the fold re-centres (#1847) */
                     sg_comom_accum(c->agg_vecs[a], c->agg_vecs2[a], rows, n, contig, r0,
                                    &c->partial_k[2 * idx], &c->partial_k[2 * idx + 1],
-                                   &sx, &sy, &sxy);
+                                   &sx, &sy, &sxy, op == OP_PEARSON_CORR ? &sxx : NULL,
+                                   op == OP_PEARSON_CORR ? &syy : NULL);
                 else
                     sg_pair_accum(c->agg_vecs[a], c->agg_vecs2[a], op, rows, n,
                                   contig, r0, &sx, &sy, &sxx, &syy, &sxy);
@@ -16238,14 +16272,17 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 size_t di = (size_t)gi * n_aggs + a;
                 size_t si = (size_t)ti * n_aggs + a;
                 bool pair = agg_is_binary_agg(ext->agg_ops[a]);
-                if (pair && agg_is_cov_agg(ext->agg_ops[a])) {
+                if (pair && agg_is_comoment_agg(ext->agg_ops[a])) {
                     /* re-centred onto the larger part's pivot (#1847) */
                     double ns = (double)(tasks[ti].hi - tasks[ti].lo);
                     double nd = (double)counts[gi] - ns;
                     unsigned im = ray_comom_im(agg_vecs[a]->type, agg_vecs2[a]->type);
+                    bool sq = ext->agg_ops[a] == OP_PEARSON_CORR && sumsq && sumsq_y;
                     ray_comom_merge(im, nd, &grp_k[2 * di], &grp_k[2 * di + 1], &sums[di].f, &sum_y[di],
-                                    &sumxy[di], ns, part_k[2 * si], part_k[2 * si + 1],
-                                    partials[si].f, part_sum_y[si], part_sumxy[si]);
+                                    &sumxy[di], sq ? &sumsq[di] : NULL, sq ? &sumsq_y[di] : NULL,
+                                    ns, part_k[2 * si], part_k[2 * si + 1],
+                                    partials[si].f, part_sum_y[si], part_sumxy[si],
+                                    sq ? part_sumsq[si] : 0.0, sq ? part_sumsq_y[si] : 0.0);
                     continue;
                 }
                 if (pair || prod[a].enabled || ext->agg_ops[a] == OP_COUNT ||
@@ -19634,7 +19671,7 @@ da_path:;
                 else if (agg_is_binary_agg(aop)) {
                     need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; need_flags |= DA_NEED_PAIR;
                     /* a cov / scov slot keeps its pair in var_k/cov_ky (#1847) */
-                    if (agg_is_cov_agg(aop)) { need_flags |= DA_NEED_VARK; da_need_comom = true; }
+                    if (agg_is_comoment_agg(aop)) { need_flags |= DA_NEED_VARK; da_need_comom = true; }
                 }
                 else if (aop == OP_MIN) need_flags |= DA_NEED_MIN;
                 else if (aop == OP_MAX) need_flags |= DA_NEED_MAX;
@@ -23298,8 +23335,8 @@ sequential_fallback:;
                     case OP_WAVG: {
                         if ((agg_op == OP_PEARSON_CORR || agg_op == OP_SCOV) && nn < 2) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
                         if ((agg_op == OP_COV || agg_op == OP_WAVG) && nn < 1) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
-                        /* a cov / scov slot sums doubles whatever its types (#1847) */
-                        double sx  = is_f64 || agg_is_cov_agg(agg_op) ? ROW_RD_F64(row, ly->off_sum, s)
+                        /* a co-moment slot sums doubles whatever its types (#1847) */
+                        double sx  = is_f64 || agg_is_comoment_agg(agg_op) ? ROW_RD_F64(row, ly->off_sum, s)
                                             : (double)ROW_RD_I64(row, ly->off_sum, s);
                         double sxx = ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0;
                         double sy  = ly->off_sum_y   ? ROW_RD_F64(row, ly->off_sum_y,   s) : 0.0;
@@ -23308,15 +23345,12 @@ sequential_fallback:;
                         /* Divisor = number of accumulated (x,y) pairs (see the
                          * radix emitter): nn on nullable layouts, cnt otherwise. */
                         double dn  = (double)nn;
-                        double num = dn * sxy - sx * sy;
-                        double dx  = dn * sxx - sx * sx;
-                        double dy  = dn * syy - sy * sy;
                         if (agg_op == OP_WSUM) { v = sxy; break; }
                         if (agg_op == OP_WAVG) { if (sx == 0.0) { v = NULL_F64; break; } v = sxy / sx; break; }
                         if (agg_op == OP_COV) { v = ray_comom_cov(dn, sx, sy, sxy, dn); break; }
                         if (agg_op == OP_SCOV) { v = ray_comom_cov(dn, sx, sy, sxy, dn - 1.0); break; }
-                        if (dx <= 0.0 || dy <= 0.0) { v = NULL_F64; break; }
-                        v = num / sqrt(dx * dy);
+                        /* about the slot's pivot (#1870); a side with no spread is NaN */
+                        v = ray_comom_pearson(dn, sx, sy, sxx, syy, sxy);
                         break;
                     }
                     default: v = 0.0; break;
