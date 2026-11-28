@@ -750,7 +750,7 @@ static inline int64_t cov_read_i64(const ray_valid_t* v, int64_t i) {
  * value an int64. */
 #define COV_SIDE_K(v, I) ((I) ? ray_comom_pivot_i((int64_t)(v)) : (double)(v))
 #define COV_SIDE_D(v, k, I) ((I) ? ray_comom_d_i((int64_t)(v), (k)) : (double)(v) - (k))
-#define COV_STATE_ROW(st, xi, yi, XI, YI) do {                                       \
+#define COV_STATE_ROW(st, xi, yi, XI, YI, SXX, SYY) do {                             \
     if ((st)->n == 0) {                                                              \
         (st)->pivx = COV_SIDE_K(xi, XI);                                               \
         (st)->pivy = COV_SIDE_K(yi, YI);                                               \
@@ -758,12 +758,12 @@ static inline int64_t cov_read_i64(const ray_valid_t* v, int64_t i) {
     }                                                                                \
     double dx_ = COV_SIDE_D(xi, (st)->pivx, XI);                                       \
     double dy_ = COV_SIDE_D(yi, (st)->pivy, YI);                                       \
-    ray_comom_add(dx_, dy_, &(st)->sx, &(st)->sy, &(st)->sxy);                       \
+    ray_comom_add(dx_, dy_, &(st)->sx, &(st)->sy, &(st)->sxy, SXX, SYY);             \
     int64_t c_ = (++(st)->n) & RAY_COMOM_N_MASK;                                     \
     if (RAY_UNLIKELY(ray_comom_due(c_)))                                             \
         ray_comom_repivot_cold(((XI) ? RAY_COMOM_IMX : 0u) | ((YI) ? RAY_COMOM_IMY : 0u), \
                                (double)c_, &(st)->pivx, &(st)->pivy,                     \
-                               &(st)->sx, &(st)->sy, &(st)->sxy);                    \
+                               &(st)->sx, &(st)->sy, &(st)->sxy, SXX, SYY);          \
 } while (0)
 
 /* One side's element `i`: an int64 (integer mode) or a double. */
@@ -771,7 +771,8 @@ static inline int64_t cov_read_i64(const ray_valid_t* v, int64_t i) {
 #define COV_RF(val, i) pearson_read_f64((val), (i))
 /* The pairs of a batch whose sides are both valid: ROW(i, x, y), each side
  * read by its reader RX / RY (a tight loop for null-free I64, F64 and F32
- * pairs of one type, and F64 with I32 or I64 either way round). */
+ * pairs of one type, F64 with I32 either way round in either mode, and
+ * F64 with I64 either way round, the I64 side in integer mode). */
 #define PAIR_FOR_EACH(valx, valy, n, RX, RY, TIGHT, ROW) do {                        \
     bool nn_ = !(valx)->has_nulls && !(valy)->has_nulls;                            \
     if (TIGHT == 1 && nn_ && (valx)->type == RAY_I64 && (valy)->type == RAY_I64) {   \
@@ -783,6 +784,12 @@ static inline int64_t cov_read_i64(const ray_valid_t* v, int64_t i) {
     } else if (TIGHT == 2 && nn_ && (valx)->type == RAY_F32 && (valy)->type == RAY_F32) { \
         const float* xd_ = (valx)->base; const float* yd_ = (valy)->base;           \
         for (int64_t i = 0; i < (n); i++) ROW(i, (double)xd_[i], (double)yd_[i]);    \
+    } else if (TIGHT == 2 && nn_ && (valx)->type == RAY_F64 && (valy)->type == RAY_I32) { \
+        const double* xd_ = (valx)->base; const int32_t* yd_ = (valy)->base;        \
+        for (int64_t i = 0; i < (n); i++) ROW(i, xd_[i], (double)yd_[i]);            \
+    } else if (TIGHT == 2 && nn_ && (valx)->type == RAY_I32 && (valy)->type == RAY_F64) { \
+        const int32_t* xd_ = (valx)->base; const double* yd_ = (valy)->base;        \
+        for (int64_t i = 0; i < (n); i++) ROW(i, (double)xd_[i], yd_[i]);            \
     } else if (TIGHT == 3 && nn_ && (valx)->type == RAY_F64 && (valy)->type == RAY_I32) { \
         const double* xd_ = (valx)->base; const int32_t* yd_ = (valy)->base;        \
         for (int64_t i = 0; i < (n); i++) ROW(i, xd_[i], (int64_t)yd_[i]);           \
@@ -805,57 +812,78 @@ static inline int64_t cov_read_i64(const ray_valid_t* v, int64_t i) {
     }                                                                                \
 } while (0)
 
-static void cov_update2(void* base, size_t stride, const uint32_t* gids,
-                        const void* vx, const void* vy,
-                        const ray_valid_t* valx, const ray_valid_t* valy,
-                        int64_t n, acc_arena_t* a) {
-    (void)a; (void)vx; (void)vy;
-    #define COV_ROW(i, xv, yv, XI, YI) do {                                          \
-        cov_state* st = (cov_state*)((char*)base + (size_t)gids[i]*stride);          \
-        COV_STATE_ROW(st, xv, yv, XI, YI);                                           \
-    } while (0)
-    #define COV_ROW_II(i, xv, yv) COV_ROW(i, xv, yv, true, true)
-    #define COV_ROW_IF(i, xv, yv) COV_ROW(i, xv, yv, true, false)
-    #define COV_ROW_FI(i, xv, yv) COV_ROW(i, xv, yv, false, true)
-    #define COV_ROW_FF(i, xv, yv) COV_ROW(i, xv, yv, false, false)
-    switch (ray_comom_im(valx->type, valy->type)) {
-    case RAY_COMOM_IMX | RAY_COMOM_IMY: PAIR_FOR_EACH(valx, valy, n, COV_RI, COV_RI, 1, COV_ROW_II); break;
-    case RAY_COMOM_IMX:                 PAIR_FOR_EACH(valx, valy, n, COV_RI, COV_RF, 4, COV_ROW_IF); break;
-    case RAY_COMOM_IMY:                 PAIR_FOR_EACH(valx, valy, n, COV_RF, COV_RI, 3, COV_ROW_FI); break;
-    default:                            PAIR_FOR_EACH(valx, valy, n, COV_RF, COV_RF, 2, COV_ROW_FF); break;
-    }
-    #undef COV_ROW
-    #undef COV_ROW_II
-    #undef COV_ROW_IF
-    #undef COV_ROW_FI
-    #undef COV_ROW_FF
+/* IMF: the integer-mode rule, ray_comom_im_all for cov / scov (their wide
+ * keys run faster on the integer loops), ray_comom_im for pearson_corr
+ * (faster on the float ones, a narrow integer side being exact as a
+ * double). */
+#define COMOM_UPDATE2_FN(NAME, ST, IMF)                                              \
+static void NAME(void* base, size_t stride, const uint32_t* gids,                    \
+                 const void* vx, const void* vy,                                     \
+                 const ray_valid_t* valx, const ray_valid_t* valy,                   \
+                 int64_t n, acc_arena_t* a) {                                        \
+    (void)a; (void)vx; (void)vy;                                                     \
+    switch (IMF(valx->type, valy->type)) {                                           \
+    case RAY_COMOM_IMX | RAY_COMOM_IMY:                                              \
+        PAIR_FOR_EACH(valx, valy, n, COV_RI, COV_RI, 1, ROW_II); break;              \
+    case RAY_COMOM_IMX:                                                              \
+        PAIR_FOR_EACH(valx, valy, n, COV_RI, COV_RF, 4, ROW_IF); break;              \
+    case RAY_COMOM_IMY:                                                              \
+        PAIR_FOR_EACH(valx, valy, n, COV_RF, COV_RI, 3, ROW_FI); break;              \
+    default:                                                                         \
+        PAIR_FOR_EACH(valx, valy, n, COV_RF, COV_RF, 2, ROW_FF); break;              \
+    }                                                                                \
 }
+#define COMOM_ROW(ST, SXXP, SYYP, i, xv, yv, XI, YI) do {                            \
+    ST* st = (ST*)((char*)base + (size_t)gids[i]*stride);                            \
+    COV_STATE_ROW(st, xv, yv, XI, YI, SXXP, SYYP);                                   \
+} while (0)
+
+#define ROW_II(i, xv, yv) COMOM_ROW(cov_state, NULL, NULL, i, xv, yv, true, true)
+#define ROW_IF(i, xv, yv) COMOM_ROW(cov_state, NULL, NULL, i, xv, yv, true, false)
+#define ROW_FI(i, xv, yv) COMOM_ROW(cov_state, NULL, NULL, i, xv, yv, false, true)
+#define ROW_FF(i, xv, yv) COMOM_ROW(cov_state, NULL, NULL, i, xv, yv, false, false)
+COMOM_UPDATE2_FN(cov_update2, cov_state, ray_comom_im_all)
+#undef ROW_II
+#undef ROW_IF
+#undef ROW_FI
+#undef ROW_FF
 static void cov_merge(void* dd, const void* ss, acc_arena_t* a) {
     (void)a; cov_state* d = dd; const cov_state* s = ss;
     int64_t nd = d->n & RAY_COMOM_N_MASK, ns = s->n & RAY_COMOM_N_MASK;
     if (ns == 0) return;
     unsigned im = RAY_COMOM_N_IMOF(d->n | s->n);
-    ray_comom_merge(im, (double)nd, &d->pivx, &d->pivy, &d->sx, &d->sy, &d->sxy,
-                    (double)ns, s->pivx, s->pivy, s->sx, s->sy, s->sxy);
+    ray_comom_merge(im, (double)nd, &d->pivx, &d->pivy, &d->sx, &d->sy, &d->sxy, NULL, NULL,
+                    (double)ns, s->pivx, s->pivy, s->sx, s->sy, s->sxy, 0.0, 0.0);
+    d->n = RAY_COMOM_N_IM(im) | (nd + ns);
+}
+
+/* pearson_corr (#1870): the same co-moments about the running mean, with
+ * the squares, in 64 bytes. */
+typedef struct { double pivx, pivy, sx, sy, sxy, sxx, syy; int64_t n; } comom_state;
+static void comom_init(void* s) { memset(s, 0, sizeof(comom_state)); }
+#define ROW_II(i, xv, yv) COMOM_ROW(comom_state, &st->sxx, &st->syy, i, xv, yv, true, true)
+#define ROW_IF(i, xv, yv) COMOM_ROW(comom_state, &st->sxx, &st->syy, i, xv, yv, true, false)
+#define ROW_FI(i, xv, yv) COMOM_ROW(comom_state, &st->sxx, &st->syy, i, xv, yv, false, true)
+#define ROW_FF(i, xv, yv) COMOM_ROW(comom_state, &st->sxx, &st->syy, i, xv, yv, false, false)
+COMOM_UPDATE2_FN(comom_update2, comom_state, ray_comom_im)
+#undef ROW_II
+#undef ROW_IF
+#undef ROW_FI
+#undef ROW_FF
+static void comom_merge(void* dd, const void* ss, acc_arena_t* a) {
+    (void)a; comom_state* d = dd; const comom_state* s = ss;
+    int64_t nd = d->n & RAY_COMOM_N_MASK, ns = s->n & RAY_COMOM_N_MASK;
+    if (ns == 0) return;
+    unsigned im = RAY_COMOM_N_IMOF(d->n | s->n);
+    ray_comom_merge(im, (double)nd, &d->pivx, &d->pivy, &d->sx, &d->sy, &d->sxy, &d->sxx, &d->syy,
+                    (double)ns, s->pivx, s->pivy, s->sx, s->sy, s->sxy, s->sxx, s->syy);
     d->n = RAY_COMOM_N_IM(im) | (nd + ns);
 }
 static double pearson_final_result(const void* s) {
-    const pearson_state* st = s;
-    double dn = (double)st->n;
-    double num = dn*st->sxy - st->sx*st->sy,
-           dx  = dn*st->sxx - st->sx*st->sx,
-           dy  = dn*st->syy - st->sy*st->sy;
-    /* dx and dy are >= 0 mathematically (Cauchy-Schwarz), but a CONSTANT
-     * column cancels to a small NEGATIVE residue in doubles.  Relying on
-     * sqrt(<=0) to produce NaN only works when exactly ONE side is
-     * negative: with both negative the product is positive, the root is
-     * finite and a garbage "correlation" outside [-1,1] is emitted
-     * (#555).  Test the two denominators separately, as the legacy keyed
-     * path does (group.c), and report the undefined case as null.
-     *
-     * n < 2 leaves dx = dy = 0, so the same guard covers it. */
-    if (dx <= 0.0 || dy <= 0.0) return NULL_F64;
-    return ray_f64_fin(num / sqrt(dx*dy));
+    const comom_state* st = s;
+    /* n < 2 or a constant side leaves no spread: the null (#555) */
+    return ray_f64_fin(ray_comom_pearson((double)(st->n & RAY_COMOM_N_MASK), st->sx, st->sy,
+                                         st->sxx, st->syy, st->sxy));
 }
 AGG_SCALAR_FINAL(pearson_final, double, ray_f64, value != value)
 static double cov_final_result(const void* s) {
@@ -886,9 +914,9 @@ static double wavg_final_result(const void* s) {
 }
 AGG_SCALAR_FINAL(wavg_final, double, ray_f64, value != value)
 static const agg_vtable_t PEARSON_F64 = {
-    .state_size = sizeof(pearson_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
-    .init = pearson_init, .update_batch2 = pearson_update2,
-    .merge = pearson_merge, .finalize = pearson_final, .finalize_value = pearson_final_value,
+    .state_size = sizeof(comom_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = comom_init, .update_batch2 = comom_update2,
+    .merge = comom_merge, .finalize = pearson_final, .finalize_value = pearson_final_value,
 };
 static const agg_vtable_t COV_F64 = {
     .state_size = sizeof(cov_state), .kind = ACC_STREAMING, .out_type = RAY_F64,

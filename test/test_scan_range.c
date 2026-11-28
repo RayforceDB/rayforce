@@ -4678,7 +4678,9 @@ static test_result_t test_v2_route_shapes(void) {
         { "(select {c: (count k) s: (sum f) mn: (min n) from: T by: nk})", R_LOCAL },
         { "(select {sv: (sum f) v: (var n) from: T where: (> g 2) by: s})", R_LOCAL },
         { "(select {x: (max f) c: (count k) from: T where: (> k 1000) by: {d: d u: u}})", R_PART },
-        { "(select {x: (sum f) p: (pearson_corr f n) from: T by: {d: d u: u}})", R_PART },
+        { "(select {x: (sum f) p: (cov f n) from: T by: {d: d u: u}})", R_PART },
+        /* pearson_corr's 64-byte pivoted state (#1870): the tablestack strategy */
+        { "(select {x: (sum f) p: (pearson_corr f n) from: T by: {d: d u: u}})", R_TS },
         { "(select {c: (count k) a: (avg nk) from: T by: {nk: nk s: s}})", R_LOCAL },
         { "(select {p: (pearson_corr f g) w: (wavg g f) from: T by: g})", R_LOCAL },    /* binary inputs */
     };

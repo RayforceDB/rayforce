@@ -6766,7 +6766,7 @@ static test_result_t test_timespan_key_v2_route(void) {
     PASS();
 }
 
-/* cov and scov against an independent two-pass reference in double-double
+/* cov, scov and pearson_corr against an independent two-pass reference in double-double
  * arithmetic (about 106 bits), on every route: the direct call, the default
  * v2 route, the legacy direct-array and hash/radix routes (route 1, 2),
  * keyless, by a low- and a high-cardinality key, with and without where:,
@@ -6785,12 +6785,14 @@ static test_result_t test_timespan_key_v2_route(void) {
  *
  * The tolerance is 1e-9 of the pair's spread, sqrt(var x * var y), for any
  * order of the rows: the sums are taken about a pivot that moves to the
- * running mean at every power of two (a merge re-expresses the smaller
+ * running mean at every power of two from 8 (a merge re-expresses the smaller
  * part about the larger part's pivot), so they carry the rounding of a sum
  * of n terms of the spread's size, at most about 3*n*u of the spread
  * (u = 2^-53): 4e-11 at these 120,000 rows, within the tolerance.  The
  * bound grows with n, so 1e-9 holds up to about 3 million rows a group,
- * not beyond.  A constant side gives 0 exactly.  The reference scales each side by a power of two first, so
+ * not beyond.  pearson_corr is checked to 1e-9 of the correlation (its
+ * bound about 6*n*u, 8e-11 here), and must be the null exactly where a side
+ * has no spread.  A constant side gives cov 0 exactly.  The reference scales each side by a power of two first, so
  * its squares never overflow. */
 typedef struct { double hi, lo; } cdd_t;
 static cdd_t cdd_qsum(double a, double b) { double s = a + b; return (cdd_t){ s, b - (s - a) }; }
@@ -6887,6 +6889,8 @@ static cdd_t comom_val(ray_t* v, int64_t i, int e) {
     if (v->type == RAY_F64) return (cdd_t){ ldexp(((double*)ray_data(v))[i], -e), 0 };
     if (v->type == RAY_F32) return (cdd_t){ ldexp((double)((float*)ray_data(v))[i], -e), 0 };
     if (v->type == RAY_I32) return cdd_i64(((int32_t*)ray_data(v))[i], e);
+    if (v->type == RAY_I16) return cdd_i64(((int16_t*)ray_data(v))[i], e);
+    if (v->type == RAY_U8 || v->type == RAY_BOOL) return cdd_i64(((uint8_t*)ray_data(v))[i], e);
     return cdd_i64(((int64_t*)ray_data(v))[i], e);
 }
 static int comom_exp(ray_t* v, int64_t n) {
@@ -6942,7 +6946,8 @@ static void comom_ref_build(ray_t* x, ray_t* y, const int64_t* gid, int64_t n, i
  * ref[group] for groups 0..ng (keyed by column 0 when keyed); unchecked: a
  * side reaches 1e150, where no answer is promised. */
 static test_result_t comom_check(ray_t* out, const char* q, bool keyed, const comom_ref_t* ref,
-                                 int64_t ng, int ex, int ey, const char* tag, bool unchecked) {
+                                 int64_t ng, int ex, int ey, const char* tag, bool unchecked,
+                                 const char* cols) {
     TEST_ASSERT_FMT(out && !RAY_IS_ERR(out), "%s %s failed: %s", tag, q, out ? ray_err_code(out) : "NULL");
     int64_t rows = out->type == RAY_TABLE ? ray_table_nrows(out) : 1;
     TEST_ASSERT_FMT(rows == ng, "%s %s: %lld groups", tag, q, (long long)rows);
@@ -6959,29 +6964,30 @@ static test_result_t comom_check(ray_t* out, const char* q, bool keyed, const co
         const comom_ref_t* e = &ref[g];
         double cxx = e->cxx.hi, cyy = e->cyy.hi;
         double scale = sqrt(cxx / e->n) * sqrt(cyy / e->n);   /* scaled units */
-        double want[2] = { cdd_div(e->cxy, e->n).hi, e->n > 1 ? cdd_div(e->cxy, e->n - 1).hi : 0 };
-        for (int a = 0; a < 2; a++) {
+        for (int a = 0; cols[a]; a++) {
+            char k = cols[a];   /* c cov, s scov, p pearson_corr */
             double got;
-            bool isnull;
             if (out->type == RAY_TABLE) {
                 ray_t* col = ray_table_get_col_idx(out, (keyed ? 1 : 0) + a);
                 got = ((double*)ray_data(col))[r];
-                isnull = got != got;
             } else {
-                got = out->f64; isnull = got != got;   /* the direct call answers one atom (column c only) */
-                if (a > 0) break;
+                got = out->f64;   /* the direct call answers one atom */
             }
-            if (e->n < (a == 0 ? 1 : 2)) {
-                TEST_ASSERT_FMT(isnull, "%s %s group %lld agg %d: %.17g, want the null", tag, q, (long long)g, a, got);
+            bool isnull = got != got;
+            bool want_null = e->n < (k == 'c' ? 1 : 2) || (k == 'p' && (!(cxx > 0) || !(cyy > 0)));
+            if (want_null) {
+                TEST_ASSERT_FMT(isnull, "%s %s group %lld agg %c: %.17g, want the null", tag, q, (long long)g, k, got);
                 continue;
             }
             if (unchecked) continue;
-            TEST_ASSERT_FMT(!isnull, "%s %s group %lld agg %d: the null, want %.17g", tag, q, (long long)g, a,
-                            ldexp(want[a], ex + ey));
-            double gs = ldexp(got, -(ex + ey));
-            double tol = 1e-9 * scale + 1e-300;
-            TEST_ASSERT_FMT(fabs(gs - want[a]) <= tol, "%s %s group %lld agg %d: got %.17g want %.17g",
-                            tag, q, (long long)g, a, got, ldexp(want[a], ex + ey));
+            double want = k == 'c' ? cdd_div(e->cxy, e->n).hi : k == 's' ? cdd_div(e->cxy, e->n - 1).hi
+                        : e->cxy.hi / (sqrt(cxx) * sqrt(cyy));
+            TEST_ASSERT_FMT(!isnull, "%s %s group %lld agg %c: the null, want %.17g", tag, q, (long long)g, k,
+                            k == 'p' ? want : ldexp(want, ex + ey));
+            double gs = k == 'p' ? got : ldexp(got, -(ex + ey));
+            double tol = k == 'p' ? 1e-9 : 1e-9 * scale + 1e-300;
+            TEST_ASSERT_FMT(fabs(gs - want) <= tol, "%s %s group %lld agg %c: got %.17g want %.17g",
+                            tag, q, (long long)g, k, got, k == 'p' ? want : ldexp(want, ex + ey));
         }
     }
     PASS();
@@ -7074,25 +7080,26 @@ static test_result_t test_comoment_large_magnitude(void) {
                     for (int where = 0; where < 2; where++)
                         for (int route = 0; route <= 2; route++) {
                             char q[256];
-                            snprintf(q, sizeof q, "(select {c:(cov x y) s:(scov x y) "
+                            snprintf(q, sizeof q, "(select {c:(cov x y) s:(scov x y) p:(pearson_corr x y) "
                                      "from:comt%s%s%s})", kf ? " by:" : "", kf ? keys[kf] : "",
                                      where ? " where:(>= klo 0)" : "");
                             ray_group_test_route(route);
                             ray_t* out = ray_eval_str(q);
                             ray_group_test_route(0);
-                            test_result_t tr = comom_check(out, q, kf > 0, ref, ng, ex, ey, tag, big);
+                            test_result_t tr = comom_check(out, q, kf > 0, ref, ng, ex, ey, tag, big, "csp");
                             ray_release(out);
                             if (tr.status != TEST_PASS) { free(ref); return tr; }
                         }
                     static const char* const extra[2][3] = {
                         { "(cov (at comt 'x) (at comt 'y))",
-                          "(select {c:(cov x y) s:(scov x y) from:comp})", NULL },
-                        { "(select {c:(cov x y) s:(scov x y) from:comts by:sk where:(in sk ['a 'b 'c])})",
-                          "(select {c:(cov x y) s:(scov x y) from:comp by:klo})", NULL },
+                          "(select {c:(cov x y) s:(scov x y) p:(pearson_corr x y) from:comp})", NULL },
+                        { "(select {c:(cov x y) s:(scov x y) p:(pearson_corr x y) from:comts by:sk where:(in sk ['a 'b 'c])})",
+                          "(select {c:(cov x y) s:(scov x y) p:(pearson_corr x y) from:comp by:klo})", NULL },
                     };
                     for (int j = 0; kf < 2 && extra[kf][j]; j++) {
                         ray_t* out = ray_eval_str(extra[kf][j]);
-                        test_result_t tr = comom_check(out, extra[kf][j], kf > 0, ref, ng, ex, ey, tag, big);
+                        test_result_t tr = comom_check(out, extra[kf][j], kf > 0, ref, ng, ex, ey, tag, big,
+                                                       strncmp(extra[kf][j], "(cov", 4) == 0 ? "c" : "csp");
                         ray_release(out);
                         if (tr.status != TEST_PASS) { free(ref); return tr; }
                     }
@@ -7163,17 +7170,20 @@ static test_result_t test_comoment_alloc_fail(void) {
 }
 
 
-/* A seeded randomized search for cov and scov against the double-double
+/* A seeded randomized search for cov, scov and pearson_corr against the double-double
  * reference (#1847): each case draws a type pair (F64, F32, I64, I32, and
- * mixed I64 x F64, F64 x I64, I32 x F64), a magnitude up to 1e149 (1e37 for
- * F32, int64's range for an integer side), a spread relative to it down to 1e-15, a
+ * mixed I64 x F64, F64 x I64, I32 x F64, F32 x I32, F64 x I16, I16 x U8,
+ * BOOL x F64, F32 x F64, U8 x I64), a magnitude up to 1e149 (1e37 for
+ * F32, int64's range for an integer side, reduced into a narrower one), a
+ * spread relative to it down to 1e-15, a
  * handful of outliers, a row order (shuffled, sorted, reversed, outliers
  * first, last or at the powers of two, two alternating clusters) and
  * sometimes nulls.  Every case runs the direct call, keyless, by a 3-key
  * and a high-cardinality column with and without where:, under routes 0, 1
  * and 2, and an index slice, at 1 and 4 workers.  Every cell must be within
  * 1e-9 of its group's spread: groups hold at most 70,000 rows, where the
- * rounding bound of a sum of n terms, about 3*n*u of the spread, is 2.3e-11.  COMOM_SEARCH_CASES cases from COMOM_SEARCH_SEED. */
+ * rounding bound of a sum of n terms, about 3*n*u of the spread, is 2.3e-11
+ * (pearson_corr: 1e-9 of the correlation, its bound about 6*n*u).  COMOM_SEARCH_CASES cases from COMOM_SEARCH_SEED. */
 #ifndef COMOM_SEARCH_CASES
 #define COMOM_SEARCH_CASES 24
 #endif
@@ -7193,7 +7203,9 @@ static int comom_cmp_d(const void* a, const void* b) {
 }
 /* One side's values: base + spread * u, outliers at the order's places,
  * reordered (0 shuffled, 1 sorted, 2 reversed, 3 outliers first, 4 last,
- * 5 at the powers of two, 6 two alternating clusters, 7 at random rows).
+ * 5 at the powers of two, 6 two alternating clusters, 7 at random rows,
+ * 8 the first 7 rows, 9 rows 1 to 8: the rows about the schedule's first
+ * move at 8).
  * A float side's magnitude is drawn up to maxmag, a third of the time from
  * its top decade; an integer side is built in int64 arithmetic (vi), a
  * third of the time near INT64_MAX or INT64_MIN with outliers at the other
@@ -7212,6 +7224,8 @@ static void comom_search_side(uint64_t* st, double* v, int64_t* vi, int64_t n, b
         else if (order == 4) o = i >= n - nout;
         else if (order == 5) o = i > 0 && (i & (i - 1)) == 0;
         else if (order == 6) o = (i % 2) != 0;
+        else if (order == 8) o = i < 7;                 /* the 7 pairs before the first move */
+        else if (order == 9) o = i >= 1 && i <= 8;      /* rows 1 to 8, about the first move */
         else o = (int64_t)(comom_su(st) * (double)n) < nout;
         rank[i] = o ? -1 - j : j;
     }
@@ -7257,6 +7271,116 @@ static void comom_search_side(uint64_t* st, double* v, int64_t* vi, int64_t n, b
     }
     free(rank); free(u);
 }
+/* An out-of-contract float side (regime 1, tiny; 2, huge): values
+ * K * 2^e with integer K < 2^53, so each is exact in the double.  Tiny:
+ * 2^e from 2^-1074 to 2^-480, so the squares and products fall into the
+ * subnormals or to zero, half the time from 2^-560 to 2^-440, sometimes all
+ * of K small (0 to 4, a few nonzero: the review's [0 0 1] * 2^-537 and its
+ * neighbours).  Huge: magnitudes from
+ * 1e150 to 1e307, spreads down to 1e-15 of them, outliers kept below
+ * DBL_MAX / 4. */
+static void comom_outside_side(uint64_t* st, double* v, int64_t n, int regime, int order,
+                               const int64_t* perm) {
+    int64_t* rank = malloc((size_t)n * sizeof(int64_t));
+    double* u = malloc((size_t)n * sizeof(double));
+    for (int64_t i = 0; i < n; i++) u[i] = comom_su(st);
+    if (order == 1 || order == 2) qsort(u, (size_t)n, sizeof(double), comom_cmp_d);
+    int nout = 1 + (int)(comom_su(st) * 4.0);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t j = order == 0 ? perm[i] : order == 2 ? n - 1 - i : i;
+        bool o = order == 3 ? i < nout : order == 4 ? i >= n - nout : order == 8 ? i < 7
+               : order == 9 ? (i >= 1 && i <= 8) : (int64_t)(comom_su(st) * (double)n) < nout;
+        rank[i] = o ? -1 - j : j;
+    }
+    if (regime == 1) {
+        int e = comom_su(st) < 0.5 ? -560 + (int)(comom_sm(st) % 120) : -1074 + (int)(comom_sm(st) % 595);
+        bool sparse = comom_su(st) < 0.4;
+        int64_t base = sparse || comom_su(st) < 0.5 ? 0 : (int64_t)(comom_sm(st) >> 34);
+        int64_t spread = sparse ? 1 + (int64_t)(comom_sm(st) % 4) : (int64_t)1 << (comom_sm(st) % 31);
+        int64_t out = sparse ? 0 : (int64_t)(comom_sm(st) >> (12 + comom_sm(st) % 40));
+        if (comom_sm(st) & 1) base = -base;
+        if (comom_sm(st) & 1) out = -out;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t r = rank[i], k;
+            if (sparse) k = r < 0 ? spread : 0;
+            else k = base + (r < 0 ? out : 0) + (int64_t)(u[r < 0 ? -1 - r : r] * (double)spread);
+            v[i] = ldexp((double)k, e);
+        }
+    } else {
+        double emag = 150.0 + comom_su(st) * 157.0;
+        double base = (comom_su(st) < 0.5 ? -1.0 : 1.0) * pow(10.0, emag);
+        double spread = fabs(base) * pow(10.0, -comom_su(st) * 15.0);
+        double outl = comom_su(st) < 0.3 ? -base : spread * pow(10.0, comom_su(st) * 6.0);
+        if (comom_su(st) < 0.5) outl = -outl;
+        double lim = 0x1p1022;
+        if (fabs(base) + fabs(outl) + spread > lim) outl = (outl < 0 ? -1.0 : 1.0) * (lim - fabs(base) - spread);
+        for (int64_t i = 0; i < n; i++) {
+            int64_t r = rank[i];
+            v[i] = r < 0 ? base + outl + spread * u[-1 - r] : base + spread * u[r];
+        }
+    }
+    free(rank); free(u);
+}
+
+/* dev's pearson_corr, the raw formula of the sums of the values, for the
+ * out-of-contract search: (n*sxy - sx*sy) / sqrt((n*sxx - sx^2)(n*syy - sy^2)),
+ * the null where a factor is not above 0 or the answer not finite. */
+typedef struct { double n, sx, sy, sxx, syy, sxy; } comom_raw_t;
+static void comom_raw_build(ray_t* x, ray_t* y, const int64_t* gid, int64_t n, int64_t ng, comom_raw_t* raw) {
+    memset(raw, 0, (size_t)ng * sizeof(comom_raw_t));
+    for (int64_t i = 0; i < n; i++) {
+        if (ray_vec_is_null(x, i) || ray_vec_is_null(y, i)) continue;
+        double a = comom_val(x, i, 0).hi, b = comom_val(y, i, 0).hi;
+        comom_raw_t* r = &raw[gid[i]];
+        r->n += 1; r->sx += a; r->sy += b; r->sxx += a * a; r->syy += b * b; r->sxy += a * b;
+    }
+}
+static double comom_raw_pearson(const comom_raw_t* r) {
+    if (r->n < 2) return NAN;
+    double num = r->n * r->sxy - r->sx * r->sy;
+    double dx = r->n * r->sxx - r->sx * r->sx, dy = r->n * r->syy - r->sy * r->sy;
+    if (!(dx > 0.0) || !(dy > 0.0)) return NAN;
+    double v = num / sqrt(dx * dy);
+    return isfinite(v) ? v : NAN;
+}
+
+/* Out of the contract no answer is promised, but none may be a wrong
+ * number where dev's is right: for each group's pearson_corr (column pc of
+ * the answer), when dev's answer is right (within 1e-9 of the reference, or
+ * the null where the reference has none), this one must be right or the
+ * null.  st counts cells, dev right, this right, this null. */
+static test_result_t comom_check_outside(ray_t* out, const char* q, bool keyed, int pc,
+                                         const comom_ref_t* ref, const comom_raw_t* raw,
+                                         int64_t ng, const char* tag, int64_t st[4]) {
+    TEST_ASSERT_FMT(out && !RAY_IS_ERR(out), "%s %s failed: %s", tag, q, out ? ray_err_code(out) : "NULL");
+    int64_t rows = out->type == RAY_TABLE ? ray_table_nrows(out) : 1;
+    TEST_ASSERT_FMT(rows == ng, "%s %s: %lld groups", tag, q, (long long)rows);
+    ray_t* kc = keyed ? ray_table_get_col_idx(out, 0) : NULL;
+    for (int64_t r = 0; r < ng; r++) {
+        int64_t g = 0;
+        if (kc) g = kc->type == RAY_SYM ? ray_read_sym(ray_data(kc), r, kc->type, kc->attrs)
+                                        : ((int64_t*)ray_data(kc))[r];
+        if (kc && kc->type == RAY_SYM) {
+            ray_t* sn = ray_sym_str(g);
+            g = sn ? ray_str_ptr(sn)[0] - 'a' : -1;
+        }
+        TEST_ASSERT_TRUE(g >= 0 && g < ng);
+        const comom_ref_t* e = &ref[g];
+        double got = out->type == RAY_TABLE ? ((double*)ray_data(ray_table_get_col_idx(out, (keyed ? 1 : 0) + pc)))[r]
+                                            : out->f64;
+        bool none = e->n < 2 || !(e->cxx.hi > 0) || !(e->cyy.hi > 0);
+        double want = none ? NAN : e->cxy.hi / (sqrt(e->cxx.hi) * sqrt(e->cyy.hi));
+        double dev = comom_raw_pearson(&raw[g]);
+        bool dev_right = none ? dev != dev : dev == dev && fabs(dev - want) <= 1e-9;
+        bool right = none ? got != got : got == got && fabs(got - want) <= 1e-9;
+        st[0]++; st[1] += dev_right; st[2] += right; st[3] += got != got;
+        if (dev_right)
+            TEST_ASSERT_FMT(right || got != got, "%s %s group %lld: got %.17g, dev %.17g, want %.17g",
+                            tag, q, (long long)g, got, dev, want);
+    }
+    PASS();
+}
+
 static ray_t* comom_search_vec(const double* v, const int64_t* vi, int64_t n, int8_t t) {
     ray_t* r = ray_vec_new(t, n);
     if (!r) return NULL;
@@ -7265,20 +7389,31 @@ static ray_t* comom_search_vec(const double* v, const int64_t* vi, int64_t n, in
         if (t == RAY_F64) ((double*)ray_data(r))[i] = v[i];
         else if (t == RAY_F32) ((float*)ray_data(r))[i] = (float)v[i];
         else if (t == RAY_I32) ((int32_t*)ray_data(r))[i] = (int32_t)(vi[i] % 2000000000);
+        else if (t == RAY_I16) ((int16_t*)ray_data(r))[i] = (int16_t)(vi[i] % 30000);
+        else if (t == RAY_U8) ((uint8_t*)ray_data(r))[i] = (uint8_t)((uint64_t)vi[i] & 255);
+        else if (t == RAY_BOOL) ((uint8_t*)ray_data(r))[i] = (uint8_t)((uint64_t)vi[i] & 1);
         else ((int64_t*)ray_data(r))[i] = vi[i] == INT64_MIN ? INT64_MIN + 1 : vi[i];
     }
     return r;
 }
 
-static test_result_t test_comoment_random_search(void) {
-    static const int8_t tx[7] = { RAY_F64, RAY_F32, RAY_I64, RAY_I32, RAY_I64, RAY_F64, RAY_I32 };
-    static const int8_t ty[7] = { RAY_F64, RAY_F32, RAY_I64, RAY_I32, RAY_F64, RAY_I64, RAY_F64 };
-    uint64_t st = COMOM_SEARCH_SEED;
-    int64_t cells = 0;
+/* outside: the regimes out of the contract (comom_outside_side), checked
+ * against dev's formula by comom_check_outside. */
+static test_result_t comom_search_run(bool outside) {
+    enum { NPAIR = 13 };
+    static const int8_t tx[NPAIR] = { RAY_F64, RAY_F32, RAY_I64, RAY_I32, RAY_I64, RAY_F64, RAY_I32,
+                                      RAY_F32, RAY_F64, RAY_I16, RAY_BOOL, RAY_F32, RAY_U8 };
+    static const int8_t ty[NPAIR] = { RAY_F64, RAY_F32, RAY_I64, RAY_I32, RAY_F64, RAY_I64, RAY_F64,
+                                      RAY_I32, RAY_I16, RAY_U8, RAY_F64, RAY_F64, RAY_I64 };
+    uint64_t st = COMOM_SEARCH_SEED + (outside ? 0x9e37u : 0u);
+    int64_t cells = 0, ost[4] = { 0, 0, 0, 0 };
     for (int c = 0; c < COMOM_SEARCH_CASES; c++) {
-        int64_t n = (c % 4 == 0) ? 70000 : (c % 4 == 1) ? 20000 : (c % 4 == 2) ? 4000 : 777;
-        int pair = (int)(comom_sm(&st) % 7);
-        int order = (int)(comom_sm(&st) % 8);
+        static const int64_t nout[7] = { 3, 5, 9, 17, 64, 777, 4000 };
+        int64_t n = outside ? nout[c % 7]
+                  : (c % 4 == 0) ? 70000 : (c % 4 == 1) ? 20000 : (c % 4 == 2) ? 4000 : 777;
+        int pair = (int)(comom_sm(&st) % NPAIR);
+        int regime = outside ? 1 + (c / 7) % 2 : 0;
+        int order = (int)(comom_sm(&st) % 10);
         bool nulls = comom_su(&st) < 0.25;
         int64_t nhi = n / 4 + 1;
         int64_t* perm = malloc((size_t)n * sizeof(int64_t));
@@ -7289,16 +7424,23 @@ static test_result_t test_comoment_random_search(void) {
         int64_t* glo = malloc((size_t)n * sizeof(int64_t));
         int64_t* ghi = malloc((size_t)n * sizeof(int64_t));
         int64_t* g0 = calloc((size_t)n, sizeof(int64_t));
-        comom_ref_t* ref = calloc((size_t)nhi, sizeof(comom_ref_t));
-        TEST_ASSERT_TRUE(perm && xv && yv && xi && yi && glo && ghi && g0 && ref);
+        int64_t nref = nhi < 3 ? 3 : nhi;   /* the 3-key groups of the shortest cases */
+        comom_ref_t* ref = calloc((size_t)nref, sizeof(comom_ref_t));
+        comom_raw_t* raw = calloc((size_t)nref, sizeof(comom_raw_t));
+        TEST_ASSERT_TRUE(perm && xv && yv && xi && yi && glo && ghi && g0 && ref && raw);
         for (int64_t i = 0; i < n; i++) perm[i] = i;
         for (int64_t i = n - 1; i > 0; i--) {
             int64_t j = (int64_t)(comom_sm(&st) % (uint64_t)(i + 1)), t = perm[i];
             perm[i] = perm[j]; perm[j] = t;
         }
-        bool ix = tx[pair] == RAY_I64 || tx[pair] == RAY_I32, iy = ty[pair] == RAY_I64 || ty[pair] == RAY_I32;
+        bool ix = tx[pair] != RAY_F64 && tx[pair] != RAY_F32, iy = ty[pair] != RAY_F64 && ty[pair] != RAY_F32;
         comom_search_side(&st, xv, xi, n, ix, tx[pair] == RAY_F32 ? 1e37 : 1e149, order, perm);
         comom_search_side(&st, yv, yi, n, iy, ty[pair] == RAY_F32 ? 1e37 : 1e149, order, perm);
+        /* out of the contract, a float side is there seven times in ten,
+         * beside an in-contract side the rest */
+        if (regime && tx[pair] == RAY_F64 && comom_su(&st) < 0.7) comom_outside_side(&st, xv, n, regime, order, perm);
+        if (regime && ty[pair] == RAY_F64 && comom_su(&st) < 0.7)
+            comom_outside_side(&st, yv, n, regime, (int)(comom_sm(&st) % 10), perm);
         for (int64_t i = 0; i < n; i++) {
             glo[i] = i % 3;
             ghi[i] = (int64_t)(comom_sm(&st) % (uint64_t)nhi);
@@ -7312,9 +7454,13 @@ static test_result_t test_comoment_random_search(void) {
         klo->len = khi->len = n;
         memcpy(ray_data(klo), glo, (size_t)n * sizeof(int64_t));
         memcpy(ray_data(khi), ghi, (size_t)n * sizeof(int64_t));
-        if (nulls)
-            for (int64_t i = 1; i < n; i += 7 + (int64_t)(comom_sm(&st) % 9))
-                ray_vec_set_null(comom_sm(&st) & 1 ? x : y, i, true);
+        /* U8 and BOOL hold no null */
+        bool nx = tx[pair] != RAY_U8 && tx[pair] != RAY_BOOL, ny = ty[pair] != RAY_U8 && ty[pair] != RAY_BOOL;
+        if (nulls && (nx || ny))
+            for (int64_t i = 1; i < n; i += 7 + (int64_t)(comom_sm(&st) % 9)) {
+                bool sx = comom_sm(&st) & 1;
+                ray_vec_set_null((sx && nx) || !ny ? x : y, i, true);
+            }
         int ex = comom_exp(x, n), ey = comom_exp(y, n);
         ray_t* t = ray_table_new(4);
         t = ray_table_add_col(t, ray_sym_intern("klo", 3), klo);
@@ -7328,52 +7474,72 @@ static test_result_t test_comoment_random_search(void) {
         TEST_ASSERT_FMT(su && !RAY_IS_ERR(su), "search case %d setup", c);
         ray_release(su);
         char tag[128];
-        snprintf(tag, sizeof tag, "search seed %#x case %d (pair %d order %d nulls %d n %lld):",
-                 (unsigned)COMOM_SEARCH_SEED, c, pair, order, nulls, (long long)n);
+        snprintf(tag, sizeof tag, "search seed %#x case %d (pair %d order %d nulls %d n %lld regime %d):",
+                 (unsigned)COMOM_SEARCH_SEED, c, pair, order, nulls, (long long)n, regime);
         for (int workers = 1; workers <= 4; workers += 3) {
             ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(workers), RAY_OK);
             for (int kf = 0; kf < 3; kf++) {
                 int64_t ng = kf == 0 ? 1 : kf == 1 ? 3 : nhi;
                 comom_ref_build(x, y, kf == 0 ? g0 : kf == 1 ? glo : ghi, n, ng, ex, ey, ref);
+                if (outside) comom_raw_build(x, y, kf == 0 ? g0 : kf == 1 ? glo : ghi, n, ng, raw);
                 for (int where = 0; where < 2; where++)
                     for (int route = 0; route <= 2; route++) {
                         char q[256];
-                        snprintf(q, sizeof q, "(select {c:(cov x y) s:(scov x y) from:comr%s%s})",
+                        snprintf(q, sizeof q, "(select {c:(cov x y) s:(scov x y) p:(pearson_corr x y) from:comr%s%s})",
                                  kf == 0 ? "" : kf == 1 ? " by:klo" : " by:khi",
                                  where ? " where:(>= klo 0)" : "");
                         ray_group_test_route(route);
                         ray_t* out = ray_eval_str(q);
                         ray_group_test_route(0);
-                        test_result_t tr = comom_check(out, q, kf > 0, ref, ng, ex, ey, tag, false);
+                        test_result_t tr = outside ? comom_check_outside(out, q, kf > 0, 2, ref, raw, ng, tag, ost)
+                                                   : comom_check(out, q, kf > 0, ref, ng, ex, ey, tag, false, "csp");
                         ray_release(out);
                         if (tr.status != TEST_PASS) return tr;
-                        cells += 2 * ng;
+                        cells += 3 * ng;
                     }
                 if (kf == 0) {
                     ray_t* out = ray_eval_str("(cov (at comr 'x) (at comr 'y))");
-                    test_result_t tr = comom_check(out, "direct", false, ref, 1, ex, ey, tag, false);
+                    TEST_ASSERT_FMT(out && !RAY_IS_ERR(out), "%s direct cov failed", tag);
+                    if (!outside) {
+                        test_result_t tc = comom_check(out, "direct cov", false, ref, 1, ex, ey, tag, false, "c");
+                        if (tc.status != TEST_PASS) { ray_release(out); return tc; }
+                    }
+                    ray_release(out);
+                    test_result_t tr;
+                    out = ray_eval_str("(pearson_corr (at comr 'x) (at comr 'y))");
+                    tr = outside ? comom_check_outside(out, "direct pearson_corr", false, 0, ref, raw, 1, tag, ost)
+                                 : comom_check(out, "direct pearson_corr", false, ref, 1, ex, ey, tag, false, "p");
                     ray_release(out);
                     if (tr.status != TEST_PASS) return tr;
-                    cells += 1;
+                    cells += 2;
                 }
                 if (kf == 1) {
-                    const char* q = "(select {c:(cov x y) s:(scov x y) from:comrs by:sk where:(in sk ['a 'b 'c])})";
+                    const char* q = "(select {c:(cov x y) s:(scov x y) p:(pearson_corr x y) from:comrs by:sk where:(in sk ['a 'b 'c])})";
                     ray_t* out = ray_eval_str(q);
-                    test_result_t tr = comom_check(out, q, true, ref, 3, ex, ey, tag, false);
+                    test_result_t tr = outside ? comom_check_outside(out, q, true, 2, ref, raw, 3, tag, ost)
+                                               : comom_check(out, q, true, ref, 3, ex, ey, tag, false, "csp");
                     ray_release(out);
                     if (tr.status != TEST_PASS) return tr;
-                    cells += 6;
+                    cells += 9;
                 }
             }
         }
         ray_release(x); ray_release(y);
-        free(perm); free(xv); free(yv); free(xi); free(yi); free(glo); free(ghi); free(g0); free(ref);
+        free(perm); free(xv); free(yv); free(xi); free(yi); free(glo); free(ghi); free(g0); free(ref); free(raw);
     }
     ray_release(ray_eval_str("(do (set comr 0) (set comrs 0) 0)"));
-    fprintf(stderr, "  comoment search: seed %#x, %d cases, %lld cells, 0 failed\n",
-            (unsigned)COMOM_SEARCH_SEED, COMOM_SEARCH_CASES, (long long)cells);
+    if (outside)
+        fprintf(stderr, "  comoment search out of the contract: seed %#x, %d cases, %lld pearson_corr cells: "
+                "dev right %lld, this right %lld, this null %lld, 0 where dev is right and this wrong\n",
+                (unsigned)COMOM_SEARCH_SEED, COMOM_SEARCH_CASES, (long long)ost[0], (long long)ost[1],
+                (long long)ost[2], (long long)ost[3]);
+    else
+        fprintf(stderr, "  comoment search: seed %#x, %d cases, %lld cells, 0 failed\n",
+                (unsigned)COMOM_SEARCH_SEED, COMOM_SEARCH_CASES, (long long)cells);
     PASS();
 }
+static test_result_t test_comoment_random_search(void) { return comom_search_run(false); }
+static test_result_t test_comoment_outside_search(void) { return comom_search_run(true); }
 
 
 const test_entry_t agg_contract_entries[] = {
@@ -7467,5 +7633,6 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/comoment_large_magnitude", test_comoment_large_magnitude, contract_setup, contract_teardown },
     { "agg_contract/comoment_alloc_fail", test_comoment_alloc_fail, contract_setup, contract_teardown },
     { "agg_contract/comoment_random_search", test_comoment_random_search, contract_setup, contract_teardown },
+    { "agg_contract/comoment_outside_search", test_comoment_outside_search, contract_setup, contract_teardown },
     { NULL, NULL, NULL, NULL },
 };

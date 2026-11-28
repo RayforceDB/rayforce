@@ -687,7 +687,11 @@ data is far from these magnitudes and is unaffected.
 
 ### `(pearson_corr x y)` — aggregate
 
-Pearson correlation over paired non-null numeric inputs.
+Pearson correlation over paired non-null numeric inputs. A side with no
+spread (a constant column, or fewer than two pairs) gives `0Nf`, and so
+does a side whose sum of squared differences from its mean is below 2^-1000
+(about 9e-302) or overflows; see
+[Covariance and correlation accuracy](#covariance-and-correlation-accuracy).
 
 ```lisp
 (pearson_corr [1 2 3] [2 4 6])  ; 1.0
@@ -702,13 +706,13 @@ Population and sample covariance over paired non-null numeric inputs.
 (scov [1 3] [2 6])  ; 4.0
 ```
 
-#### Covariance accuracy
+#### Covariance and correlation accuracy
 
-`cov` and `scov` sum the differences of the pairs from a pivot pair, and
-their products:
+`cov`, `scov` and `pearson_corr` sum the differences of the pairs from a
+pivot pair, and their products (and, for `pearson_corr`, their squares):
 - the pivot starts at the first pair of each part a route sums (a group,
   the part of it one worker or one partition sums);
-- at every power of two from 2 pairs, it moves to the running mean, and
+- at every power of two from 8 pairs, it moves to the running mean, and
   the sums are re-expressed about it exactly;
 - parts combine exactly: the smaller part is re-expressed about the larger
   part's pivot, which lies within about a standard deviation of the
@@ -716,37 +720,47 @@ their products:
 
 After the move at the largest power of two up to the count, the pivot is
 the mean of at least half the pairs, so it lies within about a standard
-deviation of the final mean whatever the order of the rows.
+deviation of the final mean whatever the order of the rows. Below 8 pairs
+the pivot is the first pair: one pair at distance d from the mean of m
+pairs makes their variance at least d²/m, so the correction it leaves is
+at most m < 8 times the spread's rounding, inside the bound below.
 
 For values whose magnitudes are all below 1e150, the error is that of
-rounding a sum of n pairs, whatever the order of the rows, on every route,
-at any worker count and any partition split: at most about 3·n·u times the
-pairs' spread, sqrt(var x · var y), where u = 2^-53 ≈ 1.1e-16 is the
-double's unit roundoff. The sum of products adds n terms that each round,
-and with the pivot within a standard deviation of the mean their sizes
-add up to at most about 2n times the spread. So the answer is within 1e-9
-of the spread for groups of up to 3 million pairs, and within 3.3e-8 at
-100 million. The bound is a worst case: rounding errors mostly cancel, and
-typical errors grow like the square root of n. Different worker counts and
-splits add the parts in a different order, so their answers can differ
-from each other, within the same bound.
+rounding sums of n pairs, whatever the order of the rows, on every route,
+at any worker count and any partition split. For `cov` and `scov` it is
+at most about 3·n·u times the pairs' spread, sqrt(var x · var y), where
+u = 2^-53 ≈ 1.1e-16 is the double's unit roundoff: the sum of products
+adds n terms that each round, and with the pivot within a standard
+deviation of the mean their sizes add up to at most about 2n times the
+spread. So `cov` is within 1e-9 of the spread for groups of up to 3
+million pairs, and within 3.3e-8 at 100 million. `pearson_corr` combines
+that sum with the two sums of squares: its error is at most about 6·n·u,
+within 1e-9 for groups of up to 1.5 million pairs. The bounds are worst
+cases: rounding errors mostly cancel, and typical errors grow like the
+square root of n. Different worker counts and splits add the parts in a
+different order, so their answers can differ from each other, within the
+same bounds.
 
 Large values close together are as accurate as small ones: values near
-1e8 or 1e15, or 3e38 in F32, give the covariance of their spread, and
-outliers among them, first, last or anywhere, do not leave cancellation
-behind.
+1e8 or 1e15, or 3e38 in F32, give the covariance and correlation of their
+spread, and outliers among them, first, last or anywhere, do not leave
+cancellation behind.
 
 Two cases hold exactly:
 - a column whose values are all equal, of any type, has a covariance of
-  exactly 0;
+  exactly 0 and a correlation of `0Nf`;
 - the covariance of `1e8 + [0 1 2 3]` with itself is its population
   variance, 1.25.
 
-Integers. Each side of a pair keeps its own arithmetic. An integer or
-temporal side's pivot is an integer: the first value exactly, then the
-mean rounded to an integer, anywhere in the int64 range. Its differences
-are taken in integer arithmetic, with one rounding to a double. A float
-side takes its differences in doubles. So the covariance of
+Integers. When both sides of a pair are integers or temporals, each
+side's pivot is an integer: the first value exactly, then the mean rounded
+to an integer, anywhere in the int64 range. The differences are taken in
+integer arithmetic, with one rounding to a double, so integer data keeps
+integer-valued sums. Beside a float side, a 64-bit integer side (I64,
+TIMESTAMP, TIMESPAN) keeps that integer arithmetic. A narrower integer
+side (I32, I16, U8, BOOL, DATE, TIME) takes the float side's arithmetic:
+its values and their differences are exact as doubles. A float side takes
+its differences in doubles. So the covariance of
 `10000000000000000 + [0 1 2 3]` with `[0 1 2 3]` is 1.25, with the second
 side integer or float, and a column of 9223372036854775807 has a
 covariance of 0.
@@ -756,16 +770,28 @@ double where the sums themselves do not: a covariance whose sums fit is
 never `0Nf` from the correction alone. The sums hold about n·cov, so they
 must fit the double range themselves.
 
-Limit: **values from 1e150.** A difference, a product or the final
-correction can overflow or cancel, so for such magnitudes the answer may be
-`0Nf` or inaccurate, as the raw formula's was.
+Limits, at both ends of the double range:
+- **Values from 1e150.** A difference, a product or the final correction
+  can overflow or cancel, so for such magnitudes the answer may be `0Nf` or
+  inaccurate, as the raw formula's was.
+- **Spreads below about 1e-150.** The products and squares of the
+  differences underflow into subnormals or to zero, so `cov` and `scov`
+  may be `0Nf` or inaccurate. `pearson_corr` is `0Nf` when a side's sum of
+  squared differences from its mean is below 2^-1000, about 9e-302, or is
+  not finite: below that, the rounding of subnormal squares can reach the
+  leading digits (x²/3 for x = 2^-537 rounds to 0). Above it, that rounding
+  adds less than a millionth of the bound above. So
+  `(pearson_corr [0.0 1e-160 2e-160] [0.0 1e-160 3e-160])` is `0Nf`, and
+  `[0 0 1]` times 2^-537 against `[0 1 0]` is `0Nf` up to 2^-500 and -0.5
+  from 2^-499.
 
-`pearson_corr` is unchanged: it is computed from the raw sums.
+Neither range carries a guarantee.
 
 ```lisp
 (cov (take 3e38e 200000) (take 3e38e 200000))   ; 0.0
 (cov (+ 1e8 [0 1 2 3]) (- 7 (* 2 (+ 1e8 [0 1 2 3]))))   ; -2.5
 (cov [10000000000000000 10000000000000001 10000000000000002 10000000000000003] [0 1 2 3])   ; 1.25
+(pearson_corr (+ 1e8 [0 1 2 3]) (- 7 (* 2 (+ 1e8 [0 1 2 3]))))   ; -1.0
 ```
 
 ### `(wsum weights values)` / `(wavg weights values)` — aggregate

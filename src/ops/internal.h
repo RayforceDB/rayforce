@@ -2307,13 +2307,17 @@ static inline double ray_var_final(uint16_t op, int64_t n, double s1, double s2,
                                * canonicalizes int y nulls (NaN in F64-packed
                                * entries, NULL_I64 in int-packed ones). */
 #define GHT_AF2_VAR      8u  /* VAR/STDDEV slot: accumulates about off_var_k */
-#define GHT_AF2_COMOM   16u  /* cov/scov slot (#1847): a pair whose
+#define GHT_AF2_COMOM   16u  /* cov/scov/pearson_corr slot (#1847): a pair whose
                               * co-moments accumulate about the pivot in
                               * off_var_k at slots s (x) and s+1 (y) */
 #define GHT_AF2_X_I64   32u  /* a COMOM slot packed F64 (the other side is a
-                              * float) whose x is an integer column: its
-                              * entry slot keeps the int64 (#1847) */
+                              * float) whose x is a 64-bit integer column
+                              * (ray_comom_im): its entry slot keeps the
+                              * int64 (#1847) */
 #define GHT_AF2_Y_I64   64u  /* the same for the y side */
+#define GHT_AF2_COMOM_SQ 128u /* a COMOM slot that keeps the squares too, in
+                               * off_sumsq and off_sumsq_y (pearson_corr,
+                               * #1870) */
 /* key_flags bits */
 #define GHT_KEYF_WIDE       1u  /* key does not fit in 8 B (RAY_GUID / RAY_STR) */
 #define GHT_KEYF_INLINE_STR 2u  /* key stores a 16 B ray_str_t descriptor inline */
