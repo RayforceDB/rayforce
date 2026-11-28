@@ -217,6 +217,10 @@ FP_STRICT_src/store/enc_alp := $(STRICT_FP_CFLAGS)
 # a product's bits depend on its order, so it multiplies row by row in every
 # profile, as the generic per-row path does (#1628).
 FP_STRICT_src/ops/aggseq := $(STRICT_FP_CFLAGS)
+# The pivoted co-moment sums' exact pivot move (TwoSum), re-expression,
+# merge and overflow-safe final correction (src/ops/comom.c): their argument
+# holds for the operations in the order written (#1897).
+FP_STRICT_src/ops/comom := $(STRICT_FP_CFLAGS)
 
 CFLAGS  = $(DEBUG_CFLAGS)
 LDFLAGS = $(DEBUG_LDFLAGS)

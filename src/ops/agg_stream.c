@@ -724,7 +724,7 @@ static void pearson_merge(void* dd, const void* ss, acc_arena_t* a) {
     d->sx += s->sx; d->sy += s->sy; d->sxx += s->sxx; d->syy += s->syy; d->sxy += s->sxy; d->n += s->n;
 }
 /* cov and scov: the co-moments about a pivot that follows the running
- * mean (#1847, ray_comom_repivot), so a group of large values close together
+ * mean (#1847, ray_comom_repivot_cold), so a group of large values close together
  * keeps sums the size of its spread.  The state takes the 48 bytes the raw
  * one took, so the engine sizes and routes them as before: n's bits 61-62
  * (RAY_COMOM_N_IM) hold the per-side integer mode, a pivot slot holding an
@@ -746,7 +746,7 @@ static inline int64_t cov_read_i64(const ray_valid_t* v, int64_t i) {
 /* One pair into the cov state `st`: its first pair seeds the pivot (each
  * side's own kind: an integer side's value exactly), every pair adds its
  * differences from it, and at each due count the pivot moves to the running
- * mean (ray_comom_repivot).  XI / YI: that side is in integer mode, its
+ * mean (ray_comom_repivot_cold).  XI / YI: that side is in integer mode, its
  * value an int64. */
 #define COV_SIDE_K(v, I) ((I) ? ray_comom_pivot_i((int64_t)(v)) : (double)(v))
 #define COV_SIDE_D(v, k, I) ((I) ? ray_comom_d_i((int64_t)(v), (k)) : (double)(v) - (k))
@@ -862,7 +862,7 @@ static double cov_final_result(const void* s) {
     const cov_state* st = s;
     if ((st->n & RAY_COMOM_N_MASK) <= 0) return NULL_F64;
     double dn = (double)(st->n & RAY_COMOM_N_MASK);
-    double v = (st->sxy - ray_comom_corr(st->sx, st->sy, dn)) / dn;
+    double v = ray_comom_cov(dn, st->sx, st->sy, st->sxy, dn);
     return ray_f64_fin(v);
 }
 AGG_SCALAR_FINAL(cov_final, double, ray_f64, value != value)
@@ -870,7 +870,7 @@ static double scov_final_result(const void* s) {
     const cov_state* st = s;
     if ((st->n & RAY_COMOM_N_MASK) <= 1) return NULL_F64;
     double dn = (double)(st->n & RAY_COMOM_N_MASK);
-    double v = (st->sxy - ray_comom_corr(st->sx, st->sy, dn)) / (dn - 1.0);
+    double v = ray_comom_cov(dn, st->sx, st->sy, st->sxy, dn - 1.0);
     return ray_f64_fin(v);
 }
 AGG_SCALAR_FINAL(scov_final, double, ray_f64, value != value)

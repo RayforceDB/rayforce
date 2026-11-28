@@ -134,6 +134,12 @@ jobs:
         run: sudo locale-gen de_DE.UTF-8
       - name: Test with the current Clang (${{ env.TEST_TIER }})
         run: make ${{ env.TEST_TIER }} CC="$CLANG_CURRENT"
+      # The suite above runs without the release profile's FP flags.  The
+      # co-moment sums' exact steps depend on the order of their operations
+      # (src/ops/comom.c, #1897): their tests run in that profile here and
+      # in gcc-12, and fail if the order is lost.
+      - name: Test the co-moment sums with the release FP flags
+        run: make test-release CC="$CLANG_CURRENT" TEST_ARGS="-f comoment"
       - name: Upload test replay files
         if: failure()
         uses: actions/upload-artifact@v4
@@ -160,6 +166,9 @@ jobs:
         run: make release CC=gcc-12
       - name: Build shared library with gcc 12
         run: make shared CC=gcc-12
+      # The co-moment tests under the release FP flags (see clang-current).
+      - name: Test the co-moment sums with the release FP flags (gcc 12)
+        run: make test-release CC=gcc-12 TEST_ARGS="-f comoment"
 
   # The suite with every assert() compiled out (-DNDEBUG).  Our own builds keep
   # asserts on, but CMake Release, distro packagers and `zig cc` define NDEBUG;

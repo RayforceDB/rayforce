@@ -6781,7 +6781,7 @@ static inline void ght_var_add(char* row, const ght_layout_t* ly, int8_t s, uint
 /* A cov / scov pair (GHT_AF2_COMOM, #1847) at slots s, s+1 of an entry into
  * slot s of an HT row, the n-th pair of the slot: about the row's pivot in
  * off_var_k (slots s, s+1), which the first pair seeds and each due count
- * moves to the running mean (ray_comom_repivot); an integer pair's (no
+ * moves to the running mean (ray_comom_repivot_cold); an integer pair's (no
  * GHT_AF_F64) differences in int64. */
 /* The per-side integer mode of a COMOM slot: a side is an integer when the
  * slot packs int64s, or it packs F64 but keeps that side's int64. */
@@ -8646,8 +8646,8 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                             double dy  = dn * syy - sy * sy;
                             if (op == OP_WSUM) { v = sxy; break; }
                             if (op == OP_WAVG) { if (sx == 0.0) { v = NULL_F64; break; } v = sxy / sx; break; }
-                            if (op == OP_COV) { v = (sxy - ray_comom_corr(sx, sy, dn)) / dn; break; }
-                            if (op == OP_SCOV) { v = (sxy - ray_comom_corr(sx, sy, dn)) / (dn - 1.0); break; }
+                            if (op == OP_COV) { v = ray_comom_cov(dn, sx, sy, sxy, dn); break; }
+                            if (op == OP_SCOV) { v = ray_comom_cov(dn, sx, sy, sxy, dn - 1.0); break; }
                             if (dx <= 0.0 || dy <= 0.0) { v = NULL_F64; break; }
                             v = num / sqrt(dx * dy);
                             break;
@@ -9940,8 +9940,8 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                             v = sxy / sx; break;
                         }
                         double dn = (double)cnt;
-                        if (agg_op == OP_COV) { v = (sxy - ray_comom_corr(sx, sy, dn)) / dn; break; }
-                        if (agg_op == OP_SCOV) { v = (sxy - ray_comom_corr(sx, sy, dn)) / (dn - 1.0); break; }
+                        if (agg_op == OP_COV) { v = ray_comom_cov(dn, sx, sy, sxy, dn); break; }
+                        if (agg_op == OP_SCOV) { v = ray_comom_cov(dn, sx, sy, sxy, dn - 1.0); break; }
                         double num = dn * sxy - sx * sy;
                         double dx = dn * sxx - sx * sx;
                         double dy = dn * syy - sy * sy;
@@ -15633,7 +15633,7 @@ static inline void sg_pair_accum(ray_t* x, ray_t* y, uint16_t op,
 
 /* A task's cov / scov sums (#1847) of differences about its pivot, its
  * first row's pair, moved to the running mean at each due count as every
- * accumulator moves it (ray_comom_repivot); an integer pair's differences
+ * accumulator moves it (ray_comom_repivot_local); an integer pair's differences
  * exact in int64.  The rows run in segments between the due counts, the
  * pivot held in locals.  The slice path admits no null. */
 static void sg_comom_accum(ray_t* x, ray_t* y, const int64_t* rows, int64_t n, bool contig,
@@ -15673,7 +15673,7 @@ static void sg_comom_accum(ray_t* x, ray_t* y, const int64_t* rows, int64_t n, b
             SG_COMOM_SEG((dx = sg_num_at(x, r) - pivx, dy = sg_num_at(y, r) - pivy));
         }
         j = e;
-        if (j == due) ray_comom_repivot_cold(im, (double)j, &pivx, &pivy, &ax, &ay, &axy);
+        if (j == due) ray_comom_repivot_local(im, (double)j, &pivx, &pivy, &ax, &ay, &axy);
     }
     #undef SG_COMOM_SEG
     *kxo = pivx; *kyo = pivy;
@@ -23313,8 +23313,8 @@ sequential_fallback:;
                         double dy  = dn * syy - sy * sy;
                         if (agg_op == OP_WSUM) { v = sxy; break; }
                         if (agg_op == OP_WAVG) { if (sx == 0.0) { v = NULL_F64; break; } v = sxy / sx; break; }
-                        if (agg_op == OP_COV) { v = (sxy - ray_comom_corr(sx, sy, dn)) / dn; break; }
-                        if (agg_op == OP_SCOV) { v = (sxy - ray_comom_corr(sx, sy, dn)) / (dn - 1.0); break; }
+                        if (agg_op == OP_COV) { v = ray_comom_cov(dn, sx, sy, sxy, dn); break; }
+                        if (agg_op == OP_SCOV) { v = ray_comom_cov(dn, sx, sy, sxy, dn - 1.0); break; }
                         if (dx <= 0.0 || dy <= 0.0) { v = NULL_F64; break; }
                         v = num / sqrt(dx * dy);
                         break;

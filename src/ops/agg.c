@@ -464,7 +464,7 @@ static ray_t* agg_pair_vec(ray_t* x, ray_t* y, uint16_t op) {
     bool shifted = agg_is_cov_agg(op);
     if (shifted) {
         /* About the first non-null pair, moved to the running mean at the
-         * due counts as every accumulator moves it (ray_comom_repivot): an
+         * due counts as every accumulator moves it (ray_comom_repivot_cold): an
          * integer side's differences taken in integers, per side. */
         unsigned im = ray_comom_im(x->type, y->type);
         bool imx = (im & RAY_COMOM_IMX) != 0, imy = (im & RAY_COMOM_IMY) != 0;
@@ -488,8 +488,8 @@ static ray_t* agg_pair_vec(ray_t* x, ray_t* y, uint16_t op) {
                 for (int64_t i = lo; i < hi; i++) {                                  \
                     ray_comom_add(D(xd[i], pivx), D(yd[i], pivy), &sx, &sy, &sxy);             \
                     if (RAY_UNLIKELY(ray_comom_due(i + 1)))                          \
-                        ray_comom_repivot_cold(im, (double)(i + 1), &pivx, &pivy,        \
-                                               &sx, &sy, &sxy);                        \
+                        ray_comom_repivot_local(im, (double)(i + 1), &pivx, &pivy,       \
+                                                &sx, &sy, &sxy);                       \
                 }                                                                    \
             }                                                                        \
             cnt = x->len;                                                            \
@@ -511,7 +511,7 @@ static ray_t* agg_pair_vec(ray_t* x, ray_t* y, uint16_t op) {
                 else { agg_read_vec_f64(y, i, &cy); dy = cy - pivy; }
                 ray_comom_add(dx, dy, &sx, &sy, &sxy);
                 if (RAY_UNLIKELY(ray_comom_due(++cnt)))
-                    ray_comom_repivot_cold(im, (double)cnt, &pivx, &pivy, &sx, &sy, &sxy);
+                    ray_comom_repivot_local(im, (double)cnt, &pivx, &pivy, &sx, &sy, &sxy);
             }
         #undef D_F
         #undef COMOM_LOOP
@@ -538,12 +538,12 @@ static ray_t* agg_pair_vec(ray_t* x, ray_t* y, uint16_t op) {
     if (op == OP_COV) {
         if (cnt <= 0) return ray_typed_null(-RAY_F64);
         double dn = (double)cnt;
-        return ray_f64(ray_f64_fin((sxy - ray_comom_corr(sx, sy, dn)) / dn));
+        return ray_f64(ray_f64_fin(ray_comom_cov(dn, sx, sy, sxy, dn)));
     }
     if (op == OP_SCOV) {
         if (cnt <= 1) return ray_typed_null(-RAY_F64);
         double dn = (double)cnt;
-        return ray_f64(ray_f64_fin((sxy - ray_comom_corr(sx, sy, dn)) / (dn - 1.0)));
+        return ray_f64(ray_f64_fin(ray_comom_cov(dn, sx, sy, sxy, dn - 1.0)));
     }
     if (cnt < 2) return ray_typed_null(-RAY_F64);
     double dn = (double)cnt;
