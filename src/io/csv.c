@@ -244,7 +244,14 @@ static csv_type_t detect_type(const char* f, size_t len) {
         break;
     }
     if (p == end && has_digit) {
-        if (!has_dot && !has_e) return CSV_TYPE_I64;
+        if (!has_dot && !has_e) {
+            /* an integer past I64's range is a float, not an I64 that
+             * would read it as null; only a cell of 19 or more bytes can be */
+            int64_t v;
+            if (RAY_UNLIKELY(len >= 19) && ray_parse_i64(f, len, &v) != len)
+                return CSV_TYPE_F64;
+            return CSV_TYPE_I64;
+        }
         return CSV_TYPE_F64;
     }
 
@@ -499,6 +506,16 @@ RAY_INLINE int64_t fast_i64(const char* p, size_t len, bool* is_null) {
     return *is_null ? 0 : v;
 }
 
+/* fast_i64 without zeroing a null cell's value: an I16 or I32 column
+ * stores its null for such a cell whatever the value, and tests the value
+ * against its range after the store */
+RAY_INLINE int64_t fast_i64_raw(const char* p, size_t len, bool* is_null) {
+    int64_t v = 0;
+    size_t n = ray_parse_i64(p, len, &v);
+    *is_null = (n == 0 || n != len);
+    return v;
+}
+
 RAY_INLINE double fast_f64(const char* p, size_t len, bool* is_null) {
     double v = 0.0;
     size_t n = ray_parse_f64(p, len, &v);
@@ -691,6 +708,95 @@ RAY_INLINE bool parse_tz_offset(const char* p, size_t len, int64_t* out_ns, size
     return true;
 }
 
+#if defined(_MSC_VER)
+#define CSV_NOINLINE __declspec(noinline)
+#else
+#define CSV_NOINLINE __attribute__((noinline))
+#endif
+
+/* The checked timestamp parse: fast_timestamp's grammar and value, with
+ * every step of the arithmetic checked, since past the type's range (and on
+ * its earliest day, even for an instant inside it) the plain arithmetic
+ * overflows.  The strict parse takes every cell here; fast_timestamp only
+ * the days near the type's ends.  Returns CSV_TS_OK with *out, CSV_TS_NULL
+ * where the text is not a timestamp, or CSV_TS_RANGE: well formed, but the
+ * instant is outside the type. */
+enum { CSV_TS_OK, CSV_TS_NULL, CSV_TS_RANGE };
+RAY_INLINE int csv_strict_timestamp(const char* p, size_t n, int64_t* out) {
+    const int64_t NS_PER_DAY = 86400000000000LL;
+    const int64_t DMAX = INT64_MAX / NS_PER_DAY;       /* 106751 */
+    if (n < 19) return CSV_TS_NULL;
+    bool sep = p[10] == 'T' || p[10] == 't' || p[10] == ' ' || (p[10] == 'D' && p[4] == '.');
+    if (!sep) return CSV_TS_NULL;
+    bool nul = false;
+    int64_t days = fast_date(p, 10, &nul);
+    if (nul) return CSV_TS_NULL;
+    size_t used = 8;
+    int64_t t = fast_time_ns(p + 11, n - 11, &nul, &used);
+    if (nul) return CSV_TS_NULL;
+    int64_t adj = 0;
+    size_t off = 11 + used, tz_used = 0;
+    if (off < n && (!parse_tz_offset(p + off, n - off, &adj, &tz_used) || off + tz_used != n))
+        return CSV_TS_NULL;
+    /* days * NS_PER_DAY + t - adj, with t in [0, NS_PER_DAY) and
+     * |adj| < NS_PER_DAY: the offset is folded into the time first, so an
+     * instant written as the day past an end plus an offset is still read;
+     * the earliest day starts below INT64_MIN, so its day is folded into
+     * the time */
+    int64_t d = days, r = t - adj;
+    if (r >= NS_PER_DAY) { d++; r -= NS_PER_DAY; }
+    else if (r < 0) { d--; r += NS_PER_DAY; }
+    if (d == -DMAX - 1) { d++; r -= NS_PER_DAY; }
+    if (d > DMAX || d < -DMAX) return CSV_TS_RANGE;
+    int64_t base = d * NS_PER_DAY;
+    if ((r > 0 && base > INT64_MAX - r) || (r < 0 && base < INT64_MIN - r)) return CSV_TS_RANGE;
+    *out = base + r;
+    return CSV_TS_OK;
+}
+
+/* A duration's days * NS_PER_DAY + the rest fits below the infinities
+ * (+-INT64_MAX, which a finite text must not reach); "0Wn" is the infinity
+ * itself and fits. */
+static bool csv_timespan_fits_slow(const char* p, size_t n, size_t i) {
+    uint64_t days = 0;
+    for (; i < n && p[i] >= '0' && p[i] <= '9'; i++) days = days * 10 + (uint64_t)(p[i] - '0');
+    char t[130];
+    if (n - i + 1 >= sizeof t) return false;
+    t[0] = '0';
+    memcpy(t + 1, p + i, n - i);
+    t[n - i + 1] = 0;
+    size_t used = 0;
+    int64_t rest = 0;
+    if (!ray_parse_timespan(t, &used, &rest) || rest < 0) return false;
+    const uint64_t day_ns = UINT64_C(86400000000000);
+    uint64_t lim = (uint64_t)INT64_MAX - 1;
+    return days <= (lim - (uint64_t)rest) / day_ns;
+}
+
+RAY_INLINE bool csv_timespan_fits(const char* p, size_t n) {
+    size_t i = (n > 0 && p[0] == '-') ? 1 : 0;
+    if (n - i == 3 && p[i] == '0' && p[i + 1] == 'W') return true;
+    /* fewer than six day digits: under 100000 days, inside the range */
+    size_t dd = 0;
+    while (dd < 6 && i + dd < n && p[i + dd] >= '0' && p[i + dd] <= '9') dd++;
+    return dd < 6 || csv_timespan_fits_slow(p, n, i);
+}
+
+/* Whether a duration text has six day digits, the only ones that can be
+ * past the type's range: the 'D' after them is at byte 6, or 7 after a
+ * minus (a five-digit negative also lands here, and is checked in full) */
+RAY_INLINE bool csv_timespan_six_days(const char* p, size_t n) {
+    return (n > 6 && p[6] == 'D') || (n > 7 && p[7] == 'D');
+}
+
+/* fast_timestamp's days near the type's ends and past them: an instant
+ * outside the type reads as null, as text that does not parse */
+CSV_NOINLINE static int64_t fast_timestamp_far(const char* p, size_t len, bool* is_null) {
+    int64_t v = 0;
+    *is_null = csv_strict_timestamp(p, len, &v) != CSV_TS_OK;
+    return *is_null ? 0 : v;
+}
+
 RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
     /* Require a strict date + separator + "HH:MM:SS" (>=19 chars).  Accept the
      * CSV writer's ISO-ish separators ('T'|'t'|' ') and Rayfall display's
@@ -715,6 +821,11 @@ RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
     int64_t time_ns = fast_time_ns(p + 11, len - 11, &time_null, &time_used);
     if (time_null) { *is_null = true; return 0; }
     const int64_t NS_PER_DAY = 86400000000000LL;
+    /* Within 106749 days of 2000 the instant, a UTC offset included, fits
+     * in int64; the days nearer the type's ends, and past them, take the
+     * checked parse */
+    if (RAY_UNLIKELY((uint32_t)(days + 106749) > 2u * 106749u))
+        return fast_timestamp_far(p, len, is_null);
     int64_t result = (int64_t)days * NS_PER_DAY + time_ns;
     /* Optional trailing UTC offset (Z | ±HH:MM | ±HHMM | ±HH).  The common
      * no-offset case ends exactly at the time component (off == len), so the
@@ -860,12 +971,6 @@ RAY_INLINE void fast_guid(const char* p, size_t len, uint8_t* dst, bool* is_null
  * the file or without.  The fast scan (no quotes) finds the
  * next LF or CR and the byte-at-a-time scan (quotes) walks to it; both take
  * the line end there by csv_eol_len, so they split a file the same way. */
-
-#if defined(_MSC_VER)
-#define CSV_NOINLINE __declspec(noinline)
-#else
-#define CSV_NOINLINE __attribute__((noinline))
-#endif
 
 /* The length of the line end at p (1 or 2); p is at an LF or a CR.  Line
  * ends are read greedily left to right: a CRLF or an LFCR whenever the byte
@@ -2524,21 +2629,37 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                      * empty / unparseable input and we store it as-is. */
                     bool is_null;
                     int64_t v = fast_i64(fld, flen, &is_null);
-                    ((uint8_t*)ctx->col_data[c])[row] = (uint8_t)v;
+                    /* a number outside the type stores 0 too, as text
+                     * that does not parse */
+                    ((uint8_t*)ctx->col_data[c])[row] = (uint64_t)v > UINT8_MAX ? 0 : (uint8_t)v;
                     break;
                 }
                 case CSV_TYPE_I16: {
                     bool is_null;
-                    int64_t v = fast_i64(fld, flen, &is_null);
+                    int64_t v = fast_i64_raw(fld, flen, &is_null);
                     ((int16_t*)ctx->col_data[c])[row] = is_null ? NULL_I16 : (int16_t)v;
-                    if (is_null) my_had_null[c] = true;
+                    /* a number outside the type reads as null, as text
+                     * that does not parse; up to 4 bytes always fit, so
+                     * the range is tested only with the null, in one branch */
+                    if (RAY_UNLIKELY(is_null | (flen > 4))) {
+                        if (!is_null && v >= INT16_MIN && v <= INT16_MAX) break;
+                        ((int16_t*)ctx->col_data[c])[row] = NULL_I16;
+                        my_had_null[c] = true;
+                    }
                     break;
                 }
                 case CSV_TYPE_I32: {
                     bool is_null;
-                    int64_t v = fast_i64(fld, flen, &is_null);
+                    int64_t v = fast_i64_raw(fld, flen, &is_null);
                     ((int32_t*)ctx->col_data[c])[row] = is_null ? NULL_I32 : (int32_t)v;
-                    if (is_null) my_had_null[c] = true;
+                    /* a number outside the type reads as null, as text
+                     * that does not parse; up to 9 bytes always fit, so
+                     * the range is tested only with the null, in one branch */
+                    if (RAY_UNLIKELY(is_null | (flen > 9))) {
+                        if (!is_null && v >= INT32_MIN && v <= INT32_MAX) break;
+                        ((int32_t*)ctx->col_data[c])[row] = NULL_I32;
+                        my_had_null[c] = true;
+                    }
                     break;
                 }
                 case CSV_TYPE_F64: {
@@ -2553,6 +2674,13 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                     double v = fast_f64(fld, flen, &is_null);
                     ((float*)ctx->col_data[c])[row] = is_null ? NULL_F32 : (float)v;
                     if (is_null) my_had_null[c] = true;
+                    /* past the type's range (from FLT_MAX and half its
+                     * last place, which rounds to an infinity) a null, as
+                     * the double's non-finite values are */
+                    if (RAY_UNLIKELY(fabs(v) >= 0x1.ffffffp127)) {
+                        ((float*)ctx->col_data[c])[row] = NULL_F32;
+                        my_had_null[c] = true;
+                    }
                     break;
                 }
                 case CSV_TYPE_DATE: {
@@ -2574,6 +2702,12 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                     int64_t v = fast_timespan(fld, flen, &is_null);
                     ((int64_t*)ctx->col_data[c])[row] = is_null ? NULL_I64 : v;
                     if (is_null) my_had_null[c] = true;
+                    /* a duration outside the type reads as null */
+                    if (RAY_UNLIKELY(csv_timespan_six_days(fld, flen)) && !is_null &&
+                        !csv_timespan_fits(fld, flen)) {
+                        ((int64_t*)ctx->col_data[c])[row] = NULL_I64;
+                        my_had_null[c] = true;
+                    }
                     break;
                 }
                 case CSV_TYPE_TIMESTAMP: {
@@ -2677,72 +2811,6 @@ static bool csv_frac_kept(const char* p, size_t n, unsigned keep) {
     for (const char* q = dot + 1; q < p + n && *q >= '0' && *q <= '9'; q++, i++)
         if (i >= keep && *q != '0') return false;
     return true;
-}
-
-/* The strict timestamp parse: fast_timestamp's grammar and value, but with
- * the arithmetic checked, since past the type's range fast_timestamp's
- * overflows (undefined; and on the earliest day even for an instant inside
- * it).  Returns CSV_TS_OK with *out, CSV_TS_NULL where fast_timestamp reads a
- * null (the text is not a timestamp), or CSV_TS_RANGE: well formed, but the
- * instant is outside the type. */
-enum { CSV_TS_OK, CSV_TS_NULL, CSV_TS_RANGE };
-RAY_INLINE int csv_strict_timestamp(const char* p, size_t n, int64_t* out) {
-    const int64_t NS_PER_DAY = 86400000000000LL;
-    const int64_t DMAX = INT64_MAX / NS_PER_DAY;       /* 106751 */
-    if (n < 19) return CSV_TS_NULL;
-    bool sep = p[10] == 'T' || p[10] == 't' || p[10] == ' ' || (p[10] == 'D' && p[4] == '.');
-    if (!sep) return CSV_TS_NULL;
-    bool nul = false;
-    int64_t days = fast_date(p, 10, &nul);
-    if (nul) return CSV_TS_NULL;
-    size_t used = 8;
-    int64_t t = fast_time_ns(p + 11, n - 11, &nul, &used);
-    if (nul) return CSV_TS_NULL;
-    int64_t adj = 0;
-    size_t off = 11 + used, tz_used = 0;
-    if (off < n && (!parse_tz_offset(p + off, n - off, &adj, &tz_used) || off + tz_used != n))
-        return CSV_TS_NULL;
-    /* days * NS_PER_DAY + t - adj, with t in [0, NS_PER_DAY) and
-     * |adj| < NS_PER_DAY; the earliest day starts below INT64_MIN, so its
-     * day is folded into the time */
-    int64_t d = days, r = t;
-    if (d == -DMAX - 1) { d++; r -= NS_PER_DAY; }
-    if (d > DMAX || d < -DMAX) return CSV_TS_RANGE;
-    int64_t base = d * NS_PER_DAY;
-    if ((r > 0 && base > INT64_MAX - r) || (r < 0 && base < INT64_MIN - r)) return CSV_TS_RANGE;
-    base += r;
-    if ((adj > 0 && base < INT64_MIN + adj) || (adj < 0 && base > INT64_MAX + adj))
-        return CSV_TS_RANGE;
-    *out = base - adj;
-    return CSV_TS_OK;
-}
-
-/* A duration's days * NS_PER_DAY + the rest fits below the infinities
- * (+-INT64_MAX, which a finite text must not reach); "0Wn" is the infinity
- * itself and fits. */
-static bool csv_timespan_fits_slow(const char* p, size_t n, size_t i) {
-    uint64_t days = 0;
-    for (; i < n && p[i] >= '0' && p[i] <= '9'; i++) days = days * 10 + (uint64_t)(p[i] - '0');
-    char t[130];
-    if (n - i + 1 >= sizeof t) return false;
-    t[0] = '0';
-    memcpy(t + 1, p + i, n - i);
-    t[n - i + 1] = 0;
-    size_t used = 0;
-    int64_t rest = 0;
-    if (!ray_parse_timespan(t, &used, &rest) || rest < 0) return false;
-    const uint64_t day_ns = UINT64_C(86400000000000);
-    uint64_t lim = (uint64_t)INT64_MAX - 1;
-    return days <= (lim - (uint64_t)rest) / day_ns;
-}
-
-RAY_INLINE bool csv_timespan_fits(const char* p, size_t n) {
-    size_t i = (n > 0 && p[0] == '-') ? 1 : 0;
-    if (n - i == 3 && p[i] == '0' && p[i + 1] == 'W') return true;
-    /* fewer than six day digits: under 100000 days, inside the range */
-    size_t dd = 0;
-    while (dd < 6 && i + dd < n && p[i + dd] >= '0' && p[i + dd] <= '9') dd++;
-    return dd < 6 || csv_timespan_fits_slow(p, n, i);
 }
 
 /* The strict parse: csv_parse_fn with the checks above, which also records
@@ -3125,21 +3193,37 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                     /* U8 is non-nullable. */
                     bool is_null;
                     int64_t v = fast_i64(fld, flen, &is_null);
-                    ((uint8_t*)col_data[c])[row] = (uint8_t)v;
+                    /* a number outside the type stores 0 too, as text
+                     * that does not parse */
+                    ((uint8_t*)col_data[c])[row] = (uint64_t)v > UINT8_MAX ? 0 : (uint8_t)v;
                     break;
                 }
                 case CSV_TYPE_I16: {
                     bool is_null;
-                    int64_t v = fast_i64(fld, flen, &is_null);
+                    int64_t v = fast_i64_raw(fld, flen, &is_null);
                     ((int16_t*)col_data[c])[row] = is_null ? NULL_I16 : (int16_t)v;
-                    if (is_null) col_had_null[c] = true;
+                    /* a number outside the type reads as null, as text
+                     * that does not parse; up to 4 bytes always fit, so
+                     * the range is tested only with the null, in one branch */
+                    if (RAY_UNLIKELY(is_null | (flen > 4))) {
+                        if (!is_null && v >= INT16_MIN && v <= INT16_MAX) break;
+                        ((int16_t*)col_data[c])[row] = NULL_I16;
+                        col_had_null[c] = true;
+                    }
                     break;
                 }
                 case CSV_TYPE_I32: {
                     bool is_null;
-                    int64_t v = fast_i64(fld, flen, &is_null);
+                    int64_t v = fast_i64_raw(fld, flen, &is_null);
                     ((int32_t*)col_data[c])[row] = is_null ? NULL_I32 : (int32_t)v;
-                    if (is_null) col_had_null[c] = true;
+                    /* a number outside the type reads as null, as text
+                     * that does not parse; up to 9 bytes always fit, so
+                     * the range is tested only with the null, in one branch */
+                    if (RAY_UNLIKELY(is_null | (flen > 9))) {
+                        if (!is_null && v >= INT32_MIN && v <= INT32_MAX) break;
+                        ((int32_t*)col_data[c])[row] = NULL_I32;
+                        col_had_null[c] = true;
+                    }
                     break;
                 }
                 case CSV_TYPE_F64: {
@@ -3154,6 +3238,13 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                     double v = fast_f64(fld, flen, &is_null);
                     ((float*)col_data[c])[row] = is_null ? NULL_F32 : (float)v;
                     if (is_null) col_had_null[c] = true;
+                    /* past the type's range (from FLT_MAX and half its
+                     * last place, which rounds to an infinity) a null, as
+                     * the double's non-finite values are */
+                    if (RAY_UNLIKELY(fabs(v) >= 0x1.ffffffp127)) {
+                        ((float*)col_data[c])[row] = NULL_F32;
+                        col_had_null[c] = true;
+                    }
                     break;
                 }
                 case CSV_TYPE_DATE: {
@@ -3175,6 +3266,12 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                     int64_t v = fast_timespan(fld, flen, &is_null);
                     ((int64_t*)col_data[c])[row] = is_null ? NULL_I64 : v;
                     if (is_null) col_had_null[c] = true;
+                    /* a duration outside the type reads as null */
+                    if (RAY_UNLIKELY(csv_timespan_six_days(fld, flen)) && !is_null &&
+                        !csv_timespan_fits(fld, flen)) {
+                        ((int64_t*)col_data[c])[row] = NULL_I64;
+                        col_had_null[c] = true;
+                    }
                     break;
                 }
                 case CSV_TYPE_TIMESTAMP: {

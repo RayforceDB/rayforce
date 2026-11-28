@@ -139,13 +139,13 @@
 (B [SYM] "anything") -- "no error"
 (B [STR] "anything") -- "no error"
 
-;; ── a number out of its column's range: lenient wraps it, keeps the null
-;;    sentinel or makes an infinity; strict refuses it, at every width ────────
+;; ── a number out of its column's range: lenient reads it as a null (0 in a
+;;    U8, #1892); strict refuses it, at every width ──────────────────────────
 (.sys.exec "printf 'u,h,i,e\\n300,40000,3000000000,1e39\\n' > rf_test_csvst_wrap.csv") -- 0
 (set W (.csv.read [U8 I16 I32 F32] "rf_test_csvst_wrap.csv"))
-(at W 'u) -- [0x2c]
-(at W 'h) -- [-25536]
-(at W 'i) -- [-1294967296]
+(at W 'u) -- [0x00]
+(at W 'h) -- [0Nh]
+(at W 'i) -- [0Ni]
 (set R (fn [t v] (.sys.exec (format "printf 'k,v\\n1,%\\n' > rf_test_csvst_t.csv" v)) (M (fn [] (.csv.read {strict: true} (concat [I64] t) "rf_test_csvst_t.csv")))))
 (R [U8] "300") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"300\" is out of range for a U8"
 (R [U8] "-1") -- ".csv.read \"rf_test_csvst_t.csv\": line 2, column v: \"-1\" is out of range for a U8"
@@ -198,7 +198,7 @@
 
 ;; ── review round 1 (#1885) ────────────────────────────────────────────────
 ;; a value the type stores as its null, or past its range, is refused for the
-;; temporal types and GUID too; the default reads them as before
+;; temporal types and GUID too; the default reads them as nulls
 (.sys.exec "printf 'v\\n-596:31:23.648\\n' > rf_test_csvst_r1.csv; printf 'v\\n00000000-0000-0000-0000-000000000000\\n' > rf_test_csvst_r2.csv; printf 'v\\n9999-01-01T00:00:00\\n' > rf_test_csvst_r3.csv; printf 'v\\n106752D00:00:00\\n' > rf_test_csvst_r4.csv") -- 0
 (M (fn [] (.csv.read {strict: true} [TIME] "rf_test_csvst_r1.csv"))) -- ".csv.read \"rf_test_csvst_r1.csv\": line 2, column v: \"-596:31:23.648\" reads as a null TIME"
 (M (fn [] (.csv.read {strict: true} [GUID] "rf_test_csvst_r2.csv"))) -- ".csv.read \"rf_test_csvst_r2.csv\": line 2, column v: \"00000000-0000-0000-0000-000000000000\" reads as a null GUID"
