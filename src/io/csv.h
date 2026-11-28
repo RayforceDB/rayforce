@@ -70,12 +70,36 @@ typedef enum {
  * CSV_TYPE_I64. */
 csv_type_t csv_resolve_int_width(int64_t min, int64_t max, bool has_null);
 
+/* Options of a CSV load beyond its schema (#1885).
+ *   strict  a row whose cell count is not the schema's, a malformed quoted
+ *           cell, or a non-empty cell that does not parse as its column's
+ *           type fails the load with a `parse` error naming the file's line
+ *           and the column; the default reads such cells as nulls.  An empty
+ *           cell is a null in both modes.
+ *   op      the caller's name at the head of that message ("csv" if NULL).
+ *   reserve bytes of the 255-byte message the caller will append to a
+ *           strict error (a parted import's note on retained output); the
+ *           cell text is cut to leave them.
+ *   err     out, the save forms only (they return a code): the strict error
+ *           with its message, which the caller then owns; NULL otherwise. */
+typedef struct {
+    bool        strict;
+    const char* op;
+    size_t      reserve;
+    ray_t*      err;
+} ray_csv_opts_t;
+
 ray_t* ray_read_csv(const char* path);
 ray_t* ray_read_csv_opts(const char* path, char delimiter, bool header,
                         const int8_t* col_types, int32_t n_types);
 ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
                                const int8_t* col_types, int32_t n_types,
                                const int64_t* col_names, int32_t n_names);
+/* The same with load options (NULL: the defaults). */
+ray_t* ray_read_csv_ex(const char* path, char delimiter, bool header,
+                       const int8_t* col_types, int32_t n_types,
+                       const int64_t* col_names, int32_t n_names,
+                       const ray_csv_opts_t* opts);
 /* `root` without trailing separators, and the `<root>.csv-partial` staging
  * directory a new parted root is imported into. */
 ray_err_t ray_csv_parted_paths(const char* root, char* dest, size_t dest_size,
@@ -90,6 +114,12 @@ ray_err_t ray_csv_save_parted_mode(const char* path, char delimiter, bool header
                                    const int64_t* col_names, int32_t n_names,
                                    const char* root, const char* table_name,
                                    int64_t rows_per_part, ray_compress_t mode);
+ray_err_t ray_csv_save_parted_ex(const char* path, char delimiter, bool header,
+                                 const int8_t* col_types, int32_t n_types,
+                                 const int64_t* col_names, int32_t n_names,
+                                 const char* root, const char* table_name,
+                                 int64_t rows_per_part, ray_compress_t mode,
+                                 ray_csv_opts_t* opts);
 ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool header,
                                           const int8_t* col_types, int32_t n_types,
                                           const int64_t* col_names, int32_t n_names,
@@ -100,6 +130,12 @@ ray_err_t ray_csv_save_splayed_mode(const char* path, char delimiter, bool heade
                                     const int8_t* col_types, int32_t n_types,
                                     const int64_t* col_names, int32_t n_names,
                                     const char* dir, int64_t rows_per_chunk, ray_compress_t mode);
+/* The same with load options (NULL: the defaults). */
+ray_err_t ray_csv_save_splayed_ex(const char* path, char delimiter, bool header,
+                                  const int8_t* col_types, int32_t n_types,
+                                  const int64_t* col_names, int32_t n_names,
+                                  const char* dir, int64_t rows_per_chunk, ray_compress_t mode,
+                                  ray_csv_opts_t* opts);
 ray_err_t ray_write_csv(ray_t* table, const char* path);
 
 /* After a failed ray_csv_save_splayed_mode / ray_csv_save_parted_mode: the
