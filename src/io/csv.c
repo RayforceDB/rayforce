@@ -511,9 +511,19 @@ RAY_INLINE int64_t fast_i64(const char* p, size_t len, bool* is_null) {
  * against its range after the store */
 RAY_INLINE int64_t fast_i64_raw(const char* p, size_t len, bool* is_null) {
     int64_t v = 0;
-    size_t n = ray_parse_i64(p, len, &v);
+    size_t n = ray_parse_i64_value(p, len, &v);
     *is_null = (n == 0 || n != len);
     return v;
+}
+
+/* The default parse's I64: the minimum, the type's null, reads as that null
+ * (and marks the column as having nulls); fast_i64 keeps it a value, for the
+ * strict parse to name */
+RAY_INLINE int64_t fast_i64_lenient(const char* p, size_t len, bool* is_null) {
+    int64_t v = 0;
+    size_t n = ray_parse_i64_value(p, len, &v);
+    *is_null = (n == 0 || n != len);
+    return *is_null ? 0 : v;
 }
 
 RAY_INLINE double fast_f64(const char* p, size_t len, bool* is_null) {
@@ -595,7 +605,10 @@ RAY_INLINE int32_t fast_date(const char* p, size_t len, bool* is_null) {
  * separators or trailing garbage (e.g. "12-34-56", "12:34:56xyz") are rejected
  * as null rather than silently coerced.  A magnitude that overflows int32
  * milliseconds is likewise rejected as null. */
-RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null) {
+/* min_null: the minimum, -596:31:23.648, the type's null, reads as null
+ * (the default parse); without it the value is returned, for the sampler
+ * and for the strict parse to name */
+RAY_INLINE int32_t fast_time_impl(const char* p, size_t len, bool* is_null, bool min_null) {
     *is_null = false;
     size_t  o    = 0;
     int64_t sign = 1;
@@ -637,8 +650,16 @@ RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null) {
         ms += frac;
     }
     ms *= sign;
-    if (RAY_UNLIKELY(ms > INT32_MAX || ms < INT32_MIN)) { *is_null = true; return 0; }
+    if (RAY_UNLIKELY(ms > INT32_MAX || ms < (int64_t)INT32_MIN + min_null)) { *is_null = true; return 0; }
     return (int32_t)ms;
+}
+
+RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null) {
+    return fast_time_impl(p, len, is_null, false);
+}
+
+RAY_INLINE int32_t fast_time_lenient(const char* p, size_t len, bool* is_null) {
+    return fast_time_impl(p, len, is_null, true);
 }
 
 /* Timestamp time component → int64_t nanoseconds.
@@ -797,7 +818,10 @@ CSV_NOINLINE static int64_t fast_timestamp_far(const char* p, size_t len, bool* 
     return *is_null ? 0 : v;
 }
 
-RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
+/* min_null: the earliest instant, 1707-09-22T00:12:43.145224192, the
+ * type's null, reads as null (the default parse); the sampler keeps it a
+ * timestamp */
+RAY_INLINE int64_t fast_timestamp_impl(const char* p, size_t len, bool* is_null, bool min_null) {
     /* Require a strict date + separator + "HH:MM:SS" (>=19 chars).  Accept the
      * CSV writer's ISO-ish separators ('T'|'t'|' ') and Rayfall display's
      * dotted-date + 'D' form.  Malformed date/time separators (e.g.
@@ -823,9 +847,13 @@ RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
     const int64_t NS_PER_DAY = 86400000000000LL;
     /* Within 106749 days of 2000 the instant, a UTC offset included, fits
      * in int64; the days nearer the type's ends, and past them, take the
-     * checked parse */
-    if (RAY_UNLIKELY((uint32_t)(days + 106749) > 2u * 106749u))
-        return fast_timestamp_far(p, len, is_null);
+     * checked parse (the type's null, the earliest instant, only comes
+     * from there) */
+    if (RAY_UNLIKELY((uint32_t)(days + 106749) > 2u * 106749u)) {
+        int64_t far = fast_timestamp_far(p, len, is_null);
+        if (min_null && far == NULL_I64) *is_null = true;
+        return far;
+    }
     int64_t result = (int64_t)days * NS_PER_DAY + time_ns;
     /* Optional trailing UTC offset (Z | ±HH:MM | ±HHMM | ±HH).  The common
      * no-offset case ends exactly at the time component (off == len), so the
@@ -843,6 +871,14 @@ RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
         result -= adj;
     }
     return result;
+}
+
+RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
+    return fast_timestamp_impl(p, len, is_null, false);
+}
+
+RAY_INLINE int64_t fast_timestamp_lenient(const char* p, size_t len, bool* is_null) {
+    return fast_timestamp_impl(p, len, is_null, true);
 }
 
 /* --------------------------------------------------------------------------
@@ -891,6 +927,18 @@ RAY_INLINE void fast_guid(const char* p, size_t len, uint8_t* dst, bool* is_null
         dst[i] = (uint8_t)((hi << 4) | lo);
     }
     *is_null = false;
+}
+
+/* Whether a GUID text fast_guid has read is the all-zero GUID, the type's
+ * null.  It tests the text, not the bytes just stored (a load of those
+ * stalls on the stores); the first eight digits decide almost every cell */
+RAY_INLINE bool csv_guid_text_zero(const char* p) {
+    uint64_t w;
+    memcpy(&w, p, 8);
+    if (w != UINT64_C(0x3030303030303030)) return false;
+    for (int i = 9; i < 36; i++)
+        if (p[i] != '0' && p[i] != '-') return false;
+    return true;
 }
 
 /* --------------------------------------------------------------------------
@@ -2619,7 +2667,7 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                 }
                 case CSV_TYPE_I64: {
                     bool is_null;
-                    int64_t v = fast_i64(fld, flen, &is_null);
+                    int64_t v = fast_i64_lenient(fld, flen, &is_null);
                     ((int64_t*)ctx->col_data[c])[row] = is_null ? NULL_I64 : v;
                     if (is_null) my_had_null[c] = true;
                     break;
@@ -2639,10 +2687,12 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                     int64_t v = fast_i64_raw(fld, flen, &is_null);
                     ((int16_t*)ctx->col_data[c])[row] = is_null ? NULL_I16 : (int16_t)v;
                     /* a number outside the type reads as null, as text
-                     * that does not parse; up to 4 bytes always fit, so
-                     * the range is tested only with the null, in one branch */
+                     * that does not parse, and the minimum, the type's null,
+                     * marks the column as having nulls; up to 4 bytes
+                     * always fit, so both are tested only with the null, in
+                     * one branch */
                     if (RAY_UNLIKELY(is_null | (flen > 4))) {
-                        if (!is_null && v >= INT16_MIN && v <= INT16_MAX) break;
+                        if (!is_null && v > INT16_MIN && v <= INT16_MAX) break;
                         ((int16_t*)ctx->col_data[c])[row] = NULL_I16;
                         my_had_null[c] = true;
                     }
@@ -2653,10 +2703,12 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                     int64_t v = fast_i64_raw(fld, flen, &is_null);
                     ((int32_t*)ctx->col_data[c])[row] = is_null ? NULL_I32 : (int32_t)v;
                     /* a number outside the type reads as null, as text
-                     * that does not parse; up to 9 bytes always fit, so
-                     * the range is tested only with the null, in one branch */
+                     * that does not parse, and the minimum, the type's null,
+                     * marks the column as having nulls; up to 9 bytes
+                     * always fit, so both are tested only with the null, in
+                     * one branch */
                     if (RAY_UNLIKELY(is_null | (flen > 9))) {
-                        if (!is_null && v >= INT32_MIN && v <= INT32_MAX) break;
+                        if (!is_null && v > INT32_MIN && v <= INT32_MAX) break;
                         ((int32_t*)ctx->col_data[c])[row] = NULL_I32;
                         my_had_null[c] = true;
                     }
@@ -2692,7 +2744,7 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                 }
                 case CSV_TYPE_TIME: {
                     bool is_null;
-                    int32_t v = fast_time(fld, flen, &is_null);
+                    int32_t v = fast_time_lenient(fld, flen, &is_null);
                     ((int32_t*)ctx->col_data[c])[row] = is_null ? NULL_I32 : v;
                     if (is_null) my_had_null[c] = true;
                     break;
@@ -2712,7 +2764,7 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                 }
                 case CSV_TYPE_TIMESTAMP: {
                     bool is_null;
-                    int64_t v = fast_timestamp(fld, flen, &is_null);
+                    int64_t v = fast_timestamp_lenient(fld, flen, &is_null);
                     ((int64_t*)ctx->col_data[c])[row] = is_null ? NULL_I64 : v;
                     if (is_null) my_had_null[c] = true;
                     break;
@@ -2723,6 +2775,9 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                     fast_guid(fld, flen, slot, &is_null);
                     if (is_null) {
                         memset(slot, 0, 16);
+                        my_had_null[c] = true;
+                    } else if (RAY_UNLIKELY(csv_guid_text_zero(fld))) {
+                        /* the all-zero GUID is the type's null */
                         my_had_null[c] = true;
                     }
                     break;
@@ -3184,7 +3239,7 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                 }
                 case CSV_TYPE_I64: {
                     bool is_null;
-                    int64_t v = fast_i64(fld, flen, &is_null);
+                    int64_t v = fast_i64_lenient(fld, flen, &is_null);
                     ((int64_t*)col_data[c])[row] = is_null ? NULL_I64 : v;
                     if (is_null) col_had_null[c] = true;
                     break;
@@ -3203,10 +3258,12 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                     int64_t v = fast_i64_raw(fld, flen, &is_null);
                     ((int16_t*)col_data[c])[row] = is_null ? NULL_I16 : (int16_t)v;
                     /* a number outside the type reads as null, as text
-                     * that does not parse; up to 4 bytes always fit, so
-                     * the range is tested only with the null, in one branch */
+                     * that does not parse, and the minimum, the type's null,
+                     * marks the column as having nulls; up to 4 bytes
+                     * always fit, so both are tested only with the null, in
+                     * one branch */
                     if (RAY_UNLIKELY(is_null | (flen > 4))) {
-                        if (!is_null && v >= INT16_MIN && v <= INT16_MAX) break;
+                        if (!is_null && v > INT16_MIN && v <= INT16_MAX) break;
                         ((int16_t*)col_data[c])[row] = NULL_I16;
                         col_had_null[c] = true;
                     }
@@ -3217,10 +3274,12 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                     int64_t v = fast_i64_raw(fld, flen, &is_null);
                     ((int32_t*)col_data[c])[row] = is_null ? NULL_I32 : (int32_t)v;
                     /* a number outside the type reads as null, as text
-                     * that does not parse; up to 9 bytes always fit, so
-                     * the range is tested only with the null, in one branch */
+                     * that does not parse, and the minimum, the type's null,
+                     * marks the column as having nulls; up to 9 bytes
+                     * always fit, so both are tested only with the null, in
+                     * one branch */
                     if (RAY_UNLIKELY(is_null | (flen > 9))) {
-                        if (!is_null && v >= INT32_MIN && v <= INT32_MAX) break;
+                        if (!is_null && v > INT32_MIN && v <= INT32_MAX) break;
                         ((int32_t*)col_data[c])[row] = NULL_I32;
                         col_had_null[c] = true;
                     }
@@ -3256,7 +3315,7 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                 }
                 case CSV_TYPE_TIME: {
                     bool is_null;
-                    int32_t v = fast_time(fld, flen, &is_null);
+                    int32_t v = fast_time_lenient(fld, flen, &is_null);
                     ((int32_t*)col_data[c])[row] = is_null ? NULL_I32 : v;
                     if (is_null) col_had_null[c] = true;
                     break;
@@ -3276,7 +3335,7 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                 }
                 case CSV_TYPE_TIMESTAMP: {
                     bool is_null;
-                    int64_t v = fast_timestamp(fld, flen, &is_null);
+                    int64_t v = fast_timestamp_lenient(fld, flen, &is_null);
                     ((int64_t*)col_data[c])[row] = is_null ? NULL_I64 : v;
                     if (is_null) col_had_null[c] = true;
                     break;
@@ -3287,6 +3346,9 @@ CSV_NOINLINE static bool csv_parse_serial(const char* buf, size_t buf_size,
                     fast_guid(fld, flen, slot, &is_null);
                     if (is_null) {
                         memset(slot, 0, 16);
+                        col_had_null[c] = true;
+                    } else if (RAY_UNLIKELY(csv_guid_text_zero(fld))) {
+                        /* the all-zero GUID is the type's null */
                         col_had_null[c] = true;
                     }
                     break;

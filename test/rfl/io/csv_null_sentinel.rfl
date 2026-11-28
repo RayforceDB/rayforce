@@ -1,0 +1,52 @@
+;; @requires: posix  (fixtures are written through a POSIX shell via .sys.exec)
+;; A cell holding the value a type keeps as its null (#1901): the minimum of
+;; I16, I32, I64, TIME and TIMESTAMP, the all-zero GUID.  It reads as that
+;; null, and marks the column as having nulls, as a blank cell does, so nil?
+;; over the column answers true for it (it answered false: the flag was set
+;; only for a cell that did not parse).  Serial (a small file) and parallel
+;; (10000 rows of fill, the rows again), by .csv.read, .csv.splayed and
+;; .csv.parted.  {strict: true} refuses these cells as before.
+;; Fixtures use the rf_test_csvns_ prefix (the Makefile removes rf_test_*.csv).
+
+(.sys.exec "rm -rf rf_test_csvns_*") -- 0
+(set M (fn [f] (try (do (f) "no error") (fn [e] (at e 'msg)))))
+(.sys.exec "printf 'a,b,c,d,e,f\\n-32768,-2147483648,-9223372036854775808,-596:31:23.648,1707-09-22T00:12:43.145224192,00000000-0000-0000-0000-000000000000\\n1,1,1,00:00:01,2000-01-01T00:00:00,01234567-89ab-cdef-0123-456789abcdef\\n' > rf_test_csvns_s.csv") -- 0
+(.sys.exec "awk 'NR==1{print;next}{r[NR]=$0;print}END{for(i=0;i<10000;i++)print \"1,1,1,00:00:01,2000-01-01T00:00:00,01234567-89ab-cdef-0123-456789abcdef\";for(j=2;j<=NR;j++)print r[j]}' rf_test_csvns_s.csv > rf_test_csvns_b.csv") -- 0
+(set T [I16 I32 I64 TIME TIMESTAMP GUID])
+;; the null in every column, and the column says so
+(set N (fn [t] (map (fn [c] (nil? (at t c))) [a b c d e f])))
+(set H (fn [t] (map (fn [c] (take (nil? (at t c)) 2)) [a b c d e f])))
+(set Z (fn [t] (map (fn [c] (take (nil? (at t c)) -2)) [a b c d e f])))
+
+(N (.csv.read T "rf_test_csvns_s.csv")) -- (list [true false] [true false] [true false] [true false] [true false] [true false])
+(set B (.csv.read T "rf_test_csvns_b.csv"))
+(H B) -- (list [true false] [true false] [true false] [true false] [true false] [true false])
+(Z B) -- (list [true false] [true false] [true false] [true false] [true false] [true false])
+(N (.csv.splayed T "rf_test_csvns_s.csv" "rf_test_csvns_sp")) -- (list [true false] [true false] [true false] [true false] [true false] [true false])
+(set BS (.csv.splayed T "rf_test_csvns_b.csv" "rf_test_csvns_sp"))
+(H BS) -- (list [true false] [true false] [true false] [true false] [true false] [true false])
+(Z BS) -- (list [true false] [true false] [true false] [true false] [true false] [true false])
+(N (.csv.parted T "rf_test_csvns_s.csv" "rf_test_csvns_pt1" 't)) -- (list [true false] [true false] [true false] [true false] [true false] [true false])
+(set BP (.csv.parted T "rf_test_csvns_b.csv" "rf_test_csvns_pt2" 't))
+(H BP) -- (list [true false] [true false] [true false] [true false] [true false] [true false])
+(Z BP) -- (list [true false] [true false] [true false] [true false] [true false] [true false])
+;; a query over the column sees the null too
+(count (select {x: a from: B where: (nil? a)})) -- 2
+(count (select {x: c from: B where: (nil? c)})) -- 2
+
+;; a GUID that is not all zeros is a value, wherever its zeros are
+(.sys.exec "printf 'g\\n00000000-0000-0000-0000-000000000001\\n10000000-0000-0000-0000-000000000000\\n00000000-1000-0000-0000-000000000000\\n' > rf_test_csvns_g.csv") -- 0
+(nil? (at (.csv.read [GUID] "rf_test_csvns_g.csv") 'g)) -- [false false false]
+
+;; inferred: the sentinel keeps its column's type, and is its null
+(.sys.exec "printf 'c,e\\n-9223372036854775808,1707-09-22T00:12:43.145224192\\n1,2000-01-01T00:00:00\\n' > rf_test_csvns_inf.csv") -- 0
+(set I (.csv.read "rf_test_csvns_inf.csv"))
+(type (at I 'c)) -- 'I64
+(type (at I 'e)) -- 'TIMESTAMP
+(nil? (at I 'c)) -- [true false]
+(nil? (at I 'e)) -- [true false]
+
+;; strict still names them
+(M (fn [] (.csv.read {strict: true} [I64 TIMESTAMP] "rf_test_csvns_inf.csv"))) -- ".csv.read \"rf_test_csvns_inf.csv\": line 2, column c: \"-9223372036854775808\" reads as a null I64"
+
+(.sys.exec "rm -rf rf_test_csvns_*") -- 0
