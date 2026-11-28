@@ -266,16 +266,17 @@ static const test_entry_t* const compiled_groups[] = {
 
 /* ─── .rfl auto-discovery ─────────────────────────────────────────── */
 /*
- * A pool of pre-declared thunks dispatches loaded .rfl files by index.
- * Each thunk calls run_rfl_at(N) which loads the file at that slot and
- * evaluates it under a fresh runtime (via rfl_setup/rfl_teardown).
+ * Every .rfl file under the root is a slot of g_rfl, which grows as the
+ * scan finds them (no fixed count).  Its jobs all run one function,
+ * rfl_thunk, which loads the file of the job's slot (test_job_t.rfl, set
+ * for the job by run_job in g_rfl_cur) and evaluates it under a fresh
+ * runtime (via rfl_setup/rfl_teardown).
  */
 
-#define RFL_THUNK_CAPACITY 1024
-
-static char  g_rfl_paths[RFL_THUNK_CAPACITY][512];
-static char  g_rfl_names[RFL_THUNK_CAPACITY][256];
-static int   g_rfl_count = 0;
+typedef struct { char path[512]; char name[256]; } rfl_slot_t;
+static rfl_slot_t* g_rfl;
+static int         g_rfl_count = 0, g_rfl_cap = 0;
+static int         g_rfl_cur = -1;   /* the running job's slot */
 
 /*
  * .rfl file semantics (line-based, v1-style TEST_ASSERT_EQ/TEST_ASSERT_ER):
@@ -609,10 +610,10 @@ static bool rfl_file_has(const char* path, const char* needle) {
 
 static test_result_t run_rfl_at(int idx) {
     if (idx < 0 || idx >= g_rfl_count) FAIL("invalid .rfl index");
-    test_result_t r = run_rfl_file(g_rfl_paths[idx]);
-    if (r.status == TEST_PASS && rfl_file_has(g_rfl_paths[idx], ";; @also-unfused")) {
+    test_result_t r = run_rfl_file(g_rfl[idx].path);
+    if (r.status == TEST_PASS && rfl_file_has(g_rfl[idx].path, ";; @also-unfused")) {
         ray_expr_disable = true;
-        r = run_rfl_file(g_rfl_paths[idx]);
+        r = run_rfl_file(g_rfl[idx].path);
         ray_expr_disable = false;
         if (r.status == TEST_FAIL) fprintf(stderr, "        (in the unfused pass)\n");
     }
@@ -638,144 +639,8 @@ static void rfl_teardown(void) {
     ray_runtime_destroy(__RUNTIME);
 }
 
-/* Thunk pool — one function per potential .rfl slot. */
-#define RFL_THUNKS(X) \
-    X(  0) X(  1) X(  2) X(  3) X(  4) X(  5) X(  6) X(  7) \
-    X(  8) X(  9) X( 10) X( 11) X( 12) X( 13) X( 14) X( 15) \
-    X( 16) X( 17) X( 18) X( 19) X( 20) X( 21) X( 22) X( 23) \
-    X( 24) X( 25) X( 26) X( 27) X( 28) X( 29) X( 30) X( 31) \
-    X( 32) X( 33) X( 34) X( 35) X( 36) X( 37) X( 38) X( 39) \
-    X( 40) X( 41) X( 42) X( 43) X( 44) X( 45) X( 46) X( 47) \
-    X( 48) X( 49) X( 50) X( 51) X( 52) X( 53) X( 54) X( 55) \
-    X( 56) X( 57) X( 58) X( 59) X( 60) X( 61) X( 62) X( 63) \
-    X( 64) X( 65) X( 66) X( 67) X( 68) X( 69) X( 70) X( 71) \
-    X( 72) X( 73) X( 74) X( 75) X( 76) X( 77) X( 78) X( 79) \
-    X( 80) X( 81) X( 82) X( 83) X( 84) X( 85) X( 86) X( 87) \
-    X( 88) X( 89) X( 90) X( 91) X( 92) X( 93) X( 94) X( 95) \
-    X( 96) X( 97) X( 98) X( 99) X(100) X(101) X(102) X(103) \
-    X(104) X(105) X(106) X(107) X(108) X(109) X(110) X(111) \
-    X(112) X(113) X(114) X(115) X(116) X(117) X(118) X(119) \
-    X(120) X(121) X(122) X(123) X(124) X(125) X(126) X(127) \
-    X(128) X(129) X(130) X(131) X(132) X(133) X(134) X(135) \
-    X(136) X(137) X(138) X(139) X(140) X(141) X(142) X(143) \
-    X(144) X(145) X(146) X(147) X(148) X(149) X(150) X(151) \
-    X(152) X(153) X(154) X(155) X(156) X(157) X(158) X(159) \
-    X(160) X(161) X(162) X(163) X(164) X(165) X(166) X(167) \
-    X(168) X(169) X(170) X(171) X(172) X(173) X(174) X(175) \
-    X(176) X(177) X(178) X(179) X(180) X(181) X(182) X(183) \
-    X(184) X(185) X(186) X(187) X(188) X(189) X(190) X(191) \
-    X(192) X(193) X(194) X(195) X(196) X(197) X(198) X(199) \
-    X(200) X(201) X(202) X(203) X(204) X(205) X(206) X(207) \
-    X(208) X(209) X(210) X(211) X(212) X(213) X(214) X(215) \
-    X(216) X(217) X(218) X(219) X(220) X(221) X(222) X(223) \
-    X(224) X(225) X(226) X(227) X(228) X(229) X(230) X(231) \
-    X(232) X(233) X(234) X(235) X(236) X(237) X(238) X(239) \
-    X(240) X(241) X(242) X(243) X(244) X(245) X(246) X(247) \
-    X(248) X(249) X(250) X(251) X(252) X(253) X(254) X(255) \
-    X(256) X(257) X(258) X(259) X(260) X(261) X(262) X(263) \
-    X(264) X(265) X(266) X(267) X(268) X(269) X(270) X(271) \
-    X(272) X(273) X(274) X(275) X(276) X(277) X(278) X(279) \
-    X(280) X(281) X(282) X(283) X(284) X(285) X(286) X(287) \
-    X(288) X(289) X(290) X(291) X(292) X(293) X(294) X(295) \
-    X(296) X(297) X(298) X(299) X(300) X(301) X(302) X(303) \
-    X(304) X(305) X(306) X(307) X(308) X(309) X(310) X(311) \
-    X(312) X(313) X(314) X(315) X(316) X(317) X(318) X(319) \
-    X(320) X(321) X(322) X(323) X(324) X(325) X(326) X(327) \
-    X(328) X(329) X(330) X(331) X(332) X(333) X(334) X(335) \
-    X(336) X(337) X(338) X(339) X(340) X(341) X(342) X(343) \
-    X(344) X(345) X(346) X(347) X(348) X(349) X(350) X(351) \
-    X(352) X(353) X(354) X(355) X(356) X(357) X(358) X(359) \
-    X(360) X(361) X(362) X(363) X(364) X(365) X(366) X(367) \
-    X(368) X(369) X(370) X(371) X(372) X(373) X(374) X(375) \
-    X(376) X(377) X(378) X(379) X(380) X(381) X(382) X(383) \
-    X(384) X(385) X(386) X(387) X(388) X(389) X(390) X(391) \
-    X(392) X(393) X(394) X(395) X(396) X(397) X(398) X(399) \
-    X(400) X(401) X(402) X(403) X(404) X(405) X(406) X(407) \
-    X(408) X(409) X(410) X(411) X(412) X(413) X(414) X(415) \
-    X(416) X(417) X(418) X(419) X(420) X(421) X(422) X(423) \
-    X(424) X(425) X(426) X(427) X(428) X(429) X(430) X(431) \
-    X(432) X(433) X(434) X(435) X(436) X(437) X(438) X(439) \
-    X(440) X(441) X(442) X(443) X(444) X(445) X(446) X(447) \
-    X(448) X(449) X(450) X(451) X(452) X(453) X(454) X(455) \
-    X(456) X(457) X(458) X(459) X(460) X(461) X(462) X(463) \
-    X(464) X(465) X(466) X(467) X(468) X(469) X(470) X(471) \
-    X(472) X(473) X(474) X(475) X(476) X(477) X(478) X(479) \
-    X(480) X(481) X(482) X(483) X(484) X(485) X(486) X(487) \
-    X(488) X(489) X(490) X(491) X(492) X(493) X(494) X(495) \
-    X(496) X(497) X(498) X(499) X(500) X(501) X(502) X(503) \
-    X(504) X(505) X(506) X(507) X(508) X(509) X(510) X(511) \
-    X(512) X(513) X(514) X(515) X(516) X(517) X(518) X(519) \
-    X(520) X(521) X(522) X(523) X(524) X(525) X(526) X(527) \
-    X(528) X(529) X(530) X(531) X(532) X(533) X(534) X(535) \
-    X(536) X(537) X(538) X(539) X(540) X(541) X(542) X(543) \
-    X(544) X(545) X(546) X(547) X(548) X(549) X(550) X(551) \
-    X(552) X(553) X(554) X(555) X(556) X(557) X(558) X(559) \
-    X(560) X(561) X(562) X(563) X(564) X(565) X(566) X(567) \
-    X(568) X(569) X(570) X(571) X(572) X(573) X(574) X(575) \
-    X(576) X(577) X(578) X(579) X(580) X(581) X(582) X(583) \
-    X(584) X(585) X(586) X(587) X(588) X(589) X(590) X(591) \
-    X(592) X(593) X(594) X(595) X(596) X(597) X(598) X(599) \
-    X(600) X(601) X(602) X(603) X(604) X(605) X(606) X(607) \
-    X(608) X(609) X(610) X(611) X(612) X(613) X(614) X(615) \
-    X(616) X(617) X(618) X(619) X(620) X(621) X(622) X(623) \
-    X(624) X(625) X(626) X(627) X(628) X(629) X(630) X(631) \
-    X(632) X(633) X(634) X(635) X(636) X(637) X(638) X(639) \
-    X(640) X(641) X(642) X(643) X(644) X(645) X(646) X(647) \
-    X(648) X(649) X(650) X(651) X(652) X(653) X(654) X(655) \
-    X(656) X(657) X(658) X(659) X(660) X(661) X(662) X(663) \
-    X(664) X(665) X(666) X(667) X(668) X(669) X(670) X(671) \
-    X(672) X(673) X(674) X(675) X(676) X(677) X(678) X(679) \
-    X(680) X(681) X(682) X(683) X(684) X(685) X(686) X(687) \
-    X(688) X(689) X(690) X(691) X(692) X(693) X(694) X(695) \
-    X(696) X(697) X(698) X(699) X(700) X(701) X(702) X(703) \
-    X(704) X(705) X(706) X(707) X(708) X(709) X(710) X(711) \
-    X(712) X(713) X(714) X(715) X(716) X(717) X(718) X(719) \
-    X(720) X(721) X(722) X(723) X(724) X(725) X(726) X(727) \
-    X(728) X(729) X(730) X(731) X(732) X(733) X(734) X(735) \
-    X(736) X(737) X(738) X(739) X(740) X(741) X(742) X(743) \
-    X(744) X(745) X(746) X(747) X(748) X(749) X(750) X(751) \
-    X(752) X(753) X(754) X(755) X(756) X(757) X(758) X(759) \
-    X(760) X(761) X(762) X(763) X(764) X(765) X(766) X(767) \
-    X(768) X(769) X(770) X(771) X(772) X(773) X(774) X(775) \
-    X(776) X(777) X(778) X(779) X(780) X(781) X(782) X(783) \
-    X(784) X(785) X(786) X(787) X(788) X(789) X(790) X(791) \
-    X(792) X(793) X(794) X(795) X(796) X(797) X(798) X(799) \
-    X(800) X(801) X(802) X(803) X(804) X(805) X(806) X(807) \
-    X(808) X(809) X(810) X(811) X(812) X(813) X(814) X(815) \
-    X(816) X(817) X(818) X(819) X(820) X(821) X(822) X(823) \
-    X(824) X(825) X(826) X(827) X(828) X(829) X(830) X(831) \
-    X(832) X(833) X(834) X(835) X(836) X(837) X(838) X(839) \
-    X(840) X(841) X(842) X(843) X(844) X(845) X(846) X(847) \
-    X(848) X(849) X(850) X(851) X(852) X(853) X(854) X(855) \
-    X(856) X(857) X(858) X(859) X(860) X(861) X(862) X(863) \
-    X(864) X(865) X(866) X(867) X(868) X(869) X(870) X(871) \
-    X(872) X(873) X(874) X(875) X(876) X(877) X(878) X(879) \
-    X(880) X(881) X(882) X(883) X(884) X(885) X(886) X(887) \
-    X(888) X(889) X(890) X(891) X(892) X(893) X(894) X(895) \
-    X(896) X(897) X(898) X(899) X(900) X(901) X(902) X(903) \
-    X(904) X(905) X(906) X(907) X(908) X(909) X(910) X(911) \
-    X(912) X(913) X(914) X(915) X(916) X(917) X(918) X(919) \
-    X(920) X(921) X(922) X(923) X(924) X(925) X(926) X(927) \
-    X(928) X(929) X(930) X(931) X(932) X(933) X(934) X(935) \
-    X(936) X(937) X(938) X(939) X(940) X(941) X(942) X(943) \
-    X(944) X(945) X(946) X(947) X(948) X(949) X(950) X(951) \
-    X(952) X(953) X(954) X(955) X(956) X(957) X(958) X(959) \
-    X(960) X(961) X(962) X(963) X(964) X(965) X(966) X(967) \
-    X(968) X(969) X(970) X(971) X(972) X(973) X(974) X(975) \
-    X(976) X(977) X(978) X(979) X(980) X(981) X(982) X(983) \
-    X(984) X(985) X(986) X(987) X(988) X(989) X(990) X(991) \
-    X(992) X(993) X(994) X(995) X(996) X(997) X(998) X(999) \
-    X(1000) X(1001) X(1002) X(1003) X(1004) X(1005) X(1006) X(1007) \
-    X(1008) X(1009) X(1010) X(1011) X(1012) X(1013) X(1014) X(1015) \
-    X(1016) X(1017) X(1018) X(1019) X(1020) X(1021) X(1022) X(1023)
-
-#define X(N) static test_result_t rfl_thunk_##N(void) { return run_rfl_at(N); }
-RFL_THUNKS(X)
-#undef X
-
-#define X(N) rfl_thunk_##N,
-static const test_func_t rfl_thunks[] = { RFL_THUNKS(X) };
-#undef X
+/* Every .rfl job's function: the file of the job's slot. */
+static test_result_t rfl_thunk(void) { return run_rfl_at(g_rfl_cur); }
 
 /* Walk `cur_dir` recursively.  `base_root` is the top-level directory
  * passed on the original call — kept constant across recursion so every
@@ -792,7 +657,11 @@ static int rfl_scan_at(const char* base_root, const char* cur_dir) {
         char full[512];
         snprintf(full, sizeof full, "%s/%s", cur_dir, ent->d_name);
         struct stat st;
-        if (stat(full, &st) != 0) continue;
+        if (stat(full, &st) != 0) {   /* e.g. a dangling link: not silently left out */
+            fprintf(stderr, "test driver: cannot stat %s under the rfl root\n", full);
+            closedir(d);
+            return -1;
+        }
         if (S_ISDIR(st.st_mode)) {
             if (rfl_scan_at(base_root, full) < 0) { closedir(d); return -1; }
             continue;
@@ -801,22 +670,24 @@ static int rfl_scan_at(const char* base_root, const char* cur_dir) {
         size_t nlen = strlen(ent->d_name);
         if (nlen < 4 || strcmp(ent->d_name + nlen - 4, ".rfl") != 0) continue;
 
-        _Static_assert(sizeof(rfl_thunks) / sizeof(*rfl_thunks) == RFL_THUNK_CAPACITY,
-                       "one thunk per .rfl slot: extend RFL_THUNKS with RFL_THUNK_CAPACITY");
-        if (g_rfl_count >= RFL_THUNK_CAPACITY) {
-            fprintf(stderr, "test driver: more than %d .rfl files — raise RFL_THUNK_CAPACITY\n",
-                    RFL_THUNK_CAPACITY);
-            closedir(d);
-            return -1;
+        if (g_rfl_count == g_rfl_cap) {
+            int cap = g_rfl_cap ? 2 * g_rfl_cap : 1024;
+            rfl_slot_t* grown = (rfl_slot_t*)realloc(g_rfl, (size_t)cap * sizeof *g_rfl);
+            if (!grown) {
+                fprintf(stderr, "test driver: out of memory for %d .rfl files\n", cap);
+                closedir(d);
+                return -1;
+            }
+            g_rfl = grown; g_rfl_cap = cap;
         }
         /* Copy full path into the path slot, bounds-checked. */
         {
             size_t flen = strlen(full);
-            if (flen >= sizeof g_rfl_paths[0]) {
+            if (flen >= sizeof g_rfl[0].path) {
                 fprintf(stderr, "test driver: .rfl path too long: %s\n", full);
                 closedir(d); return -1;
             }
-            memcpy(g_rfl_paths[g_rfl_count], full, flen + 1);
+            memcpy(g_rfl[g_rfl_count].path, full, flen + 1);
         }
 
         /* Name = path relative to BASE_ROOT (not cur_dir), ".rfl" stripped,
@@ -827,8 +698,8 @@ static int rfl_scan_at(const char* base_root, const char* cur_dir) {
         if (strncmp(full, base_root, base_len) == 0 && full[base_len] == '/')
             rel = full + base_len + 1;
         {
-            char*  dst    = g_rfl_names[g_rfl_count];
-            size_t cap    = sizeof g_rfl_names[0];     /* includes trailing NUL */
+            char*  dst    = g_rfl[g_rfl_count].name;
+            size_t cap    = sizeof g_rfl[0].name;     /* includes trailing NUL */
             size_t rellen = strlen(rel);
             if (rellen + 5 > cap) {                    /* 4 for "rfl/" + NUL   */
                 fprintf(stderr, "test driver: .rfl test name too long: rfl/%s\n", rel);
@@ -837,18 +708,18 @@ static int rfl_scan_at(const char* base_root, const char* cur_dir) {
             memcpy(dst, "rfl/", 4);
             memcpy(dst + 4, rel, rellen + 1);
         }
-        char* dot = strrchr(g_rfl_names[g_rfl_count], '.');
+        char* dot = strrchr(g_rfl[g_rfl_count].name, '.');
         if (dot && strcmp(dot, ".rfl") == 0) *dot = '\0';
 
         /* Duplicate-name guard: if two files ever resolve to the same test
          * name, munit will run both but a filter targets both at once — the
          * user can't isolate one.  Fail early so the layout can be fixed. */
         for (int i = 0; i < g_rfl_count; i++) {
-            if (strcmp(g_rfl_names[i], g_rfl_names[g_rfl_count]) == 0) {
+            if (strcmp(g_rfl[i].name, g_rfl[g_rfl_count].name) == 0) {
                 fprintf(stderr,
                         "test driver: duplicate .rfl test name \"%s\":\n"
                         "    %s\n    %s\n",
-                        g_rfl_names[g_rfl_count], g_rfl_paths[i], g_rfl_paths[g_rfl_count]);
+                        g_rfl[g_rfl_count].name, g_rfl[i].path, g_rfl[g_rfl_count].path);
                 closedir(d);
                 return -1;
             }
@@ -1291,6 +1162,7 @@ typedef struct {
     test_entry_t        e;
     const test_entry_t* inner;
     double              est_ms;   /* last recorded wall time; -1 = unknown */
+    int                 rfl;      /* the .rfl slot an rfl_thunk job runs; -1 = none */
 } test_job_t;
 
 static test_job_t* g_jobs;
@@ -1302,7 +1174,11 @@ static void job_add(test_entry_t e, const test_entry_t* inner) {
         g_jobs = (test_job_t*)realloc(g_jobs, (size_t)g_jobs_cap * sizeof *g_jobs);
         if (!g_jobs) { fprintf(stderr, "test driver: out of memory\n"); exit(2); }
     }
-    g_jobs[g_njobs++] = (test_job_t){ .e = e, .inner = inner, .est_ms = -1 };
+    g_jobs[g_njobs++] = (test_job_t){ .e = e, .inner = inner, .est_ms = -1, .rfl = -1 };
+}
+static void job_add_rfl(test_entry_t e, int slot) {
+    job_add(e, NULL);
+    g_jobs[g_njobs - 1].rfl = slot;
 }
 
 static void collect_jobs(const char* filter, bool quick) {
@@ -1321,10 +1197,10 @@ static void collect_jobs(const char* filter, bool quick) {
 
     /* Dynamic .rfl group */
     for (int i = 0; i < g_rfl_count; i++) {
-        if (!name_matches_filter(g_rfl_names[i], filter)) continue;
-        if (quick && quick_skipped(g_rfl_names[i])) continue;
-        job_add((test_entry_t){ .name = g_rfl_names[i], .func = rfl_thunks[i],
-                                .setup = rfl_setup, .teardown = rfl_teardown }, NULL);
+        if (!name_matches_filter(g_rfl[i].name, filter)) continue;
+        if (quick && quick_skipped(g_rfl[i].name)) continue;
+        job_add_rfl((test_entry_t){ .name = g_rfl[i].name, .func = rfl_thunk,
+                                    .setup = rfl_setup, .teardown = rfl_teardown }, i);
     }
 
     /* Equivalence pass: C groups that save and reload tables, then every
@@ -1348,11 +1224,11 @@ static void collect_jobs(const char* filter, bool quick) {
         }
     }
     for (int i = 0; i < g_rfl_count; i++) {
-        snprintf(ename, sizeof ename, "equiv/%.255s", g_rfl_names[i]);
+        snprintf(ename, sizeof ename, "equiv/%.255s", g_rfl[i].name);
         if (!name_matches_filter(ename, filter) || equiv_skipped(ename)) continue;
-        if (!rfl_file_saves(g_rfl_paths[i])) continue;
-        job_add((test_entry_t){ .name = tmp_strdup(ename), .func = rfl_thunks[i],
-                                .setup = equiv_rfl_setup, .teardown = equiv_rfl_teardown }, NULL);
+        if (!rfl_file_saves(g_rfl[i].path)) continue;
+        job_add_rfl((test_entry_t){ .name = tmp_strdup(ename), .func = rfl_thunk,
+                                    .setup = equiv_rfl_setup, .teardown = equiv_rfl_teardown }, i);
     }
 }
 
@@ -1386,7 +1262,9 @@ static int replay_select(const char* path) {
 static test_status_t run_job(const test_job_t* j, int* pass, int* fail, int* skip) {
     int p0 = *pass, s0 = *skip;
     g_equiv_inner = j->inner;
+    g_rfl_cur = j->rfl;
     run_one(&j->e, pass, fail, skip);
+    g_rfl_cur = -1;
     g_equiv_inner = NULL;
     return *pass != p0 ? TEST_PASS : *skip != s0 ? TEST_SKIP : TEST_FAIL;
 }
