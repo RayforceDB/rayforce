@@ -153,3 +153,16 @@
 (set Y5 (as 'F64 (map (fn [i] (if (in i [0 63]) 0.0 1e8)) I4)))
 (cov X5 Y5)
 (select {c: (cov x y) s: (scov x y) from: (table [g x y] (list (% I4 3) X5 Y5)) by: g})
+
+;; #1889: null-free F64 pairs by a wide key take a seed pass per chunk of
+;; rows; a group with several rows in a chunk, with an outlier among them,
+;; keeps the accuracy of the row-by-row path.  Each 4-row group holds
+;; 1e8 + [0 1 2 3], one of them an outlier of 1e10 every 7th group
+(set n9 120000)
+(set i9 (til n9))
+(set X9 (+ 1e8 (as 'F64 (% i9 4))))
+(set X9 (+ X9 (* 1e10 (as 'F64 (== 0 (% i9 28))))))
+(set T9 (table [g x y] (list (div i9 4) X9 (- 7.0 (* 2.0 X9)))))
+(set R9 (at (select {c: (cov x y) from: T9 by: g}) 'c))
+(set W9 (map (fn [k] (cov (take (drop X9 (* 4 k)) 4) (- 7.0 (* 2.0 (take (drop X9 (* 4 k)) 4))))) (til 30000)))
+(< (max (abs (- R9 W9))) (* 1e-9 (max (abs W9)))) -- true

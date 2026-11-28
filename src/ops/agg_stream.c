@@ -805,11 +805,81 @@ static inline int64_t cov_read_i64(const ray_valid_t* v, int64_t i) {
     }                                                                                \
 } while (0)
 
+/* Null-free F64 x F64 pairs (#1889), in chunks of COV_CHUNK rows: a seed
+ * pass first, then the accumulation.  On a wide key every row's state
+ * misses the cache, and a branch on the missed count (is the state new? is
+ * the count due?) waits out the miss and drops the loads in flight behind
+ * it.  The seed pass takes the misses with little work per row: a state
+ * not yet touched takes the row's pair as its pivot, by a bit select and
+ * not a branch.  The accumulation then finds its lines in the cache, where
+ * the due test is a cheap branch.  A group with several rows in a chunk is
+ * seeded by its last one there: still a pair of the group, which is all the
+ * pivot needs to be until its first move to the running mean. */
+#define COV_CHUNK 256
+static inline double cov_select(int64_t keep, double kept, double fresh) {
+    int64_t a, b, m = -(int64_t)(keep != 0);
+    memcpy(&a, &kept, 8); memcpy(&b, &fresh, 8);
+    a = (a & m) | (b & ~m);
+    double r; memcpy(&r, &a, 8);
+    return r;
+}
+/* Whether a batch's rows scatter over states that spill out of the core's
+ * cache, so the chunked path pays (#1889).  Deterministic, from the batch's
+ * own group ids: of its first 64 rows, at least three quarters must jump
+ * more than 4 KiB of states from the row before (a sorted, clustered or
+ * cyclic key walks neighbouring states, which the cache and its prefetch
+ * serve, and there the extra pass only costs), and the largest id seen,
+ * times the state stride, must pass 1 MiB (a key of few groups keeps its
+ * states in the cache). */
+static inline bool cov_states_spill(size_t stride, const uint32_t* gids, int64_t n) {
+    int64_t m = n < 64 ? n : 64, jumps = 0;
+    uint32_t mg = m > 0 ? gids[0] : 0;
+    for (int64_t i = 1; i < m; i++) {
+        uint32_t a = gids[i - 1], b = gids[i];
+        uint64_t d = a > b ? a - b : b - a;
+        jumps += d * stride > 4096;
+        mg = b > mg ? b : mg;
+    }
+    return m >= 16 && jumps * 4 >= 3 * (m - 1) && (uint64_t)mg * stride > ((uint64_t)1 << 20);
+}
+static __attribute__((noinline)) void cov_update2_ff(void* base, size_t stride, const uint32_t* gids,
+                           const double* xd, const double* yd, int64_t n) {
+    if (!cov_states_spill(stride, gids, n)) {
+        for (int64_t i = 0; i < n; i++) {
+            cov_state* st = (cov_state*)((char*)base + (size_t)gids[i]*stride);
+            COV_STATE_ROW(st, xd[i], yd[i], false, false);
+        }
+        return;
+    }
+    for (int64_t lo = 0; lo < n; lo += COV_CHUNK) {
+        int64_t hi = n - lo > COV_CHUNK ? lo + COV_CHUNK : n;
+        for (int64_t i = lo; i < hi; i++) {
+            cov_state* st = (cov_state*)((char*)base + (size_t)gids[i]*stride);
+            int64_t n0 = st->n;
+            st->pivx = cov_select(n0, st->pivx, xd[i]);
+            st->pivy = cov_select(n0, st->pivy, yd[i]);
+        }
+        for (int64_t i = lo; i < hi; i++) {
+            cov_state* st = (cov_state*)((char*)base + (size_t)gids[i]*stride);
+            double dx = xd[i] - st->pivx, dy = yd[i] - st->pivy;
+            ray_comom_add(dx, dy, &st->sx, &st->sy, &st->sxy);
+            int64_t c = ++st->n;
+            if (RAY_UNLIKELY(ray_comom_due(c)))
+                ray_comom_repivot_cold(0u, (double)c, &st->pivx, &st->pivy,
+                                       &st->sx, &st->sy, &st->sxy);
+        }
+    }
+}
+
 static void cov_update2(void* base, size_t stride, const uint32_t* gids,
                         const void* vx, const void* vy,
                         const ray_valid_t* valx, const ray_valid_t* valy,
                         int64_t n, acc_arena_t* a) {
     (void)a; (void)vx; (void)vy;
+    if (!valx->has_nulls && !valy->has_nulls && valx->type == RAY_F64 && valy->type == RAY_F64) {
+        cov_update2_ff(base, stride, gids, valx->base, valy->base, n);
+        return;
+    }
     #define COV_ROW(i, xv, yv, XI, YI) do {                                          \
         cov_state* st = (cov_state*)((char*)base + (size_t)gids[i]*stride);          \
         COV_STATE_ROW(st, xv, yv, XI, YI);                                           \
