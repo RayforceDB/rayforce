@@ -42,8 +42,9 @@
 ;; ====================================================================
 ;; (.graph.random-walk h src [walk-len])
 ;; -- result schema: {_step, _node}, walk-len+1 rows max (or fewer if
-;;    a dead-end node is hit).  The PRNG is xorshift64 seeded from
-;;    src_id, so results are deterministic for a given start node.
+;;    a dead-end node is hit).  The steps draw from rand's stream (#1910),
+;;    so the path depends on the stream's position: assert what every
+;;    path from the node shares.
 ;; ====================================================================
 
 ;; Default walk-len is 10 -> 11 rows.  Node 0 has out-edges so the walk
@@ -59,21 +60,34 @@
 ;; All nodes in the walk are valid IDs in [0..5].
 (>= (min (at Rw '_node)) 0)                      -- true
 (<= (max (at Rw '_node)) 5)                      -- true
-;; The PRNG is xorshift64 seeded from src_id=0, so the walk is fully
-;; deterministic.  Hand-traced on this DAG it picks 0->2->3->5 and then
-;; dead-ends at the sink (node 5), giving exactly these step/node columns.
-(at Rw '_node)                                   -- [0 2 3 5]
-(at Rw '_step)                                   -- [0 1 2 3]
-(count Rw)                                       -- 4
+;; Every path from 0 on this DAG reaches the sink (node 5) in 3 or 4
+;; steps (0->1->3->5, 0->2->3->5, 0->2->4->5, 0->1->2->3->5,
+;; 0->1->2->4->5) and dead-ends there; every step is an edge.
+(set GE (+ (* (at Edges 'src) 6) (at Edges 'dst)))
+(set Steps (fn [w] (+ (* (take w (- (count w) 1)) 6) (take w (- 1 (count w))))))
+(last (at Rw '_node))                            -- 5
+(in (count Rw) [4 5])                            -- true
+(all (in (Steps (at Rw '_node)) GE))             -- true
+(at Rw '_step)                                   -- (til (count Rw))
 
-;; Custom walk-len; result has at most walk-len+1 rows.  walk-len=3 still
-;; reaches the sink at depth 3 first, so the deterministic walk is the
-;; same 0->2->3->5 sequence.
+;; Custom walk-len; result has at most walk-len+1 rows.  No path from 0
+;; reaches the sink in fewer than 3 steps, so walk-len=3 always gives 4
+;; rows, each step an edge.
 (set Rw3 (.graph.random-walk G 0 3))
 (<= (count Rw3) 4)                               -- true
 (>= (count Rw3) 1)                               -- true
 (first (at Rw3 '_node))                          -- 0
-(at Rw3 '_node)                                  -- [0 2 3 5]
+(count Rw3)                                      -- 4
+(all (in (Steps (at Rw3 '_node)) GE))            -- true
+;; The same at 40 positions of the stream: walk i is preceded by a draw of i
+;; values, so the starts are spread, not only one walk apart.  Nothing in
+;; this file or in a file run after it in the same process asserts a value
+;; fixed by the stream's position (those checks run in fresh processes:
+;; rand_process.rfl, random_walk_process.rfl), so the draws disturb none.
+(set Ok10 (fn [w] (and (== (last w) 5) (in (count w) [4 5]) (all (in (Steps w) GE)))))
+(set Ok3 (fn [w] (and (== (count w) 4) (all (in (Steps w) GE)))))
+(all (map (fn [i] (do (rand i 2) (Ok10 (at (.graph.random-walk G 0) '_node)))) (til 40))) -- true
+(all (map (fn [i] (do (rand i 2) (Ok3 (at (.graph.random-walk G 0 3) '_node)))) (til 40))) -- true
 
 ;; Starting from a sink (node 5) immediately dead-ends -> 1 row only.
 (set RwSink (.graph.random-walk G 5 10))

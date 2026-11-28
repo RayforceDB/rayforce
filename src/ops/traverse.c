@@ -22,6 +22,7 @@
  */
 
 #include "ops/internal.h"
+#include "ops/rand.h"     /* the engine's random stream: random walk */
 #include "core/numparse.h"   /* ray_snprintf_c */
 
 /* ============================================================================
@@ -2078,7 +2079,8 @@ ray_t* exec_mst(ray_graph_t* g, ray_op_t* op) {
 }
 
 /* --------------------------------------------------------------------------
- * exec_random_walk: random walk from source node using xorshift64 PRNG.
+ * exec_random_walk: random walk from source node, drawing from the engine's
+ * random stream (ops/rand.h).
  * -------------------------------------------------------------------------- */
 ray_t* exec_random_walk(ray_graph_t* g, ray_op_t* op, ray_t* src_val) {
     ray_op_ext_t* ext = find_ext(g, op->id);
@@ -2113,9 +2115,11 @@ ray_t* exec_random_walk(ray_graph_t* g, ray_op_t* op, ray_t* src_val) {
     int64_t* sdata = (int64_t*)ray_data(step_vec);
     int64_t* ndata = (int64_t*)ray_data(node_vec);
 
-    /* xorshift64 PRNG seeded from source node */
-    uint64_t rng = (uint64_t)start_node * 6364136223846793005ULL + 1442695040888963407ULL;
-    if (rng == 0) rng = 1;
+    /* The steps draw from the engine's random stream (ops/rand.h), which
+     * rand draws from too: the walk takes walk_len positions, whether or
+     * not it reaches a dead end first, and step i picks its neighbour from
+     * position base + i, uniform over the node's out-edges (#1910) */
+    uint64_t base = ray_rand_reserve(walk_len);
 
     int64_t current = start_node;
     int64_t count = 0;
@@ -2126,8 +2130,7 @@ ray_t* exec_random_walk(ray_graph_t* g, ray_op_t* op, ray_t* src_val) {
         if (i < walk_len) {
             int64_t deg = fwd_off[current + 1] - fwd_off[current];
             if (deg == 0) break;  /* dead end */
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-            int64_t pick = (int64_t)(rng % (uint64_t)deg);
+            int64_t pick = (int64_t)ray_rand_below(ray_rand_value(base + (uint64_t)i), (uint64_t)deg);
             current = fwd_tgt[fwd_off[current] + pick];
         }
     }
