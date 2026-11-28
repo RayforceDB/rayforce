@@ -52,11 +52,11 @@
 ;; a file with quotes splits rows at a lone CR as well
 (.sys.exec "printf 'a,b,c\\r1,\"x\",2.5\\r2,y\\r' > rf_test_csvst_cr.csv") -- 0
 (M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_cr.csv"))) -- ".csv.read \"rf_test_csvst_cr.csv\": line 3: expected 3 cells, got 2"
-;; one without quotes splits at LF only and ends a cell at CR: lenient reads
-;; one row and drops the text after its first CR, which strict refuses
+;; and so does one without quotes (#1891): every row is read, and checked
 (.sys.exec "printf 'a,b,c\\r1,x,2.5\\r2,y,3.5\\r' > rf_test_csvst_cr2.csv") -- 0
-(count (.csv.read [I64 SYM F64] "rf_test_csvst_cr2.csv")) -- 1
-(M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_cr2.csv"))) -- ".csv.read \"rf_test_csvst_cr2.csv\": line 2: text after a CR inside the row (a row ends at LF or CRLF)"
+(count (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_cr2.csv")) -- 2
+(.sys.exec "printf 'a,b,c\\r1,x,2.5\\r2,y\\r' > rf_test_csvst_cr3.csv") -- 0
+(M (fn [] (.csv.read {strict: true} [I64 SYM F64] "rf_test_csvst_cr3.csv"))) -- ".csv.read \"rf_test_csvst_cr3.csv\": line 3: expected 3 cells, got 2"
 ;; a bad cell that itself spans lines is reported at the line its row starts on
 (.sys.exec "printf 'a,b\\n\"1\\n2\",x\\n' > rf_test_csvst_qbad.csv") -- 0
 (M (fn [] (.csv.read {strict: true} [I64 SYM] "rf_test_csvst_qbad.csv"))) -- ".csv.read \"rf_test_csvst_qbad.csv\": line 2, column a: \"1\\n2\" is not an I64"
