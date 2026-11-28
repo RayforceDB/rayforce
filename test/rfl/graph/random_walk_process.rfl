@@ -1,0 +1,13 @@
+;; @requires: posix  (the child processes are run through a POSIX shell via .sys.exec)
+;; .graph.random-walk in a fresh process, whose stream position is fixed
+;; (#1910): the first walks are the same at any worker count, and the
+;; neighbour choice is uniform: over one walk of 60000 steps on K4, the step
+;; from node a to node b falls in bucket (b - a) mod 4, one of 1, 2, 3, each a
+;; third of the steps; a chi-square over the 3 buckets (2 degrees of
+;; freedom, so about 2) is under 20, and the values are fixed.
+(write "rf_test_rwalk_child.rfl" "(set K (table [src dst w] (list [0 0 0 1 1 1 2 2 2 3 3 3] [1 2 3 0 2 3 0 1 3 0 1 2] [1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0])))\n(set G (.graph.build K 'src 'dst 'w))\n(println (at (.graph.random-walk G 0 8) '_node))\n(println (at (.graph.random-walk G 0 8) '_node))\n(set w (at (.graph.random-walk G 0 60000) '_node))\n(set d (% (- (take w -60000) (take w 60000)) 4))\n(set X (sum (map (fn [k] (/ (* (- (count (where (== d k))) 20000.0) (- (count (where (== d k))) 20000.0)) 20000.0)) [1 2 3])))\n(println (and (== (count (where (== d 0))) 0) (< X 20)))\n") -- 0
+(.sys.exec "./rayforce -c 1 -f rf_test_rwalk_child.rfl > rf_test_rwalk_c1.out && ./rayforce -c 4 -f rf_test_rwalk_child.rfl > rf_test_rwalk_c4.out && cmp -s rf_test_rwalk_c1.out rf_test_rwalk_c4.out") -- 0
+(.sys.exec "head -1 rf_test_rwalk_c4.out | grep -qx '\\[0 3 1 0 3 0 1 0 3\\]'") -- 0
+(.sys.exec "sed -n 2p rf_test_rwalk_c4.out | grep -qx '\\[0 1 3 1 3 1 2 3 1\\]'") -- 0
+(.sys.exec "sed -n 3p rf_test_rwalk_c4.out | grep -qx true") -- 0
+(.sys.exec "rm -f rf_test_rwalk_child.rfl rf_test_rwalk_c1.out rf_test_rwalk_c4.out") -- 0

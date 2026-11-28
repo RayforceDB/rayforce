@@ -96,6 +96,8 @@ Signature: `(.graph.dfs g src [max-depth])`. Returns `{_node, _depth, _parent}` 
 
 Signature: `(.graph.random-walk g src [walk-len])`. Returns `{_step, _node}`. Default `walk-len` is 10.
 
+Each step moves to one of the current node's out-neighbours, chosen uniformly (edge weights are not used); the walk stops early at a node with none. The choices come from the engine's random stream, the one [`rand`](../language/functions.md) draws from: successive walks from the same node differ, a fresh process gives the same walks in the same order on every platform and at any worker count, and a walk takes `walk-len` values of the stream (whether or not it stops early), so a `rand` or a walk advances the other.
+
 ## `.graph.shortest-path` { #graph-shortest-path }
 
 Signature: `(.graph.shortest-path g src dst [max-depth])`. Bidirectional BFS — unweighted hop-count shortest path. Default `max-depth` is 255.

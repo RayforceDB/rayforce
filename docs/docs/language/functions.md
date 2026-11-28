@@ -549,7 +549,9 @@ An `as` to I16, I32, DATE or TIME whose result is the target's minimum gives tha
   process starts at the same point, and each value is uniform over
   `[0, max)` for any positive `max` up to the largest I64. That is what makes
   tests and simulations reproducible, and changing `guid`'s seeding
-  deliberately left it alone.
+  deliberately left it alone. [`.graph.random-walk`](../namespaces/graph.md#graph-random-walk)
+  draws its steps from the same stream, so a walk advances `rand`'s sequence
+  and a `rand` changes the walks that follow it.
 
 ```lisp
 (first (guid 1))   ;; a different value in every process

@@ -1,0 +1,35 @@
+;; .graph.random-walk draws from the engine's random stream, the one rand
+;; draws from (#1910): successive walks from the same node differ (each was a
+;; fixed function of its start node), and every step follows an edge.  The
+;; fixed first walks of a fresh process are in random_walk_process.rfl.
+
+;; K4: every node has the other three as out-neighbours
+(set K (table [src dst w] (list [0 0 0 1 1 1 2 2 2 3 3 3] [1 2 3 0 2 3 0 1 3 0 1 2] [1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0])))
+(set GK (.graph.build K 'src 'dst 'w))
+(set KE (+ (* (at K 'src) 4) (at K 'dst)))
+;; every step of a walk is an edge of the graph
+(set Steps (fn [w] (+ (* (take w (- (count w) 1)) 4) (take w (- 1 (count w))))))
+(set W1 (at (.graph.random-walk GK 0 64) '_node))
+(set W2 (at (.graph.random-walk GK 0 64) '_node))
+(count W1) -- 65
+(first W1) -- 0
+(all (in (Steps W1) KE)) -- true
+(all (in (Steps W2) KE)) -- true
+;; two walks from the same node differ (64 steps of 3 choices each)
+(all (== W1 W2)) -- false
+;; a rand between them advances the same stream; the walks still follow edges
+(count (rand 5 10)) -- 5
+(all (in (Steps (at (.graph.random-walk GK 2 64) '_node)) KE)) -- true
+
+;; a directed graph with a dead end: the walk stops there, every step an edge
+(set D (table [src dst w] (list [0 0 1 1 2 2 3 4] [1 2 2 3 3 4 5 5] [1.0 4.0 2.0 5.0 1.0 3.0 2.0 1.0])))
+(set GD (.graph.build D 'src 'dst 'w))
+(set DE (+ (* (at D 'src) 6) (at D 'dst)))
+(set WD (at (.graph.random-walk GD 0 10) '_node))
+(last WD) -- 5
+(all (in (+ (* (take WD (- (count WD) 1)) 6) (take WD (- 1 (count WD)))) DE)) -- true
+;; walk length 1: the start and one step
+(count (.graph.random-walk GK 1 1)) -- 2
+(at (.graph.random-walk GD 5 3) '_node) -- [5]
+(.graph.random-walk GK 4) !- range
+(.graph.random-walk GK 0 0) !- domain

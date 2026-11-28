@@ -165,7 +165,7 @@
 
 ;; ======================================================================
 ;; 7. exec_random_walk — deterministic dead-end on CHAIN (each node has at
-;;    most one out-edge, so xorshift pick is irrelevant after step 0).
+;;    most one out-edge, so the random pick is irrelevant after step 0).
 ;;    Walk from node 0 with walk_len=10:
 ;;      step 0 → 0, step 1 → 1, step 2 → 2, step 3 → 3 (dead end, break).
 ;;    Expected output: 4 rows, nodes = [0,1,2,3], steps = [0,1,2,3].
@@ -192,9 +192,8 @@
 
 ;; ======================================================================
 ;; 8. exec_random_walk — invariants on a branching DAG (DAG1).
-;;    The xorshift64 seed is derived from start_node, so for a given
-;;    (graph, start_node, walk_len) the output is deterministic but its
-;;    exact path depends on RNG bits — assert structural invariants only.
+;;    The steps draw from rand's stream (#1910), so the exact path depends
+;;    on the stream's position — assert structural invariants only.
 ;; ======================================================================
 (set RwDag1 (.graph.random-walk DAG1 0 5))
 ;; total = walk_len + 1 = 6 maximum (may be shorter if a dead-end is hit).
