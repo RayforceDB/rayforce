@@ -138,6 +138,15 @@ ray_err_t ray_csv_save_splayed_ex(const char* path, char delimiter, bool header,
                                   ray_csv_opts_t* opts);
 ray_err_t ray_write_csv(ray_t* table, const char* path);
 
+#ifdef DEBUG
+/* Test seam (#1894): the nth allocation of a block for escaped text cells
+ * from now fails, on any thread (0 disarms); the count is the blocks
+ * allocated since arming, the live count those not yet freed. */
+void    ray_csv_esc_fail_for_test(int64_t nth);
+int64_t ray_csv_esc_allocs_for_test(void);
+int64_t ray_csv_esc_live_for_test(void);   /* blocks allocated, not yet freed */
+#endif
+
 /* After a failed ray_csv_save_splayed_mode / ray_csv_save_parted_mode: the
  * call on the source that failed ("open", "stat", "map", "directory", or "empty"
  * for an empty file) and its errno, saved at that call; false when the source was

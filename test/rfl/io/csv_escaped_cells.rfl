@@ -1,0 +1,44 @@
+;; @requires: posix  (fixtures are written through a POSIX shell via .sys.exec)
+;; Quoted cells with doubled quotes (#1890).  The parse unescapes such a cell
+;; into a stack buffer and keeps a copy until the strings are filled in; the
+;; copies used to take one page mapping each (about 6.5 microseconds and 4 KB
+;; a cell), and now share blocks freed with the load.  The values must not
+;; change: small cells, cells past the 8 KB stack buffer and cells past a
+;; quarter block, across the parallel parse and the splayed reader.
+;; Fixtures use the rf_test_csvesc_ prefix (the Makefile removes rf_test_*.csv).
+
+(.sys.exec "rm -rf rf_test_csvesc_* rf_test_csvesc_sp") -- 0
+
+;; ── 100000 rows (past the serial cutoff), each with one escaped cell ───────
+(.sys.exec "awk 'BEGIN{print \"id,note,k\"; for(i=1;i<=100000;i++) printf \"%d,\\\"n,%d\\\"\\\"x\\\",%d\\n\", i, i, i%7}' > rf_test_csvesc_a.csv") -- 0
+(set P0 (at (.sys.mem) 'anon-peak))
+(set A (.csv.read [I64 STR I64] "rf_test_csvesc_a.csv"))
+;; a mapping per cell raised the process's anonymous peak by about 400 MB here
+(< (- (at (.sys.mem) 'anon-peak) P0) 128000000) -- true
+(count A) -- 100000
+(at (at A 'note) 0) -- "n,1\"x"
+(at (at A 'note) 99999) -- "n,100000\"x"
+(sum (at A 'k)) -- 300000
+(count (distinct (at A 'note))) -- 100000
+;; the same cells as SYM
+(set S (.csv.read [I64 SYM I64] "rf_test_csvesc_a.csv"))
+(format "%" (at (at S 'note) 4)) -- "n,5\"x"
+(count (distinct (at S 'note))) -- 100000
+
+;; ── cells past the 8 KB stack buffer and past a quarter block (256 KB) ─────
+(.sys.exec "awk 'BEGIN{print \"id,note\"; s=\"\"; for(j=0;j<1000;j++) s=s \"ab\"; t=\"\"; for(j=0;j<70;j++) t=t s; for(i=1;i<=20000;i++){ if(i==7) printf \"%d,\\\"%s\\\"\\\"%s\\\"\\n\", i, s s s s s, s; else if(i==15000) printf \"%d,\\\"%s\\\"\\\"\\\"\\n\", i, t; else printf \"%d,\\\"q\\\"\\\"%d\\\"\\n\", i, i } }' > rf_test_csvesc_b.csv") -- 0
+(set B (.csv.read [I64 STR] "rf_test_csvesc_b.csv"))
+(count B) -- 20000
+(count (at (at B 'note) 6)) -- 12001
+(at (at (at B 'note) 6) 10000) -- "\""
+(count (at (at B 'note) 14999)) -- 140001
+(at (at (at B 'note) 14999) 140000) -- "\""
+(at (at B 'note) 0) -- "q\"1"
+(at (at B 'note) 19999) -- "q\"20000"
+
+;; ── the splayed reader keeps them the same way ─────────────────────────────
+(set SP (.csv.splayed [I64 STR I64] "rf_test_csvesc_a.csv" "rf_test_csvesc_sp"))
+(count SP) -- 100000
+(at (at SP 'note) 54321) -- "n,54322\"x"
+
+(.sys.exec "rm -rf rf_test_csvesc_* rf_test_csvesc_sp") -- 0
