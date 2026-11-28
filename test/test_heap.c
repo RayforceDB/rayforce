@@ -2829,6 +2829,545 @@ static test_result_t test_direct_cache_replaces_old_blocks(void) {
     PASS();
 }
 
+/* Mapped address space of the process in KB (statm field 1), or 0 where
+ * /proc is unavailable.  Only the Linux huge-page tests use it. */
+#if defined(RAY_OS_LINUX) && defined(DEBUG)
+static size_t heap_vm_kb(void) {
+    int fd = open("/proc/self/statm", O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[128];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    unsigned long long pages = strtoull(buf, NULL, 10);
+    long pgsz = sysconf(_SC_PAGESIZE);
+    return pgsz > 0 ? (size_t)((pages * (unsigned long long)pgsz) / 1024) : 0;
+}
+
+/* The PMD order of this machine: a free block of 2^order pages is one PMD
+ * huge page (9 on x86-64 with 4 KB pages).  -1 without huge pages. */
+static int hb_pmd_order(void) {
+    size_t pg = ray_vm_page_size(), pmd = ray_vm_pmd_size();
+    if (pmd <= pg) return -1;
+    int o = 0;
+    while ((pg << o) < pmd) o++;
+    return o;
+}
+
+/* Whether this kernel takes MADV_HUGEPAGE at all (built with transparent
+ * huge pages): the advice the heap gives, asked of a mapping of its own. */
+static bool hb_kernel_advises(void) {
+    size_t pmd = ray_vm_pmd_size();
+    if (!pmd) return false;
+    void* p = mmap(NULL, 2 * pmd, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return false;
+    bool ok = madvise(p, 2 * pmd, MADV_HUGEPAGE) == 0;
+    munmap(p, 2 * pmd);
+    return ok;
+}
+
+/* A fixture file under this process's own temporary root. */
+static void hb_path(char* out, size_t n, const char* tag) {
+    char p[128];
+    snprintf(p, sizeof(p), "/tmp/rf_buddyinfo_%s", tag);
+    snprintf(out, n, "%s", ray_test_tmp(p));
+}
+
+/* A /proc/buddyinfo for `nodes` nodes, in the kernel's layout ("Node %d,
+ * zone %8s " and a "%6lu " count per order, 0 to 10 or past the PMD
+ * order), with free[i] PMD pages free on node i and the low orders full,
+ * as on a fragmented box (thousands of small blocks, which add nothing).
+ * The 5.4 shape: node 0 has DMA and DMA32 zones too, its PMD pages split
+ * between DMA32 and Normal, every line ending in a space and a newline.
+ * The 6.x shape of a large box: a Movable zone after Normal, counts wider
+ * than their column, the free PMD pages as blocks of the next order (two
+ * PMD pages each) and an odd one at the PMD order, and no newline after
+ * the last line. */
+static bool hb_buddy_write(const char* path, int nodes, const long long* free, bool v6) {
+    int po = hb_pmd_order();
+    if (po < 0) return false;
+    int cols = po + 2 > 11 ? po + 2 : 11;
+    FILE* f = fopen(path, "w");
+    if (!f) return false;
+    for (int nd = 0; nd < nodes; nd++) {
+        long long pm = free[nd];
+        if (!v6 && nd == 0) {
+            fprintf(f, "Node %d, zone %8s ", nd, "DMA");
+            for (int o = 0; o < cols; o++) fprintf(f, "%6lu ", o < po ? 1ul : 0ul);
+            fprintf(f, "\n");
+            long long d32 = pm / 3;
+            pm -= d32;
+            fprintf(f, "Node %d, zone %8s ", nd, "DMA32");
+            for (int o = 0; o < cols; o++)
+                fprintf(f, "%6llu ", o < po ? 7ull : o == po ? (unsigned long long)d32 : 0ull);
+            fprintf(f, "\n");
+        }
+        fprintf(f, "Node %d, zone %8s ", nd, "Normal");
+        for (int o = 0; o < cols; o++) {
+            unsigned long long c = o < po ? (v6 ? 98765432ull : 87078ull) : 0ull;
+            if (o == po) c = v6 ? (unsigned long long)(pm % 2) : (unsigned long long)pm;
+            if (o == po + 1 && v6) c = (unsigned long long)(pm / 2);
+            fprintf(f, "%6llu ", c);
+        }
+        if (v6) {
+            fprintf(f, "\nNode %d, zone %8s ", nd, "Movable");
+            for (int o = 0; o < cols; o++) fprintf(f, "%6lu ", o < po ? 3ul : 0ul);
+        }
+        if (!v6 || nd + 1 < nodes) fprintf(f, "\n");
+    }
+    return fclose(f) == 0;
+}
+static bool hb_text_write(const char* path, const char* text) {
+    FILE* f = fopen(path, "w");
+    if (!f) return false;
+    fputs(text, f);
+    return fclose(f) == 0;
+}
+
+/* One direct block of exactly `map` mapped bytes, and what the heap made of
+ * it: advised for huge pages (the count rose), anonymous, its transient
+ * bytes (the early release) and its data capacity. */
+typedef struct { bool huge, anon, aligned; size_t tr, data; } hb_probe_t;
+static ray_t* hb_alloc(size_t map, hb_probe_t* o) {
+    int64_t n0 = ray_heap_direct_huge_count();
+    ray_t* b = ray_alloc(map - RAY_DIRECT_HDR - 32);
+    o->huge = ray_heap_direct_huge_count() == n0 + 1;
+    o->anon = b && !ray_direct_file_backed(b);
+    o->aligned = b && (((uintptr_t)b - RAY_DIRECT_HDR) & (ray_vm_pmd_size() - 1)) == 0;
+    o->tr = b ? ray_raw_transient_bytes(ray_data(b)) : 0;
+    o->data = b ? ray_block_data_bytes(b) : 1;
+    return b;
+}
+static hb_probe_t hb_once(size_t map) {
+    hb_probe_t o;
+    ray_t* b = hb_alloc(map, &o);
+    if (b) ray_free(b);
+    return o;
+}
+#endif
+
+/* The free huge pages per node, as /proc/buddyinfo has them: the blocks of
+ * the PMD order and up, each its pages' bytes, over the node's zones —
+ * read from the 5.4 and the 6.x layouts alike.  A file that is missing,
+ * empty or of another shape, or that lists more nodes than asked for,
+ * tells nothing (0 nodes), and so the heap takes the plain mapping. */
+static test_result_t test_buddyinfo_free_huge(void) {
+#if !defined(RAY_OS_LINUX) || !defined(DEBUG)
+    SKIP("the buddyinfo reader is Linux only; its path seam is DEBUG");
+#else
+    if (hb_pmd_order() < 0) SKIP("no PMD huge pages");
+    const int64_t pmd = (int64_t)ray_vm_pmd_size();
+    char p54[512], p6[512], pbad[512], pmiss[512];
+    hb_path(p54, sizeof(p54), "k54");
+    hb_path(p6, sizeof(p6), "k6");
+    hb_path(pbad, sizeof(pbad), "bad");
+    hb_path(pmiss, sizeof(pmiss), "missing");
+    unlink(pmiss);
+    const long long f54[2] = { 1000, 37 }, f6[2] = { 12345679, 3 };
+    bool written = hb_buddy_write(p54, 2, f54, false) && hb_buddy_write(p6, 2, f6, true);
+    int64_t b[RAY_VM_MAX_NODES] = {0};
+    ray_vm_test_buddyinfo_path_set(p54);
+    int n54 = ray_vm_free_huge_bytes(b, RAY_VM_MAX_NODES);
+    int64_t b54[2] = { b[0], b[1] };
+    int n54_one = ray_vm_free_huge_bytes(b, 1);   /* two nodes listed, room for one */
+    ray_vm_test_buddyinfo_path_set(p6);
+    int n6 = ray_vm_free_huge_bytes(b, RAY_VM_MAX_NODES);
+    int64_t b6[2] = { b[0], b[1] };
+    /* nothing usable */
+    static const char* const bad[] = {
+        "",
+        "\n",
+        "Node 0, zone   Normal\n",
+        "Node 0, zone   Normal  1 2 3 x 5 6 7 8 9 10 11\n",
+        "Node 0 zone   Normal  1 2 3 4 5 6 7 8 9 10 11\n",
+        "node 0, zone   Normal  1 2 3 4 5 6 7 8 9 10 11\n",
+        "Node -1, zone   Normal  1 2 3 4 5 6 7 8 9 10 11\n",
+        "Node 0, zone   Normal  1 2 3 4 5 6 7 8 9 10 11\n garbage\n",
+    };
+    int bad_n = 0, bad_files = 0;
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        if (!hb_text_write(pbad, bad[i])) continue;
+        bad_files++;
+        ray_vm_test_buddyinfo_path_set(pbad);
+        bad_n += ray_vm_free_huge_bytes(b, RAY_VM_MAX_NODES) != 0;
+    }
+    ray_vm_test_buddyinfo_path_set(pmiss);
+    int n_miss = ray_vm_free_huge_bytes(b, RAY_VM_MAX_NODES);
+    ray_vm_test_buddyinfo_path_set(NULL);
+    int n_real = ray_vm_free_huge_bytes(b, RAY_VM_MAX_NODES);
+    bool real_file = access("/proc/buddyinfo", R_OK) == 0;
+    unlink(p54); unlink(p6); unlink(pbad);
+    TEST_ASSERT(written, "fixtures written");
+    TEST_ASSERT_EQ_I(n54, 2);
+    TEST_ASSERT_EQ_I(b54[0], 1000 * pmd);
+    TEST_ASSERT_EQ_I(b54[1], 37 * pmd);
+    TEST_ASSERT_EQ_I(n54_one, 0);
+    TEST_ASSERT_EQ_I(n6, 2);
+    TEST_ASSERT_EQ_I(b6[0], 12345679 * pmd);
+    TEST_ASSERT_EQ_I(b6[1], 3 * pmd);
+    TEST_ASSERT_EQ_I(bad_files, (int64_t)(sizeof(bad) / sizeof(bad[0])));
+    TEST_ASSERT_EQ_I(bad_n, 0);
+    TEST_ASSERT_EQ_I(n_miss, 0);
+    if (real_file) TEST_ASSERT(n_real >= 1, "this machine's own buddyinfo reads");
+    PASS();
+#endif
+}
+
+/* A direct block over the cache's budget is advised for huge pages only
+ * when every NUMA node has free blocks of a PMD page or larger for half
+ * again its share of the block and of the advised blocks still live.  The
+ * shape of a fragmented box (thousands of small free blocks, none of the
+ * PMD order) takes the plain mapping, as does a file that tells nothing,
+ * and such a block gets the early page release a huge one does not.
+ * Exactly at the bound the block takes huge pages, one PMD page under it
+ * not.  Of two nodes, the one short of its share decides, however much
+ * the other has.  With room for one block, a second one live beside it is
+ * plain, and once the first is freed a third takes huge pages again. */
+static test_result_t test_direct_huge_buddyinfo(void) {
+#if !defined(RAY_OS_LINUX) || !defined(DEBUG)
+    SKIP("direct blocks take huge pages on Linux only; the seams are DEBUG");
+#else
+    if (hb_pmd_order() < 0 || !hb_kernel_advises()) SKIP("this kernel has no transparent huge pages");
+    const size_t pmd = ray_vm_pmd_size();
+    /* map = 4k PMD pages, over the 512 MB cache budget of an 8 GB budget:
+     * one node needs 6k PMD pages free for it, each of two nodes 3k. */
+    long long k = (long long)(((size_t)600 << 20) + 4 * pmd - 1) / (long long)(4 * pmd);
+    const size_t map = (size_t)(4 * k) * pmd;
+    char path[512], miss[512];
+    hb_path(path, sizeof(path), "gate");
+    hb_path(miss, sizeof(miss), "gate_missing");
+    unlink(miss);
+    ray_heap_direct_cache_drain();
+    int64_t previous = ray_heap_anon_watermark();
+    bool    was_lock = ray_heap_set_lock(false);
+    ray_heap_set_anon_watermark(INT64_C(8) << 30);
+    ray_heap_test_direct_huge_min_budget(INT64_C(8) << 30);
+    ray_heap_test_direct_thp(1);   /* the kernel's mode as "madvise" */
+    ray_vm_test_buddyinfo_path_set(path);
+    int64_t o0 = ray_heap_direct_huge_outstanding();
+    bool w = true;
+    /* the fragmented box: nothing of the PMD order on either node */
+    const long long zero[2] = { 0, 0 };
+    w &= hb_buddy_write(path, 2, zero, false);
+    hb_probe_t frag = hb_once(map);
+    /* one node: exactly at the bound, and one PMD page under it */
+    const long long at[1] = { 6 * k }, under[1] = { 6 * k - 1 };
+    w &= hb_buddy_write(path, 1, at, true);
+    hb_probe_t at1 = hb_once(map);
+    w &= hb_buddy_write(path, 1, under, false);
+    hb_probe_t under1 = hb_once(map);
+    /* two nodes: the short one decides; each at its share */
+    const long long skew[2] = { 100 * k, 3 * k - 1 }, even[2] = { 3 * k, 3 * k };
+    w &= hb_buddy_write(path, 2, skew, true);
+    hb_probe_t skew2 = hb_once(map);
+    w &= hb_buddy_write(path, 2, even, false);
+    hb_probe_t even2 = hb_once(map);
+    /* a file that tells nothing, and none */
+    w &= hb_text_write(path, "");
+    hb_probe_t empty = hb_once(map);
+    w &= hb_text_write(path, "Node 0, zone   Normal  junk\n");
+    hb_probe_t broken = hb_once(map);
+    ray_vm_test_buddyinfo_path_set(miss);
+    hb_probe_t missing = hb_once(map);
+    ray_vm_test_buddyinfo_path_set(path);
+    /* room for one block (8k of 6k), not two (12k) */
+    const long long one[1] = { 8 * k };
+    w &= hb_buddy_write(path, 1, one, false);
+    hb_probe_t p1, p2, p3;
+    ray_t* b1 = hb_alloc(map, &p1);
+    int64_t o1 = ray_heap_direct_huge_outstanding();
+    ray_t* b2 = hb_alloc(map, &p2);
+    int64_t o2 = ray_heap_direct_huge_outstanding();
+    if (b1) ray_free(b1);
+    int64_t o3 = ray_heap_direct_huge_outstanding();
+    ray_t* b3 = hb_alloc(map, &p3);
+    int64_t o4 = ray_heap_direct_huge_outstanding();
+    if (b2) ray_free(b2);
+    if (b3) ray_free(b3);
+    int64_t o5 = ray_heap_direct_huge_outstanding();
+    /* huge pages off: room makes no difference */
+    const long long plenty[1] = { 1000 * k };
+    w &= hb_buddy_write(path, 1, plenty, false);
+    ray_heap_test_direct_thp(0);
+    hb_probe_t off = hb_once(map);
+    ray_heap_test_direct_thp(1);
+    hb_probe_t on = hb_once(map);
+    ray_vm_test_buddyinfo_path_set(NULL);
+    unlink(path);
+    ray_heap_direct_cache_drain();
+    ray_heap_test_direct_thp(-1);
+    ray_heap_test_direct_huge_min_budget(0);
+    ray_heap_set_lock(was_lock);
+    ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT(w, "fixtures written");
+    TEST_ASSERT_EQ_I(o0, 0);   /* no advised block live before */
+    hb_probe_t all[] = { frag, at1, under1, skew2, even2, empty, broken, missing, p1, p2, p3, off, on };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
+        if (!all[i].anon) SKIP("a block spilled or was refused: the watermark is near");
+    /* the fragmented box: dev's plain mapping, released early */
+    TEST_ASSERT(!frag.huge, "no PMD pages free: no advice");
+    TEST_ASSERT_EQ_I((int64_t)frag.tr, (int64_t)frag.data);
+    TEST_ASSERT(at1.huge, "exactly at the bound: huge pages");
+    TEST_ASSERT(at1.aligned, "an advised block is PMD-aligned");
+    TEST_ASSERT_EQ_I((int64_t)at1.tr, 0);
+    TEST_ASSERT(!under1.huge, "a PMD page under the bound: plain");
+    TEST_ASSERT_EQ_I((int64_t)under1.tr, (int64_t)under1.data);
+    TEST_ASSERT(!skew2.huge, "a node short of its share: plain");
+    TEST_ASSERT(even2.huge, "each node at its share: huge pages");
+    TEST_ASSERT(!empty.huge && !broken.huge && !missing.huge, "no usable buddyinfo: plain");
+    TEST_ASSERT_EQ_I((int64_t)empty.tr, (int64_t)empty.data);
+    TEST_ASSERT(p1.huge, "room for the first block");
+    TEST_ASSERT_EQ_I(o1, (int64_t)map);
+    TEST_ASSERT(!p2.huge, "not for a second beside it");
+    TEST_ASSERT_EQ_I((int64_t)p2.tr, (int64_t)p2.data);
+    TEST_ASSERT_EQ_I(o2, (int64_t)map);
+    TEST_ASSERT_EQ_I(o3, 0);
+    TEST_ASSERT(p3.huge, "room again once the first is freed");
+    TEST_ASSERT_EQ_I(o4, (int64_t)map);
+    TEST_ASSERT_EQ_I(o5, 0);
+    TEST_ASSERT(!off.huge, "transparent huge pages off: plain");
+    TEST_ASSERT_EQ_I((int64_t)off.tr, (int64_t)off.data);
+    TEST_ASSERT(on.huge, "and on: huge pages");
+    PASS();
+#endif
+}
+
+/* The kernel's huge-page mode as sysfs has it: the PMD size's own file
+ * (Linux 6.8 and up) unless it says "inherit", else the global one. */
+#if defined(RAY_OS_LINUX) && defined(DEBUG)
+static bool hb_sysfs_thp(void) {
+    char path[160], mode[128];
+    snprintf(path, sizeof(path), "/sys/kernel/mm/transparent_hugepage/hugepages-%zukB/enabled",
+             ray_vm_pmd_size() >> 10);
+    FILE* f = ray_vm_pmd_size() ? fopen(path, "r") : NULL;
+    if (f) {
+        bool got = fgets(mode, sizeof(mode), f) != NULL;
+        fclose(f);
+        if (got && !strstr(mode, "[inherit]"))
+            return strstr(mode, "[always]") || strstr(mode, "[madvise]");
+    }
+    f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+    if (!f) return false;
+    bool on = fgets(mode, sizeof(mode), f) && (strstr(mode, "[always]") || strstr(mode, "[madvise]"));
+    fclose(f);
+    return on;
+}
+#endif
+
+/* A fresh direct block the cache will not keep (over its budget) is mapped
+ * PMD-aligned for huge pages, where the kernel has them free (a buddyinfo
+ * fixture with room here); one the cache keeps is not.  A block in small
+ * pages — transparent huge pages off — is transient (its pages may go
+ * ahead of the free), unless it is locked; an advised one is not.  On a
+ * memory budget under the gate (48 GB; 8 GB here by the test seam) no
+ * block is either, however large.  The gate itself: a 32 GB budget's block
+ * over its 2 GB cache budget is a plain mapping, a 48 GB budget's over its
+ * 3 GB cache budget takes huge pages. */
+static test_result_t test_direct_huge_over_budget(void) {
+#if !defined(RAY_OS_LINUX) || !defined(DEBUG)
+    SKIP("direct blocks take huge pages on Linux only; the seams are DEBUG");
+#else
+    bool thp_sysfs = hb_sysfs_thp();
+    bool thp_heap = ray_vm_thp_enabled();
+    if (hb_pmd_order() < 0 || !hb_kernel_advises()) {
+        TEST_ASSERT(thp_heap == thp_sysfs, "the kernel's huge-page mode as sysfs has it");
+        SKIP("this kernel has no transparent huge pages");
+    }
+    const size_t small = 64u << 20, big = 600u << 20;   /* never written: address space only */
+    char path[512];
+    hb_path(path, sizeof(path), "budget");
+    const long long plenty[1] = { 1000000 };
+    bool w = hb_buddy_write(path, 1, plenty, false);
+    ray_vm_test_buddyinfo_path_set(path);
+    ray_heap_test_direct_thp(1);
+    ray_heap_direct_cache_drain();
+    int64_t previous = ray_heap_anon_watermark();
+    bool    was_lock = ray_heap_set_lock(false);
+    /* The gate as built: 32 GB is under it, 48 GB is not. */
+    const size_t g32 = (size_t)5 << 29, g48 = (size_t)7 << 29;   /* 2.5 and 3.5 GB */
+    ray_heap_set_anon_watermark(INT64_C(32) << 30);
+    int64_t gn0 = ray_heap_direct_huge_count();
+    ray_t* gb = ray_alloc(g32);
+    int64_t gn1 = ray_heap_direct_huge_count();
+    bool    gb_anon = gb && !ray_direct_file_backed(gb);
+    if (gb) ray_free(gb);
+    ray_heap_set_anon_watermark(INT64_C(48) << 30);
+    int64_t gn2 = ray_heap_direct_huge_count();
+    ray_t* gc = ray_alloc(g48);
+    int64_t gn3 = ray_heap_direct_huge_count();
+    bool    gc_anon = gc && !ray_direct_file_backed(gc);
+    if (gc) ray_free(gc);
+    ray_heap_direct_cache_drain();
+    ray_heap_test_direct_huge_min_budget(INT64_C(8) << 30);
+    /* An 8 GB budget: the cache keeps up to 512 MB, the big block is over it. */
+    ray_heap_set_anon_watermark(INT64_C(8) << 30);
+    int64_t n0 = ray_heap_direct_huge_count();
+    ray_t* s = ray_alloc(small);
+    int64_t n1 = ray_heap_direct_huge_count();
+    ray_t* b = ray_alloc(big);
+    int64_t n2 = ray_heap_direct_huge_count();
+    bool   b_aligned = b && (((uintptr_t)b - RAY_DIRECT_HDR) & (ray_vm_pmd_size() - 1)) == 0;
+    bool   b_spilled = b && ray_direct_file_backed(b);
+    size_t s_tr = s ? ray_raw_transient_bytes(ray_data(s)) : 1;
+    size_t b_tr = b ? ray_raw_transient_bytes(ray_data(b)) : 1;
+    if (s) ray_free(s);
+    if (b) ray_free(b);
+    /* Transparent huge pages off: the same block in small pages, transient. */
+    ray_heap_test_direct_thp(0);
+    ray_t* o = ray_alloc(big);
+    int64_t n3 = ray_heap_direct_huge_count();
+    size_t o_tr = o ? ray_raw_transient_bytes(ray_data(o)) : 0;
+    size_t o_data = o ? ray_block_data_bytes(o) : 1;
+    if (o) ray_free(o);
+    /* Locked against swap, it is not transient: munmap's own unlock walk
+     * frees its pages, which MADV_DONTNEED refuses. */
+    ray_heap_set_lock(true);
+    int64_t locked0 = ray_heap_locked_bytes();
+    ray_t* l = ray_alloc(big);
+    bool   l_locked = ray_heap_locked_bytes() > locked0;
+    size_t l_tr = l ? ray_raw_transient_bytes(ray_data(l)) : 1;
+    if (l) ray_free(l);
+    ray_heap_set_lock(false);
+    ray_heap_test_direct_thp(1);
+    /* Under 8 GB the same over-budget block (cache budget 256 MB) is a plain
+     * mapping, left to its free. */
+    ray_heap_set_anon_watermark(INT64_C(4) << 30);
+    int64_t n4 = ray_heap_direct_huge_count();
+    ray_t* c = ray_alloc(big);
+    int64_t n5 = ray_heap_direct_huge_count();
+    size_t c_tr = c ? ray_raw_transient_bytes(ray_data(c)) : 0;
+    size_t c_data = c ? ray_block_data_bytes(c) : 1;
+    if (c) ray_free(c);
+    ray_heap_direct_cache_drain();
+    ray_vm_test_buddyinfo_path_set(NULL);
+    unlink(path);
+    ray_heap_test_direct_thp(-1);
+    ray_heap_test_direct_huge_min_budget(0);
+    ray_heap_set_lock(was_lock);
+    ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT(w, "fixture written");
+    TEST_ASSERT(thp_heap == thp_sysfs, "the kernel's huge-page mode as sysfs has it");
+    if (gb_anon) TEST_ASSERT_EQ_I(gn1 - gn0, 0);   /* 32 GB: dev's plain mapping */
+    if (gc_anon) TEST_ASSERT_EQ_I(gn3 - gn2, 1);   /* 48 GB: huge pages */
+    if (!s || !b || !c || !l || !o) SKIP("600 MB block unavailable");
+    if (b_spilled) SKIP("the big block spilled: the watermark is near");
+    TEST_ASSERT_EQ_I(n1 - n0, 0);   /* the cache keeps the small one */
+    TEST_ASSERT_EQ_I(n2 - n1, 1);   /* the big one is over the cache budget */
+    TEST_ASSERT(b_aligned, "the advised block is mapped PMD-aligned");
+    TEST_ASSERT_EQ_I((int64_t)s_tr, 0);
+    TEST_ASSERT_EQ_I((int64_t)b_tr, 0);   /* advised: left to the free */
+    TEST_ASSERT_EQ_I(n3 - n2, 0);
+    TEST_ASSERT_EQ_I((int64_t)o_tr, (int64_t)o_data);
+    if (l_locked) TEST_ASSERT_EQ_I((int64_t)l_tr, 0);
+    /* a 4 GB budget's block over its cache budget takes no huge pages and
+     * is left to its free */
+    TEST_ASSERT_EQ_I(n5 - n4, 0);
+    TEST_ASSERT_EQ_I((int64_t)c_tr, 0);
+    TEST_ASSERT(c_data > 0, "the 4 GB budget's block");
+    PASS();
+#endif
+}
+
+/* A huge-page direct block keeps no slack of its aligned over-allocation:
+ * the process maps its map_size and no more, and the free unmaps it all.
+ * A block in small pages (no PMD pages free when it was mapped) is
+ * transient: its pages released ahead of the free, in 2 MB slices as the
+ * grouping's workers do, go from RAM while the header page it is freed by
+ * stays; the free then unmaps the whole block and returns its committed
+ * bytes. */
+static test_result_t test_direct_huge_release(void) {
+#if !defined(RAY_OS_LINUX) || !defined(DEBUG)
+    SKIP("direct blocks take huge pages on Linux only; the seams are DEBUG");
+#else
+    const size_t big = 600u << 20, slice = 2u << 20;
+    if (heap_vm_kb() == 0 || !relieve_mincore()) SKIP("no /proc/self/statm or mincore");
+    if (hb_pmd_order() < 0 || !hb_kernel_advises()) SKIP("this kernel has no transparent huge pages");
+    char path[512];
+    hb_path(path, sizeof(path), "release");
+    const long long plenty[1] = { 1000000 }, none[1] = { 0 };
+    bool w = hb_buddy_write(path, 1, plenty, false);
+    ray_vm_test_buddyinfo_path_set(path);
+    ray_heap_test_direct_thp(1);
+    ray_heap_test_direct_huge_min_budget(INT64_C(8) << 30);   /* 8 GB is a big budget */
+    ray_heap_direct_cache_drain();
+    int64_t previous = ray_heap_anon_watermark();
+    bool    was_lock = ray_heap_set_lock(false);
+    ray_heap_set_anon_watermark(INT64_C(8) << 30);
+    int64_t committed = ray_heap_anon_committed();
+    /* the huge-page block: no slack */
+    int64_t n0 = ray_heap_direct_huge_count();
+    size_t hv0 = heap_vm_kb();
+    ray_t* h = ray_alloc(big);
+    size_t hv1 = heap_vm_kb();
+    bool   h_huge = h && !ray_direct_file_backed(h) && ray_heap_direct_huge_count() == n0 + 1;
+    size_t hmap = h ? ray_direct_map_size(h) : 0;
+    if (h) ray_free(h);
+    size_t hv2 = heap_vm_kb();
+    /* the block in small pages */
+    w &= hb_buddy_write(path, 1, none, false);
+    int64_t n1 = ray_heap_direct_huge_count();
+    size_t vm0 = heap_vm_kb();
+    ray_t* b = ray_alloc(big);
+    size_t vm1 = heap_vm_kb();
+    if (!w || !h_huge || !b || ray_direct_file_backed(b) || ray_heap_direct_huge_count() != n1) {
+        if (b) ray_free(b);
+        ray_vm_test_buddyinfo_path_set(NULL);
+        unlink(path);
+        ray_heap_test_direct_thp(-1);
+        ray_heap_test_direct_huge_min_budget(0);
+        ray_heap_set_lock(was_lock);
+        ray_heap_set_anon_watermark(previous);
+        TEST_ASSERT(w, "fixtures written");
+        TEST_ASSERT(!b || ray_heap_direct_huge_count() == n1, "no PMD pages free: no advice");
+        SKIP("600 MB blocks unavailable");
+    }
+    size_t map = ray_direct_map_size(b);
+    char*  base = (char*)b - RAY_DIRECT_HDR;
+    char*  p = ray_data(b);
+    size_t bytes = ray_raw_transient_bytes(p);
+    uintptr_t lo = ((uintptr_t)p + slice - 1) & ~(uintptr_t)(slice - 1);
+    uintptr_t hi = ((uintptr_t)p + bytes) & ~(uintptr_t)(slice - 1);
+    bool range_ok = hi > lo && (size_t)(hi - lo) > big - 2 * slice && lo >= (uintptr_t)p;
+    /* Write one byte in each of eight slices past the first, and the last. */
+    int res_before = 0, res_after = 0;
+    if (range_ok) {
+        char* touched[9];
+        for (int i = 0; i < 8; i++) { touched[i] = (char*)lo + (size_t)i * 37 * slice + 4096; *touched[i] = 1; }
+        touched[8] = (char*)hi - 1; *touched[8] = 1;
+        for (int i = 0; i < 9; i++) res_before += relieve_resident(touched[i]);
+        for (uintptr_t a = lo; a < hi; a += slice) ray_vm_release((void*)a, slice);
+        for (int i = 0; i < 9; i++) res_after += relieve_resident(touched[i]);
+    }
+    bool hdr_kept = ray_direct_map_size(b) == map && relieve_resident(base) == 1;
+    ray_free(b);
+    size_t vm2 = heap_vm_kb();
+    unsigned char v = 0;
+    bool gone = mincore(base, 4096, &v) != 0 && errno == ENOMEM
+             && mincore((char*)base + map - 4096, 4096, &v) != 0 && errno == ENOMEM;
+    int64_t committed_after = ray_heap_anon_committed();
+    ray_vm_test_buddyinfo_path_set(NULL);
+    unlink(path);
+    ray_heap_test_direct_thp(-1);
+    ray_heap_test_direct_huge_min_budget(0);
+    ray_heap_set_lock(was_lock);
+    ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT_EQ_I((int64_t)(hv1 - hv0), (int64_t)(hmap / 1024));   /* no slack kept */
+    TEST_ASSERT_EQ_I((int64_t)(hv1 - hv2), (int64_t)(hmap / 1024));
+    TEST_ASSERT_EQ_I((int64_t)(vm1 - vm0), (int64_t)(map / 1024));
+    /* the transient range is the block less its first and last slice,
+     * and starts past the headers */
+    TEST_ASSERT(range_ok, "transient range");
+    TEST_ASSERT_EQ_I(res_before, 9);
+    TEST_ASSERT_EQ_I(res_after, 0);
+    TEST_ASSERT(hdr_kept, "the header page survives the release");
+    TEST_ASSERT_EQ_I((int64_t)(vm1 - vm2), (int64_t)(map / 1024));    /* the free unmaps it all */
+    TEST_ASSERT(gone, "the block's first and last pages are unmapped");
+    TEST_ASSERT_EQ_I(committed_after, committed);
+    PASS();
+#endif
+}
+
 /* Allocations off the per-thread heaps (ray_sys_alloc: the symbol and domain
  * string arenas, index-build scratch) count toward the anonymous watermark,
  * and a large one that would cross it is backed by a spill file (#712): it
@@ -7163,6 +7702,10 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_park",             test_relieve_park,                heap_setup, heap_teardown },
     { "heap/abandon_drops_last_spill_pool", test_abandon_drops_last_spill_pool, heap_setup, heap_teardown },
     { "heap/direct_cache_concurrent", test_direct_cache_concurrent_replacement, heap_setup, heap_teardown },
+    { "heap/direct_huge_over_budget", test_direct_huge_over_budget,           heap_setup, heap_teardown },
+    { "heap/buddyinfo_free_huge",     test_buddyinfo_free_huge,               heap_setup, heap_teardown },
+    { "heap/direct_huge_buddyinfo",   test_direct_huge_buddyinfo,             heap_setup, heap_teardown },
+    { "heap/direct_huge_release",     test_direct_huge_release,               heap_setup, heap_teardown },
     { "heap/anon_watermark_spill",     test_anon_watermark_spill,              heap_setup, heap_teardown },
     { "heap/anon_watermark_spill_after_empty_pools", test_anon_watermark_spill_after_empty_pools, heap_setup, heap_teardown },
     { "heap/lock_pool_under_watermark", test_lock_pool_under_watermark, heap_setup, heap_teardown },

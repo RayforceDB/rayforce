@@ -8381,6 +8381,48 @@ static void agg_ord_fill_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
     memset(c->pairs + start, 0xFF, (size_t)(end - start) * sizeof(agg_radix_order_t));
 }
 
+/* ray_free_raw of an input-sized block (the radix payload, the order map).
+ * One the direct cache will not keep (ray_raw_transient_bytes: over its
+ * budget) is unmapped at once, and that munmap is single-threaded: it
+ * walked 5.6M page-table entries for 3.5 s of a 13 s query on the 23 GB
+ * payload of a 1B-row grouping.  The heap maps such a block advised for
+ * huge pages where the kernel has them free, which makes that unmap short;
+ * a block in small pages (ray_raw_transient_bytes says which: transparent
+ * huge pages off, or too few free) has its pages dropped by the workers
+ * first instead, a 2 MB slice a task, and the unmap finds them gone.
+ * The first slice holds the headers and is left to the unmap, as is the
+ * tail.  Linux only: elsewhere the free alone.  Kept noinline, out of the
+ * hot bodies of its callers (see agg_radix_select_first_n). */
+#if defined(RAY_OS_LINUX)
+#define AGG_FREE_SLICE ((uintptr_t)2 << 20)
+typedef struct { uintptr_t lo, hi; } agg_free_ctx_t;
+static void agg_free_slice_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const agg_free_ctx_t* c = raw;
+    uintptr_t lo = c->lo + (uintptr_t)start * AGG_FREE_SLICE;
+    uintptr_t hi = c->lo + (uintptr_t)end * AGG_FREE_SLICE;
+    if (hi > c->hi) hi = c->hi;
+    if (hi > lo) ray_vm_release((void*)lo, hi - lo);
+}
+#endif
+static void __attribute__((noinline)) agg_free_input_sized(ray_pool_t* pool, void* p) {
+#if defined(RAY_OS_LINUX)
+    size_t bytes = pool ? ray_raw_transient_bytes(p) : 0;
+    if (bytes) {
+        agg_free_ctx_t c = {
+            .lo = ((uintptr_t)p + AGG_FREE_SLICE - 1) & ~(AGG_FREE_SLICE - 1),
+            .hi = ((uintptr_t)p + bytes) & ~(AGG_FREE_SLICE - 1),
+        };
+        if (c.hi > c.lo)
+            ray_pool_dispatch_n(pool, agg_free_slice_fn, &c,
+                                (uint32_t)((c.hi - c.lo + AGG_FREE_SLICE - 1) / AGG_FREE_SLICE));
+    }
+#else
+    (void)pool;
+#endif
+    ray_free_raw(p);
+}
+
 /* Largest group count whose first-seen order is restored by sorting the
  * groups rather than by the input-sized order map (see agg_parts_emit). */
 #define AGG_ORDER_SORT_MAX_GROUPS 16384
@@ -8540,7 +8582,7 @@ static ray_t* agg_parts_emit(ray_op_ext_t* ext, agg_desc_t* d,
                     ray_pool_dispatch_n(pool, agg_ord_compact_fn, &cctx, (uint32_t)n_chunks);
                     ord_cancel = pool_cancelled(pool);   /* else the key emit reads them */
                     order_ok = !ord_cancel;
-                    ray_free_raw(pairs);
+                    agg_free_input_sized(pool, pairs);
                     pairs = compacted;
                     compacted = NULL;
                 }
@@ -9831,7 +9873,7 @@ static ray_t* exec_group_v2_parallel_radix(
     /* Phases 1+2 done (every dispatch joined); val_off/val2_off and the
      * payload records are no longer read — groups keep copies of their keys. */
     scratch_free(off_hdr);
-    ray_free_raw(pay); ctx.pay = NULL;
+    agg_free_input_sized(pool, pay); ctx.pay = NULL;
     ray_free_raw(part_start); ctx.part_start = NULL;
 
     if (cancelled || oom) {

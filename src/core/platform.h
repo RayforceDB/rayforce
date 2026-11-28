@@ -245,6 +245,29 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment);
  * if the hint was issued (Linux THP); false where unsupported (macOS, WASM,
  * Windows). */
 bool ray_vm_hugepage(void* ptr, size_t size);
+/* Whether the kernel grants the huge pages ray_vm_hugepage advises: Linux
+ * with transparent huge pages in "always" or "madvise" mode (read once) —
+ * the PMD size's own mode (hugepages-<size>kB/enabled, Linux 6.8 and up)
+ * where the kernel has one and it is not "inherit", else the global one.
+ * False elsewhere. */
+bool ray_vm_thp_enabled(void);
+/* The size of a PMD-mapped transparent huge page: Linux's hpage_pmd_size
+ * (2 MB on x86-64 with 4 KB pages, 512 MB on arm64 with 64 KB pages), read
+ * once; 2 MB on x86-64 without that file.  0 where there is none. */
+size_t ray_vm_pmd_size(void);
+/* Free memory the kernel holds in blocks of a PMD huge page or larger, per
+ * NUMA node: /proc/buddyinfo, the free blocks of order >= the PMD order
+ * over each node's zones, in bytes, read anew on each call.  Fills
+ * bytes[i] for the i-th node listed and returns the node count; 0 when it
+ * cannot tell (no file, a line it cannot parse, more than `max` nodes,
+ * no PMD size) and everywhere but Linux. */
+#define RAY_VM_MAX_NODES 128
+int ray_vm_free_huge_bytes(int64_t* bytes, int max);
+#ifdef DEBUG
+/* Read the free huge-page blocks from `path` instead of /proc/buddyinfo
+ * (NULL: the real file).  For tests. */
+void ray_vm_test_buddyinfo_path_set(const char* path);
+#endif
 /* Lock [ptr, ptr+size) of an anonymous mapping against swap-out, page by
  * page as each is faulted in (Linux: mlock2 MLOCK_ONFAULT); munmap unlocks
  * it.  False where it cannot be — RLIMIT_MEMLOCK, a kernel before 4.4, a

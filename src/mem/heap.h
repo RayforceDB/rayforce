@@ -395,6 +395,20 @@ int64_t ray_heap_spill_discard_count(void);
  * Compiled only under DEBUG, as the test objects are. */
 #ifdef DEBUG
 void ray_heap_test_scribble(bool on);
+/* Direct blocks advised for transparent huge pages so far (the advice
+ * taken): a fresh anonymous block over the direct cache's budget, on a
+ * memory budget of 48 GB and up, where every NUMA node has the free huge
+ * pages for it (Linux).  And the bytes of those still live.  For tests. */
+int64_t ray_heap_direct_huge_count(void);
+int64_t ray_heap_direct_huge_outstanding(void);
+/* ray_raw_transient_bytes calls that found a transient block.  For tests. */
+int64_t ray_heap_direct_transient_count(void);
+/* The memory budget from which direct blocks take huge pages and an early
+ * page release (48 GB; 0 restores it).  For tests. */
+void ray_heap_test_direct_huge_min_budget(int64_t bytes);
+/* Take transparent huge pages as on (1) or off (0) in the kernel, or ask
+ * the kernel again (-1: ray_vm_thp_enabled).  For tests. */
+void ray_heap_test_direct_thp(int on);
 #endif
 
 /* ray_alloc whose data bytes read as zero, on the calling thread: a block
@@ -440,9 +454,12 @@ typedef struct {
     int    swap_fd;       /* -1 = anonymous (ray_vm_free); >=0 = file-backed spill */
     int    locked;        /* locked against swap-out (heap_lock) */
     char*  swap_path;     /* spill file to unlink+free on release; NULL if anon */
-    int    fresh;         /* mapped for this allocation (its pages read as zero),
+    uint8_t fresh;        /* mapped for this allocation (its pages read as zero),
                              not taken from the reuse cache */
-    char   _pad1[RAY_DIRECT_HDR - sizeof(size_t) - 3 * sizeof(int) - sizeof(char*)];
+    uint8_t huge;         /* advised for transparent huge pages (the advice
+                             taken: heap_alloc_direct), counted in the bytes
+                             outstanding until freed */
+    char   _pad1[RAY_DIRECT_HDR - sizeof(size_t) - 2 * sizeof(int) - sizeof(char*) - 2];
 } ray_direct_hdr_t;
 _Static_assert(sizeof(ray_direct_hdr_t) == RAY_DIRECT_HDR, "direct hdr must be 32B");
 
@@ -472,6 +489,16 @@ static inline bool ray_direct_file_backed(const ray_t* v) {
  * other block, and where the platform cannot punch a mapped range.  True
  * when pages were punched out. */
 bool ray_raw_discard(void* p, size_t from, size_t upto);
+
+/* The data capacity of ray_alloc_raw block `p` when ray_free_raw will unmap
+ * it at once and its pages may go first — an anonymous direct block over
+ * the direct cache's budget, not locked against swap, on a memory budget
+ * of 48 GB and up, not advised for huge pages (transparent huge pages off,
+ * or too few free on some node when it was mapped) — else 0.
+ * Such a block's pages may be released ahead of the free (ray_vm_release,
+ * from any thread, in parallel), which leaves the single-threaded munmap
+ * nothing to walk. */
+size_t ray_raw_transient_bytes(const void* p);
 
 /* Anonymous (RAM-resident, OOM-killable) pool, direct and sys bytes currently
  * committed.  Allocations that would push this past the anon watermark

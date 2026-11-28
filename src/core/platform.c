@@ -667,6 +667,54 @@ bool ray_vm_hugepage(void* ptr, size_t size) {
 #endif
 }
 
+#if defined(RAY_OS_LINUX)
+/* A transparent huge-page mode file: 1 "[always]" or "[madvise]", 0
+ * "[never]", 2 "[inherit]" (the global mode decides), -1 no file or none
+ * of these. */
+static int vm_thp_mode(const char* path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    char buf[128];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    if (strstr(buf, "[always]") || strstr(buf, "[madvise]")) return 1;
+    if (strstr(buf, "[never]")) return 0;
+    if (strstr(buf, "[inherit]")) return 2;
+    return -1;
+}
+#endif
+
+/* Linux, read once: the PMD size's own mode,
+ * /sys/kernel/mm/transparent_hugepage/hugepages-<size>kB/enabled (Linux 6.8
+ * and up), unless it is "inherit"; else the global mode, .../enabled.
+ * "[always]" or "[madvise]" grants the pages ray_vm_hugepage advises,
+ * "[never]" or a kernel without the files does not (madvise still returns
+ * 0 under "never"). */
+bool ray_vm_thp_enabled(void) {
+#if defined(RAY_OS_LINUX)
+    static _Atomic(int) mode = -1;   /* -1 unread, 0 off, 1 on */
+    int m = atomic_load_explicit(&mode, memory_order_relaxed);
+    if (m < 0) {
+        int own = -1;
+        size_t pmd = ray_vm_pmd_size();
+        if (pmd) {
+            char path[128];
+            snprintf(path, sizeof(path),
+                     "/sys/kernel/mm/transparent_hugepage/hugepages-%zukB/enabled", pmd >> 10);
+            own = vm_thp_mode(path);
+        }
+        if (own == 0 || own == 1) m = own;
+        else m = vm_thp_mode("/sys/kernel/mm/transparent_hugepage/enabled") == 1 ? 1 : 0;
+        atomic_store_explicit(&mode, m, memory_order_relaxed);
+    }
+    return m == 1;
+#else
+    return false;
+#endif
+}
+
 /* Linux: mlock2(MLOCK_ONFAULT) — only the pages faulted in are locked, as
  * they are faulted.  Called as a raw system call: sanitizer runtimes
  * intercept mlock() and make it a no-op, and an old libc has no mlock2
@@ -1556,6 +1604,7 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
 }
 
 bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+bool ray_vm_thp_enabled(void) { return false; }
 bool ray_vm_lock(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
 void ray_vm_unlock(void* ptr, size_t size) { (void)ptr; (void)size; }
 int ray_vm_release_locked(void* ptr, size_t size) { ray_vm_release(ptr, size); return 0; }
@@ -1828,6 +1877,7 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
 }
 
 bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+bool ray_vm_thp_enabled(void) { return false; }
 bool ray_vm_lock(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
 void ray_vm_unlock(void* ptr, size_t size) { (void)ptr; (void)size; }
 int ray_vm_release_locked(void* ptr, size_t size) { ray_vm_release(ptr, size); return 0; }
@@ -1899,6 +1949,145 @@ uint64_t ray_cache_llc_bytes(void) {
     if (g_llc_for_test) return g_llc_for_test;
 #endif
     return cache_llc_probe();
+}
+
+/* ---- Free huge-page blocks (platform.h) ---------------------------------- */
+size_t ray_vm_pmd_size(void) {
+#if defined(RAY_OS_LINUX)
+    static _Atomic(size_t) cached = 1;   /* 1: unread */
+    size_t v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (v == 1) {
+        v = 0;
+        size_t pg = vm_page_size();
+        int fd = open("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            char buf[32];
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            if (n > 0) {
+                buf[n] = '\0';
+                unsigned long long b = strtoull(buf, NULL, 10);
+                if (b > pg && (b & (b - 1)) == 0 && b <= ((unsigned long long)1 << 40)) v = (size_t)b;
+            }
+        } else {
+#if defined(__x86_64__)
+            if (pg == 4096) v = (size_t)2 << 20;
+#endif
+        }
+        atomic_store_explicit(&cached, v, memory_order_relaxed);
+    }
+    return v;
+#else
+    return 0;
+#endif
+}
+
+#if defined(RAY_OS_LINUX)
+#ifdef DEBUG
+static _Atomic(const char*) vm_buddyinfo_test_path;
+void ray_vm_test_buddyinfo_path_set(const char* path) {
+    atomic_store_explicit(&vm_buddyinfo_test_path, path, memory_order_relaxed);
+}
+#endif
+
+typedef struct {
+    int64_t* bytes;
+    int      ids[RAY_VM_MAX_NODES];
+    int      max, nodes, pmd_order;
+    size_t   page;
+} vm_buddy_t;
+
+/* One /proc/buddyinfo line, "Node 0, zone   Normal  87078  43481 ...": the
+ * node, the zone's name, and the free block count of each order from 0.
+ * The orders from the PMD order up add (count << order) pages to the
+ * node's sum.  False for a line of another shape. */
+static bool vm_buddy_line(vm_buddy_t* b, char* s) {
+    while (*s == ' ' || *s == '\t') s++;
+    if (!*s) return true;   /* a blank line */
+    if (strncmp(s, "Node ", 5) != 0) return false;
+    char* e;
+    long id = strtol(s + 5, &e, 10);
+    if (e == s + 5 || id < 0 || id > INT32_MAX || *e != ',') return false;
+    s = e + 1;
+    while (*s == ' ') s++;
+    if (strncmp(s, "zone", 4) != 0 || (s[4] != ' ' && s[4] != '\t')) return false;
+    s += 4;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!*s) return false;
+    while (*s && *s != ' ' && *s != '\t') s++;   /* the zone's name */
+    int slot = -1;
+    for (int i = 0; i < b->nodes; i++)
+        if (b->ids[i] == (int)id) { slot = i; break; }
+    if (slot < 0) {
+        if (b->nodes >= b->max) return false;
+        slot = b->nodes++;
+        b->ids[slot] = (int)id;
+        b->bytes[slot] = 0;
+    }
+    int order = 0;
+    for (;; order++) {
+        while (*s == ' ' || *s == '\t') s++;
+        if (!*s) break;
+        if (*s < '0' || *s > '9') return false;
+        unsigned long long n = strtoull(s, &e, 10);
+        s = e;
+        if (order < b->pmd_order || n == 0) continue;
+        if (order >= 40) return false;
+        uint64_t block = (uint64_t)b->page << order;
+        uint64_t have = (uint64_t)b->bytes[slot];
+        uint64_t room = (uint64_t)INT64_MAX - have;
+        b->bytes[slot] = n > room / block ? INT64_MAX : (int64_t)(have + n * block);
+    }
+    return order > 0;
+}
+#elif defined(DEBUG)
+void ray_vm_test_buddyinfo_path_set(const char* path) { (void)path; }
+#endif
+
+int ray_vm_free_huge_bytes(int64_t* bytes, int max) {
+#if defined(RAY_OS_LINUX)
+    size_t pg = vm_page_size(), pmd = ray_vm_pmd_size();
+    if (!bytes || max <= 0 || pmd <= pg) return 0;
+    vm_buddy_t b = { .bytes = bytes, .max = max < RAY_VM_MAX_NODES ? max : RAY_VM_MAX_NODES,
+                     .page = pg };
+    while (((size_t)pg << b.pmd_order) < pmd) b.pmd_order++;
+    const char* path = "/proc/buddyinfo";
+#ifdef DEBUG
+    const char* tp = atomic_load_explicit(&vm_buddyinfo_test_path, memory_order_relaxed);
+    if (tp) path = tp;
+#endif
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    /* Line by line through a stack buffer: a line holds a node, a zone and
+     * a dozen or so counts, far below its size. */
+    char buf[2048];
+    size_t len = 0;
+    bool ok = true, eof = false;
+    while (ok) {
+        char* nl = len ? memchr(buf, '\n', len) : NULL;
+        if (!nl && !eof) {
+            if (len >= sizeof(buf) - 1) { ok = false; break; }   /* a line past the buffer */
+            ssize_t n = read(fd, buf + len, sizeof(buf) - 1 - len);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) { ok = false; break; }
+            if (n == 0) eof = true;
+            len += (size_t)n;
+            continue;
+        }
+        if (!nl && len == 0) break;               /* the end */
+        size_t take = nl ? (size_t)(nl - buf) : len;   /* the last line may lack its newline */
+        buf[take] = '\0';
+        ok = vm_buddy_line(&b, buf);
+        size_t used = nl ? take + 1 : take;
+        memmove(buf, buf + used, len - used);
+        len -= used;
+    }
+    close(fd);
+    return ok ? b.nodes : 0;
+#else
+    (void)bytes; (void)max;
+    return 0;
+#endif
 }
 
 /* ---- I/O counters for the traces ----------------------------------------- */
