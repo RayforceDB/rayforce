@@ -5,7 +5,7 @@
 ;; result lost the source's string pool, and with it every string longer
 ;; than its 12 inline bytes.  The result now has the source's width, domain
 ;; and pool, as take's does.
-(.sys.exec "rm -rf /tmp/rf_issue_1800 && mkdir -p /tmp/rf_issue_1800") -- 0
+(.sys.exec "rm -rf /tmp/rf_issue_1800") -- 0
 (set T (table [g c s x] (list ['a 'a 'b 'b] [true false true false] ['p 'q 'r 's] (list "a string longer than twelve bytes" "q" "another string longer than twelve" "s"))))
 (.db.splayed.set "/tmp/rf_issue_1800/spl/t/" T "/tmp/rf_issue_1800/spl/.sym")
 (set S (.db.splayed.get "/tmp/rf_issue_1800/spl/t/" "/tmp/rf_issue_1800/spl/.sym"))

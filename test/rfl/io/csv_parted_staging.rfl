@@ -1,3 +1,4 @@
+;; @requires: posix  (fixtures are built or checked through a POSIX shell via .sys.exec)
 ;; csv_parted_staging.rfl — `.csv.parted` into a NEW root stages in
 ;; `<root>.csv-partial` and keeps it after a failure, for diagnosis.
 ;; A mistyped source path must not leave that directory behind (it would

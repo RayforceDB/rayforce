@@ -41,7 +41,7 @@
 
 ;; ── F32 inputs: sum and avg promote to F64; min and max keep F32 (#1447) ───
 ;; F32 used to fall through the I64 readers and silently broadcast zeros.
-(.sys.exec "printf 'k,o,v\\na,1,1.5\\na,2,2.5\\nb,1,10.0\\na,3,3.5\\nb,2,20.0\\n' > /tmp/rfl_window_f32.csv")
+(write "/tmp/rfl_window_f32.csv" "k,o,v\na,1,1.5\na,2,2.5\nb,1,10.0\na,3,3.5\nb,2,20.0\n")
 (set F (.csv.read [SYMBOL I64 F32] "/tmp/rfl_window_f32.csv"))
 (set FW (window {from: F part: [k] funcs: {sm: (sum v) av: (avg v) mn: (min v) mx: (max v)}}))
 (type (at FW 'sm)) -- 'F64

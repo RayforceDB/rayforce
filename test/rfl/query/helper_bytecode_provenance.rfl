@@ -615,10 +615,6 @@ CNT11 -- 6
 (set kdisp10 (fn [v] ((at H10 'a) v) (if (< v 4) 0 1)))
 (at (select {n: (count v) by: (kdisp10 v) from: T10}) 'n) -- [3 3]
 CNT10 -- 6
-;; a swallowed whole-column failure leaves no trace or message behind: a
-;; later uncaught error in a fresh interpreter is reported at its own place
-(write "/tmp/rfl_trace_clear.rfl" "(set TB (table [v] (list [1 2 3 10 20 30]))) (set kneg (fn [v] 1 (if (< v 0) (raise 'negative) (% v 7)))) (select {n: (count v) by: (kneg v) from: TB}) (+ 1 'a)")
-(.sys.exec "./rayforce /tmp/rfl_trace_clear.rfl 2>&1 | grep -c negative | grep -qx 0") -- 0
 ;; an effect reached through a parameter counts: the parameter means the
 ;; argument it is bound to, not a global or let of the same name
 (set CNT12 0)

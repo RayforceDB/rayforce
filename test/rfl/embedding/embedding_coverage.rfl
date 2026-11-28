@@ -141,7 +141,6 @@
 ;; Persists the IP-metric index, frees the in-memory copy, reloads,
 ;; and confirms metadata + a query still resolve.  Drives ray_hnsw_save_fn
 ;; (lines 806-819) and ray_hnsw_load_fn (lines 822-835).
-(.sys.exec "mkdir -p /tmp/rfl_embcov_idx")
 (.emb.hnsw.set "/tmp/rfl_embcov_idx" IdxIp)
 (.emb.hnsw.free IdxIp)
 

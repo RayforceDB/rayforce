@@ -139,14 +139,8 @@
 (.sys.listen -1)      !- domain
 (.sys.listen 65536)   !- domain
 (.sys.listen 99999)   !- domain
-;; Success path: binds and returns the listener's selector id.  The
-;; listener stays open until rfl_teardown destroys the poll.
-(.sys.exec "test/serve.sh --port > /tmp/rfl_syscmd_cov_port") -- 0
-(set lport (as 'i64 (trim (read "/tmp/rfl_syscmd_cov_port"))))
-(set listen-id (.sys.listen lport))
-(>= listen-id 0)      -- true
-;; Same port again — already bound by us → io.
-(.sys.listen lport)   !- io
+;; The success path (a free port from test/serve.sh, so a POSIX shell) is
+;; in syscmd_coverage_process.rfl.
 ;; String coerces through arg_as_i64; numeric string takes the same
 ;; path as the number (out-of-range here → domain), junk → type.
 (.sys.listen "99999") !- domain
@@ -155,7 +149,6 @@
 ;; Same surface via .sys.cmd string dispatch — exercises the dispatcher
 ;; path through to h_listen, which is a separate code path from the
 ;; direct ray_sys_listen_fn entry above.
-(.sys.cmd (format "listen %" lport)) !- io
 (.sys.cmd "listen -1")    !- domain
 (.sys.cmd "listen 65536") !- domain
 

@@ -5,7 +5,7 @@
 ;; inputs at that length.  It now gathers the kept rows first when every key
 ;; and input is row by row, and costs about what gathering the kept rows in
 ;; an inner select and grouping them costs.
-(.sys.exec "rm -rf /tmp/rf_issue_1748 && mkdir -p /tmp/rf_issue_1748") -- 0
+(.sys.exec "rm -rf /tmp/rf_issue_1748") -- 0
 (set n 20000)
 (set mk (fn [p] (table [k f a b c] (list (+ (* p n) (til n)) (at ['x 'y 'z 'u 'v 'w 'r 's 'p 'o] (% (til n) 10)) (til n) (% (til n) 7) (* 2 (til n))))))
 (map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1748/%/t" (+ 2024.01.01 p)) (mk p) "/tmp/rf_issue_1748/.sym")) (til 8))

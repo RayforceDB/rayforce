@@ -5,7 +5,7 @@
 ;; the direct call.  A call through a computed head under by: is the call of
 ;; the function it gives too: a builtin is written as its name (#1815), and
 ;; one left as written (a lambda) runs per group.
-(.sys.exec "rm -rf /tmp/rf_issue_1772 && mkdir -p /tmp/rf_issue_1772") -- 0
+(.sys.exec "rm -rf /tmp/rf_issue_1772") -- 0
 (set t (table [a c s] (list [1 2 3 4] [100 200 300 400] ['x 'y 'x 'y])))
 (set f (fn [v] (+ v c)))
 (set f2 (fn [x y] (+ x (+ y c))))

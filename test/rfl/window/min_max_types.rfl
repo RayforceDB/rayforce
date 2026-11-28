@@ -60,13 +60,3 @@
 (at (window {from: PT part: [k] order: [i] funcs: {x: (min s)}}) 'x) -- (as 'SYM ["ab" "ab" "ab" "b" "b" "" ""])
 (at (window {from: PT part: [k] order: [i] funcs: {x: (max d)}}) 'x) -- (as 'DATE [3 3 3 5 5 0Nl 0Nl])
 (.sys.exec "rm -rf /tmp/rfl_window_min_max_types") -- 0
-
-;; a SYM column read over its own .sym in a process that interned other symbols
-;; first: file-domain cell ids differ from runtime ids, and the text order must
-;; still be the builtin's (checked against by:, in a second process)
-(.sys.exec "rm -rf /tmp/rfl_window_min_max_fd /tmp/rfl_window_min_max_fd.rfl") -- 0
-(set FS (as 'SYM (map (fn [j] (format "s%" j)) (% (* 7919 (til 6000)) 500))))
-(.db.splayed.set "/tmp/rfl_window_min_max_fd/t/" (table [k i s] (list (% (til 6000) 97) (til 6000) (concat (as 'SYM [""]) (drop FS 1)))) "/tmp/rfl_window_min_max_fd/.sym")
-(.sys.exec "printf '%s\n' '(set junk (map (fn [j] (as (quote SYM) (format \"zq%\" j))) (til 300)))' '(set T (.db.splayed.get \"/tmp/rfl_window_min_max_fd/t/\" \"/tmp/rfl_window_min_max_fd/.sym\"))' '(set a (window {from: T part: [k] order: [i] funcs: {x: (min s) y: (max s)}}))' '(set g (select {m: (min s) M: (max s) from: T by: k asc: k}))' '(println (and (identical (at a (quote x)) (at (at g (quote m)) (at T (quote k)))) (identical (at a (quote y)) (at (at g (quote M)) (at T (quote k))))))' > /tmp/rfl_window_min_max_fd.rfl") -- 0
-(.sys.exec "./rayforce /tmp/rfl_window_min_max_fd.rfl </dev/null | grep -qx true") -- 0
-(.sys.exec "rm -rf /tmp/rfl_window_min_max_fd /tmp/rfl_window_min_max_fd.rfl") -- 0

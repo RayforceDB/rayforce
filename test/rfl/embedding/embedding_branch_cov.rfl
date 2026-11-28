@@ -376,7 +376,6 @@
 ;;     (just reinforcing io error for bad load path)
 ;; ════════════════════════════════════════════════════════════════
 
-(.sys.exec "mkdir -p /tmp/rfl_emb_branch_cov")
 (set Idx28 (.emb.hnsw.build V3 'l2))
 (.emb.hnsw.set "/tmp/rfl_emb_branch_cov" Idx28)
 (.emb.hnsw.free Idx28)

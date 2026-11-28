@@ -1,0 +1,13 @@
+;; @requires: posix  (a second process is run through a POSIX shell via .sys.exec)
+;; splayed.rfl's nested GUID atoms, read back by a fresh process: it once
+;; dereferenced the stale payload address the writer stored (SIGSEGV).
+(.sys.exec "rm -rf /tmp/rfl_splayed_guidatom /tmp/rfl_parted_guidatom /tmp/rfl_guidatom_read.rfl")
+(set GA (guid 3))
+(set GT (table [k g a] (list [0 1 2] GA (list (list (at GA 0) 1) (list 2 (list (at GA 1) (as 'GUID 0N))) (list (at GA 2))))))
+(.db.splayed.set "/tmp/rfl_splayed_guidatom/" GT)
+(.db.splayed.set "/tmp/rfl_parted_guidatom/2024.01.01/t/" GT)
+(.db.splayed.set "/tmp/rfl_parted_guidatom/2024.01.02/t/" GT)
+(set GT 0)
+(.sys.exec "printf '%s\n' '(set R (.db.splayed.get \"/tmp/rfl_splayed_guidatom/\"))' '(set P (.db.parted.get \"/tmp/rfl_parted_guidatom/\" (quote t)))' '(println (and (== (first (at (at R (quote a)) 0)) (at (at R (quote g)) 0)) (== (first (last (at (at R (quote a)) 1))) (at (at R (quote g)) 1)) (nil? (last (last (at (at R (quote a)) 1)))) (== (first (at (at P (quote a)) 5)) (at (at P (quote g)) 2))))' > /tmp/rfl_guidatom_read.rfl") -- 0
+(.sys.exec "./rayforce /tmp/rfl_guidatom_read.rfl </dev/null | grep -qx true") -- 0
+(.sys.exec "rm -rf /tmp/rfl_splayed_guidatom /tmp/rfl_parted_guidatom /tmp/rfl_guidatom_read.rfl")

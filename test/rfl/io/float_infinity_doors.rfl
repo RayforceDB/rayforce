@@ -45,10 +45,10 @@ M -- [1.0 0Nf 1.0]
 (at p1 'of) -- (as 'F32 [0Nf 0Nf 0Nf 2.5 0Nf 3.5 0Nf 4.5 5.5])
 (nil? (at p0 'od)) -- [true true true false true false true false false]
 (at (select {n: (neg d) from: (.parquet.scan "test/data/parquet/infinities-0.parquet")}) 'n) -- [0Nf -1.5 0Nf -2.5 0Nf -3.5 0Nf -4.5 -5.5]
-(.sys.exec "rm -rf /tmp/rf_float_infinity_doors && mkdir -p /tmp/rf_float_infinity_doors")
-(.parquet.splayed "test/data/parquet/infinities-1.parquet" "/tmp/rf_float_infinity_doors/s/") -- 9
-(at (.db.splayed.get "/tmp/rf_float_infinity_doors/s/") 'f) -- (as 'F32 [0Nf 1.5 0Nf 2.5 0Nf 3.5 0Nf 4.5 5.5])
-(.sys.exec "rm -rf /tmp/rf_float_infinity_doors")
+(.sys.exec "rm -rf /tmp/rf_float_infinity_doors /tmp/rf_float_infinity_doors_s")
+(.parquet.splayed "test/data/parquet/infinities-1.parquet" "/tmp/rf_float_infinity_doors_s/") -- 9
+(at (.db.splayed.get "/tmp/rf_float_infinity_doors_s/") 'f) -- (as 'F32 [0Nf 1.5 0Nf 2.5 0Nf 3.5 0Nf 4.5 5.5])
+(.sys.exec "rm -rf /tmp/rf_float_infinity_doors /tmp/rf_float_infinity_doors_s")
 ;; a constant select output folded when the query is planned gives the null
 ;; as the atom does, so neg of it is the null in both forms
 (set C (table [x] (list [1.0 2.0 3.0])))
@@ -85,7 +85,7 @@ M -- [1.0 0Nf 1.0]
 (at (update {r: (med x) from: MA by: k}) 'r) -- [0Nf 0Nf 0Nf 0Nf]
 (set MB (table [k x] (list (take 'a 100000) (take 1e308 100000))))
 (at (select {r: (med x) from: MB by: k}) 'r) -- [0Nf]
-(.sys.exec "rm -rf /tmp/rf_float_infinity_doors")
+(.sys.exec "rm -rf /tmp/rf_float_infinity_doors /tmp/rf_float_infinity_doors_s")
 (.db.splayed.set "/tmp/rf_float_infinity_doors/p/2024.01.01/t/" (take MA 2))
 (.db.splayed.set "/tmp/rf_float_infinity_doors/p/2024.01.02/t/" (take MA 2))
 (set PM (.db.parted.get "/tmp/rf_float_infinity_doors/p/" 't))
@@ -96,4 +96,4 @@ M -- [1.0 0Nf 1.0]
 (set PQ (.db.parted.get "/tmp/rf_float_infinity_doors/q/" 't))
 (at (select {r: (quantile x 0.5) from: PQ}) 'r) -- [0Nf]
 (at (select {r: (percentile x 50) from: PQ by: k}) 'r) -- [0Nf]
-(.sys.exec "rm -rf /tmp/rf_float_infinity_doors")
+(.sys.exec "rm -rf /tmp/rf_float_infinity_doors /tmp/rf_float_infinity_doors_s")

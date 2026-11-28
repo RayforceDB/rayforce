@@ -69,7 +69,7 @@
 ;; ----- 4. I64 (INT64_MIN sentinel) via CSV ingest -----
 ;; CSV reader writes the sentinel into the payload; consumers must read it.
 (.sys.exec "rm -f /tmp/rfl_sentinel_baseline_i64.csv")
-(.sys.exec "printf 'x\\n100\\n\\n300\\n\\n500\\n' > /tmp/rfl_sentinel_baseline_i64.csv")
+(write "/tmp/rfl_sentinel_baseline_i64.csv" "x\n100\n\n300\n\n500\n")
 (set Ti (.csv.read [I64] "/tmp/rfl_sentinel_baseline_i64.csv"))
 (set Vi (at Ti 'x))
 (count Vi)                             -- 5

@@ -3,7 +3,7 @@
 ;; builds the kept rows' int64 index only for a column that still reads it.
 ;; Partitions of 20000 rows, so some morsels of the selection cross a
 ;; partition's end.
-(.sys.exec "rm -rf /tmp/rf_issue_1757 && mkdir -p /tmp/rf_issue_1757") -- 0
+(.sys.exec "rm -rf /tmp/rf_issue_1757") -- 0
 (set n 20000)
 (set mk (fn [p] (table [k f a b c] (list (+ (* p n) (til n)) (at ['x 'y 'z 'u 'v 'w 'r 's 'p 'o] (% (til n) 10)) (til n) (as 'I16 (% (til n) 7)) (as 'I32 (* 2 (til n)))))))
 (map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1757/%/t" (+ 2024.01.01 p)) (mk p) "/tmp/rf_issue_1757/.sym")) (til 8))

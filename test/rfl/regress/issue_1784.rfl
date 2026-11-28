@@ -6,7 +6,7 @@
 ;; rows only, a few kept cells of a vector read alone, beside the kept rows
 ;; of the other columns, and the group costs about what gathering first
 ;; costs.  The key mixes inline, longer and empty text.
-(.sys.exec "rm -rf /tmp/rf_issue_1784 && mkdir -p /tmp/rf_issue_1784/c /tmp/rf_issue_1784/p") -- 0
+(.sys.exec "rm -rf /tmp/rf_issue_1784") -- 0
 (set n 65536)
 (set txt (fn [v] (map (fn [i] (if (== 0 (% i 97)) "" (if (== 0 (% i 3)) (format "k%" i) (if (== 1 (% i 3)) (format "a longer text value number % here" i) (format "mid-%-x" i))))) v)))
 (set mk (fn [p] (table [k g t u c] (list (+ (* p n) (til n)) (% (til n) 100) (txt (+ (* p n) (til n))) (txt (% (til n) 5)) (* 2 (til n))))))
@@ -40,7 +40,7 @@
 ;; 1e16, 1.0 and -1e16 keeps what follows the last -1e16 of each partition
 ;; (1.1 here, 4.4 over four), where one pass over the gathered rows would
 ;; keep 7.1 (the exact sum is 302).  The answers are dev's, to the bit.
-(.sys.exec "rm -rf /tmp/rf_issue_1784/f && mkdir -p /tmp/rf_issue_1784/f") -- 0
+(.sys.exec "rm -rf /tmp/rf_issue_1784/f") -- 0
 (set TF (table [g t f] (list (% (til n) 100) (take [""] n) (take [1e16 1.0 -1e16 0Nf 0.1 -0.3 1e-300] n))))
 (map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1784/f/%/t" (+ 2024.01.01 p)) TF "/tmp/rf_issue_1784/f/.sym" {compress: true})) (til 4))
 (set PF (.db.parted.get "/tmp/rf_issue_1784/f/" 't))
