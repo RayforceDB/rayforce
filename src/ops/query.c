@@ -3058,6 +3058,38 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             return compile_if_chain_dag(g, elems + 1, n - 1);
         }
 
+        /* (fill k x) with an atom k of x's own type: each row is k where x
+         * is null and x elsewhere (ray_fill_fn), which is
+         * OP_IF(OP_ISNULL(x), k, x) over the whole column.  Without it a
+         * projection of a fill ran the per-row evaluator, one call a row.
+         * Any other k (another type, which ray_fill_fn casts, or a vector)
+         * is left to the evaluator. */
+        if (fname_len == 4 && memcmp(fname, "fill", 4) == 0) {
+            if (n != 3) return NULL;
+            ray_t* b = ray_env_get(fn_sym);
+            if (!b || b->type != RAY_BINARY ||
+                (ray_binary_fn)(uintptr_t)b->i64 != ray_fill_fn) return NULL;
+            ray_op_t* k = compile_expr_dag(g, elems[1]);
+            if (!k) return NULL;
+            uint32_t k_id = k->id;
+            ray_op_t* x = compile_expr_dag(g, elems[2]);
+            if (!x) return NULL;
+            uint32_t x_id = x->id;
+            if (!op_tree_is_atom(g, k_id) || op_tree_is_scalar(g, x_id)) return NULL;
+            int8_t xt = x->out_type;
+            if (RAY_IS_PARTED(xt)) xt = (int8_t)RAY_PARTED_BASETYPE(xt);
+            if (g->nodes[k_id].out_type != xt) return NULL;
+            switch (xt) {
+                case RAY_I16: case RAY_I32: case RAY_I64:
+                case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_F64: break;
+                default: return NULL;
+            }
+            ray_op_t* isn = ray_isnull(g, &g->nodes[x_id]);
+            if (!isn) return NULL;
+            uint32_t isn_id = isn->id;
+            return ray_if(g, &g->nodes[isn_id], &g->nodes[k_id], &g->nodes[x_id]);
+        }
+
         /* (substr str start len) — 4 elements. */
         if (fname_len == 6 && memcmp(fname, "substr", 6) == 0) {
             if (n != 4) return NULL;

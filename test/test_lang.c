@@ -3820,6 +3820,89 @@ static test_result_t test_eval_select_unary_arith_dag_admission(void) {
     PASS();
 }
 
+/* ---- Test: fill with an atom of the column's type lowers to OP_IF ----
+ * (fill k x) over a column, k an atom of x's type, compiles to
+ * OP_IF(OP_ISNULL(x), k, x) for the integer, temporal and F64 columns; any
+ * other k (another type, a vector) or a SYM column declines, so the
+ * evaluator fills.  Lowered or not, a projection's fill has the answer
+ * fill gives the column outside a select. */
+static test_result_t test_eval_select_fill_dag_admission(void) {
+    ray_t* tbl = ray_eval_str(
+        "(table [h i l d t ts f s] (list (as 'I16 [1 0N]) (as 'I32 [1 0N]) [1 0N] "
+        "[2024.01.01 0Nd] [10:00:00.000 0Nt] [2024.01.01D10:00:00.000000000 0Np] "
+        "[1.5 0Nf] ['a 'b]))");
+    TEST_ASSERT_NOT_NULL(tbl);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    static const struct { const char* src; bool lowers; } cases[] = {
+        { "(fill 7h h)", true },
+        { "(fill 7i i)", true },
+        { "(fill 7 l)", true },
+        { "(fill 7 (* l 2))", true },
+        { "(fill 2020.01.01 d)", true },
+        { "(fill 09:00:00.000 t)", true },
+        { "(fill 2020.01.01D00:00:00.000000000 ts)", true },
+        { "(fill 0.5 f)", true },
+        { "(fill 7 h)", false },
+        { "(fill 7i l)", false },
+        { "(fill 7.0 l)", false },
+        { "(fill [7 8] l)", false },
+        { "(fill 'z s)", false },
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        ray_t* expr = ray_parse(cases[k].src);
+        TEST_ASSERT_NOT_NULL(expr);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(expr));
+        ray_graph_t* g = ray_graph_new(tbl);
+        TEST_ASSERT_NOT_NULL(g);
+        ray_op_t* op = compile_expr_dag(g, expr);
+        bool is_if = op && op->opcode == OP_IF;
+        TEST_ASSERT_FMT(is_if == cases[k].lowers, "%s: compiled to %s, want %s", cases[k].src,
+                        op ? (is_if ? "if" : "another op") : "nothing",
+                        cases[k].lowers ? "if" : "no if");
+        ray_graph_free(g);
+        ray_release(expr);
+    }
+    ray_release(tbl);
+
+    /* The answers, against fill over the column outside a select: rows a
+     * left join left unmatched are null, every third row matched.  The
+     * declined fill (7i over I64) is a select of its own: beside the
+     * lowered ones it would send the whole select to the evaluator. */
+    ray_t* r = ray_eval_str(
+        "(do (set Fb (table [id] (list (til 3000)))) "
+        "(set Fr (table [id h i l d t ts f] (list (* 3 (til 900)) (as 'I16 (% (til 900) 50)) "
+        "(as 'I32 (til 900)) (til 900) (as 'DATE (til 900)) (as 'TIME (til 900)) "
+        "(as 'TIMESTAMP (til 900)) (/ (as 'F64 (til 900)) (% (til 900) 4))))) "
+        "(set Fj (left-join [id] Fb Fr)) "
+        "(set Fs (select {from: Fj h: (fill 7h h) i: (fill 7i i) l: (fill 7 l) "
+        "d: (fill 2020.01.01 d) t: (fill 09:00:00.000 t) "
+        "ts: (fill 2020.01.01D00:00:00.000000000 ts) f: (fill 0.5 f)})) "
+        "(set Fw (select {from: Fj w: (fill 7i l)})) "
+        "(list (identical (at Fs 'h) (fill 7h (at Fj 'h))) "
+        "(identical (at Fs 'i) (fill 7i (at Fj 'i))) "
+        "(identical (at Fs 'l) (fill 7 (at Fj 'l))) "
+        "(identical (at Fs 'd) (fill 2020.01.01 (at Fj 'd))) "
+        "(identical (at Fs 't) (fill 09:00:00.000 (at Fj 't))) "
+        "(identical (at Fs 'ts) (fill 2020.01.01D00:00:00.000000000 (at Fj 'ts))) "
+        "(identical (at Fs 'f) (fill 0.5 (at Fj 'f))) "
+        "(identical (at Fw 'w) (fill 7i (at Fj 'l))) "
+        "(sum (nil? (at Fs 'l))) (sum (== (at Fs 'l) 7)) (sum (== (at Fs 'f) 0.5))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(ray_len(r), 11);
+    ray_t** e = (ray_t**)ray_data(r);
+    for (int k = 0; k < 8; k++)
+        TEST_ASSERT_FMT(e[k]->type == -RAY_BOOL && e[k]->b8, "column %d differs from fill", k);
+    TEST_ASSERT_EQ_I(e[8]->i64, 0);
+    /* 2100 unmatched rows, plus row 21 (l = 7) */
+    TEST_ASSERT_EQ_I(e[9]->i64, 2101);
+    /* 2100 unmatched rows and the 225 matched 0/0 rows */
+    TEST_ASSERT_EQ_I(e[10]->i64, 2325);
+    ray_release(r);
+    PASS();
+}
+
 /* ---- Test: an empty-operand type probe that fails leaves nothing behind ----
  * An empty operand makes the atomic mappers probe `fn` on a fabricated
  * zero atom to learn the result type.  A probe the builtin rejects —
@@ -16813,6 +16896,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_where", test_eval_select_where, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_sym", test_eval_select_where_in_sym, lang_setup, lang_teardown },
     { "lang/eval/select_unary_arith_dag_admission", test_eval_select_unary_arith_dag_admission, lang_setup, lang_teardown },
+    { "lang/eval/select_fill_dag_admission", test_eval_select_fill_dag_admission, lang_setup, lang_teardown },
     { "lang/eval/select_or_eq_as_in", test_eval_select_or_eq_as_in, lang_setup, lang_teardown },
     { "lang/eval/select_temporal_mod_dag_admission", test_eval_select_temporal_mod_dag_admission, lang_setup, lang_teardown },
     { "lang/eval/select_temporal_int_dag_admission", test_eval_select_temporal_int_dag_admission, lang_setup, lang_teardown },
