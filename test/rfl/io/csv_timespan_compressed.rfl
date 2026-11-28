@@ -1,0 +1,24 @@
+;; @requires: posix  (fixtures are written through a POSIX shell via .sys.exec)
+;; A TIMESPAN column takes the indexes the other 8-byte numeric types take
+;; (#1902): the index-kind matrix left it out, so the compressed writer
+;; refused the zone index a CSV import gives the column, and a compressed
+;; .csv.parted of a TIMESPAN column failed with nyi.
+;; Fixtures use the rf_test_csvtz_ prefix (the Makefile removes rf_test_*.csv).
+
+(.sys.exec "rm -rf rf_test_csvtz_*") -- 0
+(.sys.exec "awk 'BEGIN{print \"v\"; for(i=0;i<20000;i++) printf \"%dD%02d:00:00\\n\", i%50, i%24}' > rf_test_csvtz_a.csv") -- 0
+(set P (.csv.parted {compress: true} [TIMESPAN] "rf_test_csvtz_a.csv" "rf_test_csvtz_pt" 't))
+(count P) -- 20000
+(take (at P 'v) 3) -- [0D00:00:00.000000000 1D01:00:00.000000000 2D02:00:00.000000000]
+(count (select {x: v from: P where: (== v 1D01:00:00)})) -- 34
+(count (select {x: v from: P where: (> v 48D00:00:00)})) -- 766
+(set S (.csv.splayed {compress: true} [TIMESPAN] "rf_test_csvtz_a.csv" "rf_test_csvtz_sp"))
+(count (select {x: v from: S where: (== v 1D01:00:00)})) -- 34
+(set x (at (.csv.read [TIMESPAN] "rf_test_csvtz_a.csv") 'v))
+(at (.idx.info (.idx.hash x)) 'kind) -- 'hash
+(count (where (== (.idx.hash x) 1D01:00:00))) -- 34
+(count (where (> (.idx.zone x) 48D00:00:00))) -- 766
+(count (where (< (.idx.sort x) 0D02:00:00))) -- 34
+(count (where (== (.idx.bloom x) 1D01:00:00))) -- 34
+
+(.sys.exec "rm -rf rf_test_csvtz_*") -- 0

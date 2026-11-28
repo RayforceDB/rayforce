@@ -90,15 +90,14 @@
 (as 'I32 (H (SP (.csv.parted [TIME] "rf_test_csvor_timeb.csv" "rf_test_csvor_pt13" 't)) 6)) -- [2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni 2147483647 -2147483647 0Ni 0Ni 0Ni 0Ni]
 
 ;; ── TIMESPAN: finite, short of the infinities; 0Wn itself is accepted ───────
-;; (parted uncompressed: a compressed parted import of a TIMESPAN column is nyi)
 (.sys.exec "printf 'v\\n106751D23:47:16.854775806\\n-106751D23:47:16.854775806\\n106751D23:47:16.854775807\\n-106751D23:47:16.854775807\\n106752D00:00:00\\n-106752D00:00:00\\n999999D00:00:00\\n0Wn\\n' > rf_test_csvor_ts.csv") -- 0
 (B "ts" "1D00:00:00") -- 0
 (at (.csv.read [TIMESPAN] "rf_test_csvor_ts.csv") 'v) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
 (H (at (.csv.read [TIMESPAN] "rf_test_csvor_tsb.csv") 'v) 8) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn 106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
 (SP (.csv.splayed [TIMESPAN] "rf_test_csvor_ts.csv" "rf_test_csvor_sp")) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
 (H (SP (.csv.splayed [TIMESPAN] "rf_test_csvor_tsb.csv" "rf_test_csvor_sp")) 8) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn 106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
-(SP (.csv.parted {compress: false} [TIMESPAN] "rf_test_csvor_ts.csv" "rf_test_csvor_pt14" 't)) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
-(H (SP (.csv.parted {compress: false} [TIMESPAN] "rf_test_csvor_tsb.csv" "rf_test_csvor_pt15" 't)) 8) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn 106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
+(SP (.csv.parted [TIMESPAN] "rf_test_csvor_ts.csv" "rf_test_csvor_pt14" 't)) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
+(H (SP (.csv.parted [TIMESPAN] "rf_test_csvor_tsb.csv" "rf_test_csvor_pt15" 't)) 8) -- [106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn 106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn 0Nn 0Nn 0Nn 0Wn]
 
 ;; ── TIMESTAMP: 1707-09-22T00:12:43.145224193 to 2292-04-10T23:47:16.854775807
 ;; and the instant a UTC offset gives must be inside too; the sentinel

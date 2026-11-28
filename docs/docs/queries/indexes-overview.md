@@ -20,7 +20,7 @@ Attach one of four kinds to a numeric vector (`.idx.hash` also to a symbol, stri
 
 **Today's status:** all four are *built, inspectable via `(.idx.info)`, and consulted by the executor at six routing sites* — filter comparisons, filter IN, ORDER BY (single ascending key), distinct, find, and equi-joins (`inner-join`, `semi-mask`, `anti-mask`).  The routing is transparent: a query against an indexed column uses the fast path; the same query without the index falls back to the linear scan and returns identical results.
 
-**Surface:** `(.idx.zone v)`, `(.idx.hash v)`, `(.idx.sort v)`, `(.idx.bloom v)`, `(.idx.drop v)`, `(.idx.has? v)`, `(.idx.info v)`. Numeric/boolean columns (`RAY_BOOL` through `RAY_TIMESTAMP`) are supported by all kinds; `.idx.hash` additionally accepts `RAY_SYM`, `RAY_STR` and `RAY_GUID`. `RAY_SYM`, `RAY_STR` and `RAY_GUID` on the non-hash kinds are deferred.
+**Surface:** `(.idx.zone v)`, `(.idx.hash v)`, `(.idx.sort v)`, `(.idx.bloom v)`, `(.idx.drop v)`, `(.idx.has? v)`, `(.idx.info v)`. Numeric/boolean and temporal columns (`RAY_BOOL` through `RAY_TIMESTAMP`, and `RAY_TIMESPAN`) are supported by all kinds; `.idx.hash` additionally accepts `RAY_SYM`, `RAY_STR` and `RAY_GUID`. `RAY_SYM`, `RAY_STR` and `RAY_GUID` on the non-hash kinds are deferred.
 
 **See:** [Accelerator Indexes (reference)](indexes.md) · [Indexes Guide: choosing a kind](../guides/indexes.md#choose).
 
