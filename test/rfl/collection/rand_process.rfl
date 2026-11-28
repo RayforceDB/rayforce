@@ -1,0 +1,13 @@
+;; @requires: posix  (the child processes are run through a POSIX shell via .sys.exec)
+;; rand's stream (#1898) in a fresh process, whose position is fixed: the
+;; plain range and edge-case checks are in rand.rfl.
+;; a fresh process gives the same sequence on every platform and at any
+;; worker count; there it is uniform: a chi-square over 10 buckets of a
+;; million values (9 degrees of freedom, so about 9; under 30 always, and
+;; the values are fixed), for a small max, one whose rand() % max was capped,
+;; and one where a modulo of 64 random bits is biased by a third
+(write "rf_test_rand_child.rfl" "(set H (fn [x b] (map (fn [k] (count (where (== (div x b) k)))) (til 10))))\n(set X (fn [cs] (sum (map (fn [c] (/ (* (- c 100000.0) (- c 100000.0)) 100000.0)) cs))))\n(println (rand 3 1000))\n(println (and (< (X (H (rand 1000000 10) 1)) 30) (< (X (H (rand 1000000 3000000000) 300000000)) 30) (< (X (H (rand 1000000 6917529027641081856) 691752902764108186)) 30)))\n") -- 0
+(.sys.exec "./rayforce -c 1 -f rf_test_rand_child.rfl > rf_test_rand_c1.out && ./rayforce -c 4 -f rf_test_rand_child.rfl > rf_test_rand_c4.out && cmp -s rf_test_rand_c1.out rf_test_rand_c4.out") -- 0
+(.sys.exec "head -1 rf_test_rand_c4.out | grep -qx '\\[883 431 26\\]'") -- 0
+(.sys.exec "sed -n 2p rf_test_rand_c4.out | grep -qx true") -- 0
+(.sys.exec "rm -f rf_test_rand_child.rfl rf_test_rand_c1.out rf_test_rand_c4.out") -- 0

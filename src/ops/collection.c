@@ -8390,7 +8390,46 @@ ray_t* ray_reverse_fn(ray_t* x) {
  * Binary search
  * ══════════════════════════════════════════ */
 
-/* (rand n max) → vector of n random i64 in [0, max) */
+/* The engine's random integers (#1898).  One process-wide stream: position
+ * p of it is splitmix64's output for counter p, so a value depends only on
+ * its position, never on which thread or worker made it.  A call takes the
+ * next n positions with one atomic add; every process starts at position 0,
+ * so (rand ...) gives the same sequence in every process, on every
+ * platform, as rand()'s unseeded stream did on one platform.  It replaces
+ * rand() % max, which never went past RAND_MAX (2^31 - 1, or 32767 on
+ * Windows) and was biased towards the smaller values. */
+static _Atomic uint64_t g_rand_pos;
+
+static inline uint64_t rand_mix(uint64_t z) {
+    z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+    return z ^ (z >> 31);
+}
+
+#define RAND_GAMMA UINT64_C(0x9E3779B97F4A7C15)
+
+/* A uniform value in [0, range) from x, the stream's value at its
+ * position: the high word of x * range, rejecting the few x whose low word
+ * falls under 2^64 mod range (Lemire's multiply-and-reject), which are
+ * replaced from a stream of their own, seeded by x, so the result stays a
+ * function of the position alone */
+static inline uint64_t rand_bounded(uint64_t x, uint64_t range) {
+    uint64_t lo = x, hi = range;
+    ray__wymum(&lo, &hi);
+    if (RAY_UNLIKELY(lo < range)) {
+        uint64_t t = (0 - range) % range;
+        uint64_t s = x;
+        while (lo < t) {
+            s += RAND_GAMMA;
+            lo = rand_mix(s);
+            hi = range;
+            ray__wymum(&lo, &hi);
+        }
+    }
+    return hi;
+}
+
+/* (rand n max) → vector of n random i64, uniform in [0, max) */
 ray_t* ray_rand_fn(ray_t* a, ray_t* b) {
     if (!ray_is_atom(a) || !ray_is_atom(b)) return ray_error("type", "rand: count and max must be atoms, got %s and %s", ray_type_name(a->type), ray_type_name(b->type));
     int64_t n, mx;
@@ -8406,7 +8445,11 @@ ray_t* ray_rand_fn(ray_t* a, ray_t* b) {
     ray_t* vec = ray_vec_new(RAY_I64, n);
     if (RAY_IS_ERR(vec)) return vec;
     int64_t* d = (int64_t*)ray_data(vec);
-    for (int64_t i = 0; i < n; i++) d[i] = (int64_t)(rand() % mx);
+    uint64_t z = atomic_fetch_add_explicit(&g_rand_pos, (uint64_t)n, memory_order_relaxed) * RAND_GAMMA;
+    for (int64_t i = 0; i < n; i++) {
+        z += RAND_GAMMA;
+        d[i] = (int64_t)rand_bounded(rand_mix(z), (uint64_t)mx);
+    }
     vec->len = n;
     return vec;
 }

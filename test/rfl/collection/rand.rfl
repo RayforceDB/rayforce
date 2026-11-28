@@ -14,3 +14,20 @@
 ;; ========== DOMAIN ERRORS ==========
 ;; non-positive upper bound is rejected as a domain error
 (rand 5 0) !- domain
+
+;; ========== UNIFORM OVER [0, max) FOR EVERY I64 max (#1898) ==========
+;; rand() % max never went past RAND_MAX (2^31 - 1, 32767 on Windows)
+(> (max (rand 100000 10000000000)) 2147483647) -- true
+(< (max (rand 100000 10000000000)) 10000000000) -- true
+(> (max (rand 100000 3000000000)) 2147483647) -- true
+(< (max (rand 100000 3000000000)) 3000000000) -- true
+(set Big (rand 1000 9223372036854775807))
+(and (>= (min Big) 0) (> (max Big) 4611686018427387904)) -- true
+(rand 5 1) -- [0 0 0 0 0]
+(rand 3i 1i) -- [0 0 0]
+(type (rand 3i 10i)) -- 'I64
+(rand 0 1) -- []
+(rand 5 -3) !- domain
+(rand -1 5) !- domain
+(rand 5 1.5) !- type
+(rand 5.0 10) !- type

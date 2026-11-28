@@ -287,7 +287,7 @@ static const ray_sig_entry_t sigs[] = {
     {"xbar", "(xbar <x: numeric or temporal vector> <bucket: non-zero num>)",
      "Round down to nearest multiple (bucketing)"},
     {"rand", "(rand <count: i64 or i32 atom> <max: i64 or i32 atom, above 0>)",
-     "N random integers from 0 up to, not including, `max`; **deterministic**: the same sequence in every process"},
+     "N random integers, uniform from 0 up to, not including, `max` (any positive I64); **deterministic**: the same sequence in every process, on every platform"},
     {"at", "(at <collection: vector, list, str, dict or table> <index: int, an integer vector, or a dict key>)",
      "Index a collection; vector keys batch dictionary lookups. A typed vector indexed by an integer vector keeps its type: a null or out-of-range index gives the type's null (`false`/`0x00` for BOOL/U8)"},
     /* docs: . A string takes the same keys: an integer atom gives a one-character string, a collection of them a string, `(at "boom" [1 3])` is `"om"`, and an empty key of any type the empty string; any other key, a boolean or a date included, is the same `type` error as for a vector (`at: index must be an integer, got sym`), and an out-of-range, negative or null position on a string is a `domain` error */

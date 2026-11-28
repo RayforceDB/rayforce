@@ -260,7 +260,7 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `where` | unary | Indices where boolean vector is true | `(where [true false true])` → `[0 2]` |
 | `group` | unary | Group indices by value (returns dict) | `(group [A B A])` → dict of groups |
 | `diverse` | unary | Check if all elements are unique (no duplicates) | `(diverse [1 2 3])` → `true` |
-| `rand` | binary | N random integers from 0 up to, not including, `max`; **deterministic**: the same sequence in every process | `(rand 3 100)` → 3 random ints 0..99 |
+| `rand` | binary | N random integers, uniform from 0 up to, not including, `max` (any positive I64); **deterministic**: the same sequence in every process, on every platform | `(rand 3 100)` → 3 random ints 0..99 |
 | `bin` | binary | Binary search — left boundary (sorted input) | `(bin [10 20 30] 25)` → `1` |
 | `binr` | binary | Binary search — right boundary (sorted input) | `(binr [10 20 30] 25)` → `2` |
 | `unify` | binary | A two-element list of both values, as given (no merge, no type coercion) | `(unify d1 d2)` |
@@ -544,13 +544,16 @@ An `as` to I16, I32, DATE or TIME whose result is the target's minimum gives tha
 - `guid` is seeded from the OS at first use, per thread, so values are unique
   across processes and machines. That is the property the type exists to
   provide, so it is not something to trade for reproducibility.
-- `rand` is deterministic — the same process-wide sequence every run. That is
-  what makes tests and simulations reproducible, and changing `guid`'s seeding
+- `rand` is deterministic — the same process-wide sequence every run, on every
+  platform: each call takes the next values of one 64-bit stream that every
+  process starts at the same point, and each value is uniform over
+  `[0, max)` for any positive `max` up to the largest I64. That is what makes
+  tests and simulations reproducible, and changing `guid`'s seeding
   deliberately left it alone.
 
 ```lisp
 (first (guid 1))   ;; a different value in every process
-(rand 3 1000)      ;; [383 886 777] in every process
+(rand 3 1000)      ;; [883 431 26] first in every process
 ```
 
 If you need a reproducible stream, use `rand`. If you need identifiers that do
