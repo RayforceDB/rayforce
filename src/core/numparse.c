@@ -197,7 +197,9 @@ uint32_t ray_parse_4_digits(const void *p) {
 
 #define IS_DIGIT(c) ((unsigned)((unsigned char)(c) - '0') < 10u)
 
-size_t ray_parse_i64(const char *src, size_t len, int64_t *dst) {
+/* min_ok: the minimum, INT64_MIN, parses as a value (it is the type's
+ * null sentinel, which ray_parse_i64_value refuses) */
+RAY_INLINE size_t parse_i64_impl(const char *src, size_t len, int64_t *dst, bool min_ok) {
     if (len == 0) return 0;
 
     size_t i = 0;
@@ -246,13 +248,21 @@ size_t ray_parse_i64(const char *src, size_t len, int64_t *dst) {
 
     /* Fit into int64 with proper handling of INT64_MIN. */
     if (neg) {
-        if (result > (uint64_t)INT64_MAX + 1ULL) return 0;
+        if (result > (uint64_t)INT64_MAX + (uint64_t)min_ok) return 0;
         *dst = (int64_t)(0u - result);                /* avoids signed UB */
     } else {
         if (result > (uint64_t)INT64_MAX) return 0;
         *dst = (int64_t)result;
     }
     return i;
+}
+
+size_t ray_parse_i64(const char *src, size_t len, int64_t *dst) {
+    return parse_i64_impl(src, len, dst, true);
+}
+
+size_t ray_parse_i64_value(const char *src, size_t len, int64_t *dst) {
+    return parse_i64_impl(src, len, dst, false);
 }
 
 

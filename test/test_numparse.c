@@ -389,6 +389,23 @@ static test_result_t test_numparse_hex(void) {
     PASS();
 }
 
+/* ray_parse_i64_value: ray_parse_i64 without the minimum, the I64 null */
+static test_result_t test_numparse_i64_value(void) {
+    int64_t v = 7;
+    TEST_ASSERT_EQ_U(ray_parse_i64_value("-9223372036854775808", 20, &v), 0);
+    TEST_ASSERT_EQ_U(ray_parse_i64_value("-0009223372036854775808", 23, &v), 0);
+    TEST_ASSERT_EQ_U(ray_parse_i64_value("-9223372036854775807", 20, &v), 20);
+    TEST_ASSERT_EQ_I(v, -INT64_MAX);
+    TEST_ASSERT_EQ_U(ray_parse_i64_value("9223372036854775807", 19, &v), 19);
+    TEST_ASSERT_EQ_I(v, INT64_MAX);
+    TEST_ASSERT_EQ_U(ray_parse_i64_value("12x", 3, &v), 2);
+    TEST_ASSERT_EQ_I(v, 12);
+    /* ray_parse_i64 still takes the minimum */
+    TEST_ASSERT_EQ_U(ray_parse_i64("-9223372036854775808", 20, &v), 20);
+    TEST_ASSERT_EQ_I(v, INT64_MIN);
+    PASS();
+}
+
 const test_entry_t numparse_entries[] = {
     { "numparse/swar_8digits",   test_numparse_swar_8digits, NULL, NULL },
     { "numparse/swar_4digits",   test_numparse_swar_4digits, NULL, NULL },
@@ -407,5 +424,6 @@ const test_entry_t numparse_entries[] = {
     { "numparse/f64_tiny_leading_zeros",
                                  test_numparse_f64_tiny_leading_zeros, NULL, NULL },
     { "numparse/hex",            test_numparse_hex,          NULL, NULL },
+    { "numparse/i64_value",      test_numparse_i64_value,    NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
