@@ -55,6 +55,7 @@ agg_route_stats_t agg_route_stats(void) { return route_stats; }
 void agg_route_note_key_domain(void) { route_stats.key_domain_evals++; }
 void agg_route_note_key_where_deferred(void) { route_stats.key_where_deferred++; }
 void agg_route_note_vocab_order(void) { route_stats.key_vocab_order++; }
+void agg_route_note_cd_row_map(void) { route_stats.cd_row_map++; }
 void agg_route_note_da_lazy(uint64_t skipped_chunks) {
     route_stats.da_lazy_merges++;
     route_stats.da_lazy_skipped += skipped_chunks;
